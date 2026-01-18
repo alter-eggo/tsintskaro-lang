@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
+import { DictionaryService } from '../dictionary/dictionary.service';
 
 interface ExtractedWord {
   word: string;
@@ -12,7 +13,10 @@ interface ExtractedWord {
 export class OpenaiService {
   private openai: OpenAI;
 
-  constructor(private config: ConfigService) {
+  constructor(
+    private config: ConfigService,
+    private dictionaryService: DictionaryService,
+  ) {
     this.openai = new OpenAI({
       apiKey: this.config.get('openaiKey'),
     });
@@ -20,13 +24,19 @@ export class OpenaiService {
 
   async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
     const combinedText = messages.join('\n---\n');
+    const dictionary = this.dictionaryService.getFormattedForPrompt();
+
+    const dictionarySection = dictionary
+      ? `\nИзвестные слова из словаря (используй эти переводы):\n${dictionary}\n`
+      : '';
 
     const prompt = `Ты лингвистический аналитик. Ниже сообщения из Telegram-чата жителей села Цинцкаро (Грузия). Они говорят по-русски, но вставляют слова из родного языка — старого азербайджанского диалекта, записанного кириллицей.
-
+${dictionarySection}
 Твоя задача:
 1. Найти слова, которые НЕ являются стандартным русским языком — это слова из цинцкаринского диалекта
-2. Для каждого слова попробуй угадать перевод на русский по контексту (если невозможно — напиши null)
-3. Добавь короткий контекст, где слово было использовано
+2. Если слово есть в словаре выше — используй перевод оттуда
+3. Если слова нет в словаре — попробуй угадать перевод по контексту (если невозможно — напиши null)
+4. Добавь короткий контекст, где слово было использовано
 
 Сообщения:
 ${combinedText}

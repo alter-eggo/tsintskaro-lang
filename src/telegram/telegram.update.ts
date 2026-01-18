@@ -168,8 +168,11 @@ export class TelegramUpdate implements OnModuleInit {
     let report = '📖 <b>СЛОВАРЬ ЦИНЦКАРО</b>\n\n';
 
     words.forEach((w, i) => {
-      const translation = w.possibleTranslation || 'не могу перевести';
-      report += `${i + 1}. <b>${w.word}</b> - ${translation}\n`;
+      const translation = 
+        w.possibleTranslation && w.possibleTranslation !== 'null'
+          ? w.possibleTranslation
+          : '❓ перевод неизвестен';
+      report += `${i + 1}. <b>${w.word}</b> — ${translation}\n`;
     });
 
     report += `\n📝 Найдено слов: ${words.length}`;
