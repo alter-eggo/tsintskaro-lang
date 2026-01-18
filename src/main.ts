@@ -3,7 +3,8 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  await app.listen(3000);
-  console.log('Tsintskaro Bot is running...');
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  console.log(`Tsintskaro Bot is running on port ${port}...`);
 }
 bootstrap();
