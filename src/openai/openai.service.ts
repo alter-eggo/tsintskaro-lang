@@ -21,28 +21,28 @@ export class OpenaiService {
   async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
     const combinedText = messages.join('\n---\n');
 
-    const prompt = `You are a linguistic analyst. Below are messages from a Telegram chat of people from Tsintskaro village (Georgia). They speak Russian but mix in words from their native language - an old Azerbaijani dialect written in Cyrillic script.
+    const prompt = `Ты лингвистический аналитик. Ниже сообщения из Telegram-чата жителей села Цинцкаро (Грузия). Они говорят по-русски, но вставляют слова из родного языка — старого азербайджанского диалекта, записанного кириллицей.
 
-Your task:
-1. Identify words that are NOT standard Russian - these are likely from their native Tsintskaro dialect
-2. For each word found, try to guess a translation or meaning based on context (if impossible, say null)
-3. Include a short context snippet showing how the word was used
+Твоя задача:
+1. Найти слова, которые НЕ являются стандартным русским языком — это слова из цинцкаринского диалекта
+2. Для каждого слова попробуй угадать перевод на русский по контексту (если невозможно — напиши null)
+3. Добавь короткий контекст, где слово было использовано
 
-Messages:
+Сообщения:
 ${combinedText}
 
-Respond in JSON format only:
+Отвечай ТОЛЬКО в формате JSON:
 {
   "words": [
     {
-      "word": "the non-Russian word",
-      "possibleTranslation": "translation or null",
-      "context": "short phrase where it appeared"
+      "word": "нерусское слово",
+      "possibleTranslation": "перевод на русский или null",
+      "context": "короткая фраза где появилось"
     }
   ]
 }
 
-If no non-Russian words found, return {"words": []}`;
+Если нерусских слов не найдено, верни {"words": []}`;
 
     const response = await this.openai.chat.completions.create({
       model: 'gpt-4o',
