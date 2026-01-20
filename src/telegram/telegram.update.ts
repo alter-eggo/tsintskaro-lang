@@ -1,6 +1,7 @@
 import { Update, Ctx, Hears, Command, Start, InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { TelegramService } from './telegram.service';
+import { DictionaryService } from '../dictionary/dictionary.service';
 import { OpenaiService } from '../openai/openai.service';
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
@@ -14,6 +15,7 @@ export class TelegramUpdate implements OnModuleInit {
     @InjectBot() private bot: Telegraf<Context>,
     private telegramService: TelegramService,
     private openaiService: OpenaiService,
+    private dictionaryService: DictionaryService,
     private config: ConfigService,
   ) {
     this.threshold = this.config.get('messageThreshold') || 100;
@@ -32,6 +34,9 @@ export class TelegramUpdate implements OnModuleInit {
 
   @Start()
   async onStart(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) {
+      return;
+    }
     if (this.isPrivateChat(ctx)) {
       await ctx.reply('Этот бот работает только в групповых чатах.');
       return;
@@ -49,6 +54,15 @@ export class TelegramUpdate implements OnModuleInit {
 
   private isPrivateChat(ctx: Context): boolean {
     return ctx.chat?.type === 'private';
+  }
+
+  private async requireAdmin(ctx: Context): Promise<boolean> {
+    const username = ctx.from?.username;
+    const isAdmin = username === 'AAlxnv' || username === 'MEMazmanova';
+    if (!isAdmin) {
+      await ctx.reply('Команды боту доступны только администраторам');
+    }
+    return isAdmin;
   }
 
   @Hears(/^[^\/]/)
@@ -71,6 +85,9 @@ export class TelegramUpdate implements OnModuleInit {
 
   @Command('status')
   async onStatus(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) {
+      return;
+    }
     if (this.isPrivateChat(ctx)) {
       await ctx.reply('Этот бот работает только в групповых чатах.');
       return;
@@ -86,6 +103,9 @@ export class TelegramUpdate implements OnModuleInit {
 
   @Command('report')
   async onReport(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) {
+      return;
+    }
     if (this.isPrivateChat(ctx)) {
       await ctx.reply('Этот бот работает только в групповых чатах.');
       return;
@@ -97,6 +117,9 @@ export class TelegramUpdate implements OnModuleInit {
 
   @Command('clear')
   async onClear(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) {
+      return;
+    }
     if (this.isPrivateChat(ctx)) {
       await ctx.reply('Этот бот работает только в групповых чатах.');
       return;
@@ -165,17 +188,57 @@ export class TelegramUpdate implements OnModuleInit {
       context: string;
     }>,
   ): string {
-    let report = '📖 <b>СЛОВАРЬ ЦИНЦКАРО</b>\n\n';
+    const fromDictionary: Array<{ word: string; translation: string }> = [];
+    const translated: Array<{ word: string; translation: string }> = [];
+    const untranslated: Array<{ word: string }> = [];
 
-    words.forEach((w, i) => {
-      const translation = 
+    words.forEach((w) => {
+      const dictionaryEntry = this.dictionaryService.findWord(w.word);
+      if (dictionaryEntry) {
+        fromDictionary.push({
+          word: w.word,
+          translation: dictionaryEntry.translation,
+        });
+        return;
+      }
+
+      const normalizedTranslation =
         w.possibleTranslation && w.possibleTranslation !== 'null'
           ? w.possibleTranslation
-          : '❓ перевод неизвестен';
-      report += `${i + 1}. <b>${w.word}</b> — ${translation}\n`;
+          : null;
+
+      if (normalizedTranslation) {
+        translated.push({ word: w.word, translation: normalizedTranslation });
+      } else {
+        untranslated.push({ word: w.word });
+      }
     });
 
-    report += `\n📝 Найдено слов: ${words.length}`;
+    const sectionLines = (
+      items: string[],
+      emptyLabel = '— нет',
+    ): string => (items.length > 0 ? items.join('\n') : emptyLabel);
+
+    const dictionaryLines = fromDictionary.map(
+      (item, index) => `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
+    );
+    const translatedLines = translated.map(
+      (item, index) => `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
+    );
+    const untranslatedLines = untranslated.map(
+      (item, index) => `${index + 1}. <b>${item.word}</b>`,
+    );
+
+    let report = '📖 <b>СЛОВАРЬ ЦИНЦКАРО</b>\n\n';
+    report +=
+      'Слова найденные в словаре:\n' +
+      `${sectionLines(dictionaryLines)}\n\n` +
+      'Переведенные слова:\n' +
+      `${sectionLines(translatedLines)}\n\n` +
+      'Непереведенные слова:\n' +
+      `${sectionLines(untranslatedLines)}`;
+
+    report += `\n\n📝 Найдено слов: ${words.length}`;
     return report;
   }
 
