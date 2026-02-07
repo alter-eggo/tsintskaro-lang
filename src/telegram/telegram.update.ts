@@ -68,6 +68,7 @@ export class TelegramUpdate implements OnModuleInit {
   @Hears(/^[^\/]/)
   async onText(@Ctx() ctx: Context) {
     if (this.isPrivateChat(ctx)) return;
+    if (ctx.from?.is_bot) return; // Игнорировать сообщения от ботов
 
     const chatId = ctx.chat!.id;
     const message = ctx.message as { text: string; from?: { username?: string } };
@@ -131,44 +132,63 @@ export class TelegramUpdate implements OnModuleInit {
 
   private async generateReport(ctx: Context) {
     const chatId = ctx.chat!.id;
-    const messages = this.telegramService.getMessagesText(chatId);
+    const messagesText = this.telegramService.getMessagesText(chatId);
+    const messages = this.telegramService.getMessages(chatId);
 
-    if (messages.length === 0) {
+    if (messagesText.length === 0) {
       await ctx.reply('Сообщений пока нет.');
       return;
     }
 
-    const countWord = this.pluralize(messages.length, 'сообщение', 'сообщения', 'сообщений');
-    const statusMsg = await ctx.reply(`🔍 Анализирую ${messages.length} ${countWord}...`);
+    const countWord = this.pluralize(
+      messagesText.length,
+      'сообщение',
+      'сообщения',
+      'сообщений',
+    );
+    const statusMsg = await ctx.reply(
+      `🔍 Анализирую ${messagesText.length} ${countWord}...`,
+    );
 
     try {
-      const words = await this.openaiService.analyzeMessages(messages);
+      const [words, discussionResult] = await Promise.all([
+        this.openaiService.analyzeMessages(messagesText),
+        this.openaiService.processDiscussion(messages),
+      ]);
 
-      // Delete the "analyzing" message
       await ctx.deleteMessage(statusMsg.message_id);
 
-      if (words.length === 0) {
-        await ctx.reply('Цинцкарских слов не найдено.');
-      } else {
-        const report = this.formatReport(words);
+      let report = this.formatReport(words);
+      const summary = discussionResult.discussionSummary || '';
+      if (summary) {
+        const escapedSummary = summary
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+        report +=
+          '\n\n---\n\n📝 <b>ПОДРОБНОЕ ОПИСАНИЕ ОБСУЖДЕНИЯ:</b>\n' +
+          escapedSummary;
+      }
 
-        if (report.length > 4000) {
-          const chunks = this.chunkString(report, 4000);
-          for (let i = 0; i < chunks.length; i++) {
-            // Add footer only to last chunk
-            const isLast = i === chunks.length - 1;
-            const text = isLast ? chunks[i] + '\n\n✅ Отчёт готов, буфер очищен.' : chunks[i];
-            await ctx.reply(text, { parse_mode: 'HTML' });
-          }
-        } else {
-          await ctx.reply(report + '\n\n✅ Отчёт готов, буфер очищен.', { parse_mode: 'HTML' });
+      if (report.length > 4000) {
+        const chunks = this.chunkString(report, 4000);
+        for (let i = 0; i < chunks.length; i++) {
+          const isLast = i === chunks.length - 1;
+          const text = isLast
+            ? chunks[i] + '\n\n✅ Отчёт готов, буфер очищен.'
+            : chunks[i];
+          await ctx.reply(text, { parse_mode: 'HTML' });
         }
+      } else {
+        await ctx.reply(report + '\n\n✅ Отчёт готов, буфер очищен.', {
+          parse_mode: 'HTML',
+        });
       }
 
       this.telegramService.clearBuffer(chatId);
     } catch (error) {
-      console.error('Analysis error:', error);
-      await ctx.reply('❌ Ошибка при анализе. Попробуйте ещё раз.');
+      this.logger.error('Report error:', error);
+      await ctx.reply('❌ Ошибка при формировании отчёта. Попробуйте ещё раз.');
     }
   }
 
@@ -188,11 +208,20 @@ export class TelegramUpdate implements OnModuleInit {
       context: string;
     }>,
   ): string {
+    // Deduplicate words by their lowercase form, keeping first occurrence
+    const seen = new Set<string>();
+    const uniqueWords = words.filter((w) => {
+      const key = w.word.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
     const fromDictionary: Array<{ word: string; translation: string }> = [];
     const translated: Array<{ word: string; translation: string }> = [];
     const untranslated: Array<{ word: string }> = [];
 
-    words.forEach((w) => {
+    uniqueWords.forEach((w) => {
       const dictionaryEntry = this.dictionaryService.findWord(w.word);
       if (dictionaryEntry) {
         fromDictionary.push({
@@ -238,14 +267,28 @@ export class TelegramUpdate implements OnModuleInit {
       'Непереведенные слова:\n' +
       `${sectionLines(untranslatedLines)}`;
 
-    report += `\n\n📝 Найдено слов: ${words.length}`;
+    report += `\n\n📝 Найдено слов: ${uniqueWords.length}`;
     return report;
   }
 
   private chunkString(str: string, size: number): string[] {
     const chunks: string[] = [];
-    for (let i = 0; i < str.length; i += size) {
-      chunks.push(str.slice(i, i + size));
+    let currentChunk = '';
+    const lines = str.split('\n');
+
+    for (const line of lines) {
+      if (currentChunk.length + line.length + 1 > size) {
+        if (currentChunk.length > 0) {
+          chunks.push(currentChunk);
+          currentChunk = '';
+        }
+        currentChunk = line;
+      } else {
+        currentChunk += (currentChunk ? '\n' : '') + line;
+      }
+    }
+    if (currentChunk) {
+      chunks.push(currentChunk);
     }
     return chunks;
   }

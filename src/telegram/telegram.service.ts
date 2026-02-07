@@ -28,6 +28,11 @@ export class TelegramService {
     return buffer ? buffer.map((m) => m.text) : [];
   }
 
+  getMessages(chatId: number): { text: string; username: string }[] {
+    const buffer = this.chatBuffers.get(chatId);
+    return buffer ? buffer.map((m) => ({ text: m.text, username: m.username })) : [];
+  }
+
   clearBuffer(chatId: number): void {
     this.chatBuffers.delete(chatId);
   }
