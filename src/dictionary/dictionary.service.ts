@@ -17,16 +17,37 @@ export class DictionaryService implements OnModuleInit {
     this.loadDictionary();
   }
 
+  reload() {
+    this.entries = [];
+    this.loadDictionary();
+  }
+
   private loadDictionary() {
-    // Try multiple possible paths
-    const possiblePaths = [
+    const jsonPaths = [
+      path.join(__dirname, '..', 'assets', 'dictionary.json'),
+      path.join(process.cwd(), 'src', 'assets', 'dictionary.json'),
+      path.join(process.cwd(), 'dist', 'assets', 'dictionary.json'),
+    ];
+
+    for (const p of jsonPaths) {
+      try {
+        fs.accessSync(p);
+        this.logger.log(`Found dictionary JSON at: ${p}`);
+        this.loadFromJson(p);
+        return;
+      } catch {
+        // File not found, try next
+      }
+    }
+
+    const xlsxPaths = [
       path.join(__dirname, '..', 'assets', 'disctionary.xlsx'),
       path.join(process.cwd(), 'src', 'assets', 'disctionary.xlsx'),
       path.join(process.cwd(), 'dist', 'assets', 'disctionary.xlsx'),
     ];
 
     let filePath: string | null = null;
-    for (const p of possiblePaths) {
+    for (const p of xlsxPaths) {
       try {
         fs.accessSync(p);
         filePath = p;
@@ -38,21 +59,44 @@ export class DictionaryService implements OnModuleInit {
     }
 
     if (!filePath) {
-      this.logger.error(`Dictionary not found. Tried: ${possiblePaths.join(', ')}`);
+      this.logger.error(`Dictionary not found. Tried JSON: ${jsonPaths.join(', ')} and xlsx: ${xlsxPaths.join(', ')}`);
       return;
     }
 
+    this.loadFromXlsx(filePath);
+  }
+
+  private loadFromJson(filePath: string) {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(raw) as { entries?: { word: string; translation: string }[] };
+      const entries = data.entries ?? [];
+      for (const e of entries) {
+        if (e.word && e.translation) {
+          this.entries.push({
+            word: String(e.word).trim().toLowerCase(),
+            translation: String(e.translation).trim(),
+          });
+        }
+      }
+      this.logger.log(`Loaded ${this.entries.length} dictionary entries from JSON: ${filePath}`);
+      if (this.entries.length > 0) {
+        const sample = this.entries.slice(0, 3).map((e) => `${e.word}=${e.translation}`).join(', ');
+        this.logger.log(`Sample entries: ${sample}`);
+      }
+    } catch (error) {
+      this.logger.error('Failed to load dictionary from JSON:', error);
+    }
+  }
+
+  private loadFromXlsx(filePath: string) {
     try {
       const workbook = XLSX.readFile(filePath);
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
-      
-      // Convert to JSON, assuming first row might be headers
       const rows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1 });
-      
-      // Skip header row if it looks like headers
       const startRow = this.looksLikeHeader(rows[0]) ? 1 : 0;
-      
+
       for (let i = startRow; i < rows.length; i++) {
         const row = rows[i];
         if (row && row[0] && row[1]) {
@@ -62,12 +106,10 @@ export class DictionaryService implements OnModuleInit {
           });
         }
       }
-      
+
       this.logger.log(`Loaded ${this.entries.length} dictionary entries`);
-      
-      // Log first few entries as sample
       if (this.entries.length > 0) {
-        const sample = this.entries.slice(0, 3).map(e => `${e.word}=${e.translation}`).join(', ');
+        const sample = this.entries.slice(0, 3).map((e) => `${e.word}=${e.translation}`).join(', ');
         this.logger.log(`Sample entries: ${sample}`);
       }
     } catch (error) {

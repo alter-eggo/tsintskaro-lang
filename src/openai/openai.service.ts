@@ -47,6 +47,8 @@ export interface ProcessDiscussionResult {
   duplicatesRemoved: number;
 }
 
+const MODEL_NAME = 'gpt-5.2';
+
 @Injectable()
 export class OpenaiService {
   private openai: OpenAI;
@@ -94,10 +96,9 @@ ${combinedText}
 Если нерусских слов не найдено, верни {"words": []}`;
 
     const response = await this.openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: MODEL_NAME,
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
-      temperature: 0.3,
     });
 
     const content = response.choices[0].message.content;
@@ -153,9 +154,8 @@ ${formattedMessages}
 - слово (причина, username)`;
 
     const response = await this.openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: MODEL_NAME,
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
     });
 
     return response.choices[0].message.content || 'Ошибка обработки';
@@ -205,21 +205,20 @@ ${formattedMessages}
 Если слов не найдено, верни: {"discussionSummary": "...", "entries": []}`;
 
     const response = await this.openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: MODEL_NAME,
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
-      temperature: 0.2,
     });
 
     const content = response.choices[0].message.content;
     const parsed = JSON.parse(content) as ProcessDiscussionRawResult;
 
-    const summary = parsed.discussionSummary || 'Подробное описание не сформировано.';
+    const summary =
+      parsed.discussionSummary || 'Подробное описание не сформировано.';
     const entries = parsed.entries || [];
 
-    const { agreedWords, disputedWords, duplicatesRemoved } = this.deduplicateAndSplit(
-      entries,
-    );
+    const { agreedWords, disputedWords, duplicatesRemoved } =
+      this.deduplicateAndSplit(entries);
 
     return {
       discussionSummary: summary,
@@ -233,9 +232,7 @@ ${formattedMessages}
   /**
    * Группирует по слову: одинаковые (слово, перевод, часть речи) — один согласованный; разные варианты — спорное с вариантами.
    */
-  private deduplicateAndSplit(
-    entries: ProcessDiscussionEntry[],
-  ): {
+  private deduplicateAndSplit(entries: ProcessDiscussionEntry[]): {
     agreedWords: AgreedWord[];
     disputedWords: DisputedWord[];
     duplicatesRemoved: number;
@@ -253,7 +250,10 @@ ${formattedMessages}
     let duplicatesRemoved = 0;
 
     for (const [, group] of byWord) {
-      const uniqueByTranslationAndPOS = new Map<string, { translation: string; partOfSpeech: string; usernames: string[] }>();
+      const uniqueByTranslationAndPOS = new Map<
+        string,
+        { translation: string; partOfSpeech: string; usernames: string[] }
+      >();
       for (const e of group) {
         const key = `${e.translation.trim()}\t${e.partOfSpeech.trim()}`;
         if (!uniqueByTranslationAndPOS.has(key)) {
@@ -282,11 +282,14 @@ ${formattedMessages}
           if (!byTranslation.has(t)) byTranslation.set(t, e.username);
           partOfSpeeches.add(e.partOfSpeech.trim());
         }
-        const variants = [...byTranslation.entries()].map(([translation, username]) => ({
-          username,
-          translation,
-        }));
-        const partOfSpeech = [...partOfSpeeches].join(' / ') || group[0].partOfSpeech.trim();
+        const variants = [...byTranslation.entries()].map(
+          ([translation, username]) => ({
+            username,
+            translation,
+          }),
+        );
+        const partOfSpeech =
+          [...partOfSpeeches].join(' / ') || group[0].partOfSpeech.trim();
         disputedWords.push({
           word: group[0].word.trim(),
           partOfSpeech,
