@@ -34,14 +34,7 @@ export class PollSchedulerService {
       return;
     }
     try {
-      const target = await this.pollConfig.get();
-      if (!target) {
-        this.logger.log(
-          'Skipping scheduled polls — target chat not configured (run /setpollchat)',
-        );
-        return;
-      }
-      await this.sendOne('ts_to_ru', target.chatId, target.threadId);
+      await this.sendBoth();
     } catch (err) {
       this.logger.error('Scheduled poll run failed', err);
     }
