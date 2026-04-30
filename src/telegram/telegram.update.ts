@@ -302,7 +302,7 @@ export class TelegramUpdate implements OnModuleInit {
       await ctx.reply('⚠️ Сначала настрой через /setpollchat.');
       return;
     }
-    await ctx.reply('🚀 Отправляю пару опросов (с задержкой 30 секунд)...');
+    await ctx.reply('🚀 Отправляю пару опросов...');
     await this.pollScheduler.sendBoth();
   }
 

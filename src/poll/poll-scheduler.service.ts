@@ -10,7 +10,7 @@ import { PollDirection } from './entities/poll-history.entity';
 
 const POLL_CRON = '0 8,10,12,14,16,18,20 * * *';
 const POLL_TZ = 'Europe/Moscow';
-const DELAY_BETWEEN_QUIZZES_MS = 30_000;
+const DELAY_BETWEEN_QUIZZES_MS = 5_000;
 
 @Injectable()
 export class PollSchedulerService {
