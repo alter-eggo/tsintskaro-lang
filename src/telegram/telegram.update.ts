@@ -3,6 +3,8 @@ import { Context, Telegraf } from 'telegraf';
 import { TelegramService } from './telegram.service';
 import { DictionaryService } from '../dictionary/dictionary.service';
 import { OpenaiService } from '../openai/openai.service';
+import { PollConfigService } from '../poll/poll-config.service';
+import { PollSchedulerService } from '../poll/poll-scheduler.service';
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
 
@@ -16,6 +18,8 @@ export class TelegramUpdate implements OnModuleInit {
     private telegramService: TelegramService,
     private openaiService: OpenaiService,
     private dictionaryService: DictionaryService,
+    private pollConfigService: PollConfigService,
+    private pollScheduler: PollSchedulerService,
     private config: ConfigService,
   ) {
     this.threshold = this.config.get('messageThreshold') || 100;
@@ -28,6 +32,17 @@ export class TelegramUpdate implements OnModuleInit {
       { command: 'report', description: 'Создать отчёт сейчас' },
       { command: 'status', description: 'Показать количество сообщений' },
       { command: 'clear', description: 'Очистить буфер без отчёта' },
+      { command: 'setsummarythread', description: 'Слать отчёты в этот топик' },
+      { command: 'clearsummarythread', description: 'Отключить топик отчётов' },
+      {
+        command: 'summarythreadstatus',
+        description: 'Куда сейчас идут отчёты',
+      },
+      { command: 'setpollchat', description: 'Слать опросы в этот топик' },
+      { command: 'clearpollchat', description: 'Отключить опросы' },
+      { command: 'pollstatus', description: 'Куда сейчас идут опросы' },
+      { command: 'pollnow', description: 'Отправить пару опросов сейчас' },
+      { command: 'threadid', description: 'Показать chat_id и thread_id' },
     ]);
     this.logger.log('Bot commands registered');
   }
@@ -48,7 +63,8 @@ export class TelegramUpdate implements OnModuleInit {
         'Команды:\n' +
         '/report - Создать отчёт сейчас\n' +
         '/status - Показать количество собранных сообщений\n' +
-        '/clear - Очистить буфер без отчёта',
+        '/clear - Очистить буфер без отчёта\n' +
+        '/setsummarythread - Слать отчёты в этот топик',
     );
   }
 
@@ -71,13 +87,32 @@ export class TelegramUpdate implements OnModuleInit {
     if (ctx.from?.is_bot) return; // Игнорировать сообщения от ботов
 
     const chatId = ctx.chat!.id;
-    const message = ctx.message as { text: string; from?: { username?: string } };
+    const message = ctx.message as {
+      message_id?: number;
+      text: string;
+      from?: { username?: string };
+      message_thread_id?: number;
+      date?: number;
+    };
     const text = message.text;
-    this.logger.log(`[Chat ${chatId}] Received text: "${text}"`);
+    const threadId = message.message_thread_id;
+    this.logger.log(
+      `[Chat ${chatId}${threadId ? ` / thread ${threadId}` : ''}] Received text: "${text}"`,
+    );
 
     const username = message.from?.username || 'anonymous';
-    const count = this.telegramService.addMessage(chatId, text, username);
-    this.logger.log(`[Chat ${chatId}] Message count: ${count}/${this.threshold}`);
+    const sentAt = message.date ? new Date(message.date * 1000) : new Date();
+    const count = await this.telegramService.addMessage(
+      chatId,
+      threadId ?? null,
+      message.message_id ?? null,
+      text,
+      username,
+      sentAt,
+    );
+    this.logger.log(
+      `[Chat ${chatId}] Message count: ${count}/${this.threshold}`,
+    );
 
     if (count >= this.threshold) {
       await this.generateReport(ctx);
@@ -95,7 +130,7 @@ export class TelegramUpdate implements OnModuleInit {
     }
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] Received /status command`);
-    const count = this.telegramService.getCount(chatId);
+    const count = await this.telegramService.getCount(chatId);
     await ctx.reply(
       `📊 Собрано сообщений: ${count}/${this.threshold}\n` +
         `Используйте /report для создания отчёта.`,
@@ -126,19 +161,194 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     const chatId = ctx.chat!.id;
-    this.telegramService.clearBuffer(chatId);
+    await this.telegramService.clearBuffer(chatId);
     await ctx.reply('🗑 Буфер очищен.');
+  }
+
+  @Command('setsummarythread')
+  @Hears(/^\/setSummaryThread(?:@\w+)?(?:\s|$)/)
+  async onSetSummaryThread(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      return;
+    }
+    const chatId = ctx.chat!.id;
+    const message = ctx.message as { message_thread_id?: number };
+    const threadId = message.message_thread_id ?? null;
+    const username = ctx.from?.username || 'unknown';
+
+    await this.telegramService.setSummaryTarget(chatId, threadId, username);
+
+    await ctx.reply(
+      `✅ Отчёты и подробные описания обсуждений будут приходить сюда.\n` +
+        `chat_id: <code>${chatId}</code>\n` +
+        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('clearsummarythread')
+  async onClearSummaryThread(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+    await this.telegramService.clearSummaryTarget();
+    await ctx.reply(
+      '🛑 Отдельный топик отчётов отключён. Используйте /setsummarythread чтобы включить снова.',
+    );
+  }
+
+  @Command('summarythreadstatus')
+  async onSummaryThreadStatus(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+    const target = await this.telegramService.getSummaryTarget();
+    if (!target) {
+      await ctx.reply(
+        '⚠️ Топик отчётов не настроен.\nВызови /setsummarythread в нужном топике.',
+      );
+      return;
+    }
+    const setAt =
+      target.setAt instanceof Date ? target.setAt : new Date(target.setAt);
+    await ctx.reply(
+      `📍 Отчёты идут сюда:\n` +
+        `chat_id: <code>${target.chatId}</code>\n` +
+        `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
+        `настроил: @${target.setBy}\n` +
+        `когда: ${setAt.toISOString()}`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('setpollchat')
+  async onSetPollChat(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      return;
+    }
+    const chatId = ctx.chat!.id;
+    const message = ctx.message as { message_thread_id?: number };
+    const threadId = message.message_thread_id ?? null;
+    const username = ctx.from?.username || 'unknown';
+
+    await this.pollConfigService.set(chatId, threadId, username);
+
+    await ctx.reply(
+      `✅ Опросы будут приходить сюда.\n` +
+        `chat_id: <code>${chatId}</code>\n` +
+        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
+        `Расписание: 8, 10, 12, 14, 16, 18, 20 МСК — два опроса в каждой точке.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('clearpollchat')
+  async onClearPollChat(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+    await this.pollConfigService.clear();
+    await ctx.reply(
+      '🛑 Опросы отключены. Используйте /setpollchat чтобы включить снова.',
+    );
+  }
+
+  @Command('pollstatus')
+  async onPollStatus(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+    const target = await this.pollConfigService.get();
+    if (!target) {
+      await ctx.reply(
+        '⚠️ Опросы не настроены.\nВызови /setpollchat в нужном топике.',
+      );
+      return;
+    }
+    const setAt =
+      target.setAt instanceof Date ? target.setAt : new Date(target.setAt);
+    await ctx.reply(
+      `📍 Опросы идут сюда:\n` +
+        `chat_id: <code>${target.chatId}</code>\n` +
+        `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
+        `настроил: @${target.setBy}\n` +
+        `когда: ${setAt.toISOString()}\n\n` +
+        `Расписание: 8, 10, 12, 14, 16, 18, 20 МСК.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('pollnow')
+  async onPollNow(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+    const target = await this.pollConfigService.get();
+    if (!target) {
+      await ctx.reply('⚠️ Сначала настрой через /setpollchat.');
+      return;
+    }
+    await ctx.reply('🚀 Отправляю пару опросов (с задержкой 30 секунд)...');
+    const result = await this.pollScheduler.sendBoth();
+    await ctx.reply(
+      `Готово.\n` +
+        `Цинцкарское→русское: ${result.tsToRu ? '✅' : '❌'}\n` +
+        `Русское→цинцкарское: ${result.ruToTs ? '✅' : '❌'}`,
+    );
+  }
+
+  @Command('threadid')
+  async onThreadId(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      return;
+    }
+    const chatId = ctx.chat!.id;
+    const message = ctx.message as { message_thread_id?: number };
+    const threadId = message.message_thread_id ?? null;
+    await ctx.reply(
+      `chat_id: <code>${chatId}</code>\n` +
+        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>`,
+      { parse_mode: 'HTML' },
+    );
   }
 
   private async generateReport(ctx: Context) {
     const chatId = ctx.chat!.id;
-    const messagesText = this.telegramService.getMessagesText(chatId);
-    const messages = this.telegramService.getMessages(chatId);
+    const sourceMessage = ctx.message as { message_thread_id?: number };
+    const sourceThreadId = sourceMessage?.message_thread_id ?? null;
+    const storedMessages = await this.telegramService.getActiveMessages(chatId);
+    const messagesText = storedMessages.map((m) => m.text);
+    const messages = storedMessages.map((m) => ({
+      text: m.text,
+      username: m.username,
+    }));
 
     if (messagesText.length === 0) {
       await ctx.reply('Сообщений пока нет.');
       return;
     }
+
+    const summaryTarget = await this.telegramService.getSummaryTarget();
+    const target = summaryTarget ?? {
+      chatId,
+      threadId: sourceThreadId,
+    };
 
     const countWord = this.pluralize(
       messagesText.length,
@@ -156,7 +366,7 @@ export class TelegramUpdate implements OnModuleInit {
         this.openaiService.processDiscussion(messages),
       ]);
 
-      await ctx.deleteMessage(statusMsg.message_id);
+      await this.deleteMessageIfPossible(ctx, statusMsg.message_id);
 
       let report = this.formatReport(words);
       const summary = discussionResult.discussionSummary || '';
@@ -170,25 +380,82 @@ export class TelegramUpdate implements OnModuleInit {
           escapedSummary;
       }
 
-      if (report.length > 4000) {
-        const chunks = this.chunkString(report, 4000);
-        for (let i = 0; i < chunks.length; i++) {
-          const isLast = i === chunks.length - 1;
-          const text = isLast
-            ? chunks[i] + '\n\n✅ Отчёт готов, буфер очищен.'
-            : chunks[i];
-          await ctx.reply(text, { parse_mode: 'HTML' });
-        }
-      } else {
-        await ctx.reply(report + '\n\n✅ Отчёт готов, буфер очищен.', {
-          parse_mode: 'HTML',
-        });
-      }
+      const savedReport = await this.telegramService.createSummaryReport({
+        sourceChatId: chatId,
+        sourceThreadId,
+        targetChatId: target.chatId,
+        targetThreadId: target.threadId,
+        messageCount: messagesText.length,
+        extractedWords: words,
+        discussionResult: discussionResult as unknown as Record<
+          string,
+          unknown
+        >,
+        reportText: report,
+        discussionSummary: summary || null,
+        createdBy: ctx.from?.username || null,
+      });
 
-      this.telegramService.clearBuffer(chatId);
+      await this.sendReportToTarget(target.chatId, target.threadId, report);
+
+      await this.telegramService.markMessagesReported(
+        storedMessages.map((m) => m.id),
+        savedReport.id,
+      );
+
+      if (
+        summaryTarget &&
+        (summaryTarget.chatId !== chatId ||
+          (summaryTarget.threadId ?? null) !== sourceThreadId)
+      ) {
+        await ctx.reply(
+          '✅ Отчёт отправлен в настроенный топик, буфер очищен.',
+        );
+      }
     } catch (error) {
       this.logger.error('Report error:', error);
       await ctx.reply('❌ Ошибка при формировании отчёта. Попробуйте ещё раз.');
+    }
+  }
+
+  private async sendReportToTarget(
+    chatId: number,
+    threadId: number | null,
+    report: string,
+  ): Promise<void> {
+    if (report.length > 4000) {
+      const chunks = this.chunkString(report, 4000);
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
+        const text = isLast
+          ? chunks[i] + '\n\n✅ Отчёт готов, буфер очищен.'
+          : chunks[i];
+        await this.bot.telegram.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          message_thread_id: threadId ?? undefined,
+        });
+      }
+      return;
+    }
+
+    await this.bot.telegram.sendMessage(
+      chatId,
+      report + '\n\n✅ Отчёт готов, буфер очищен.',
+      {
+        parse_mode: 'HTML',
+        message_thread_id: threadId ?? undefined,
+      },
+    );
+  }
+
+  private async deleteMessageIfPossible(
+    ctx: Context,
+    messageId: number,
+  ): Promise<void> {
+    try {
+      await ctx.deleteMessage(messageId);
+    } catch (error) {
+      this.logger.warn(`Could not delete status message ${messageId}`);
     }
   }
 
@@ -243,16 +510,16 @@ export class TelegramUpdate implements OnModuleInit {
       }
     });
 
-    const sectionLines = (
-      items: string[],
-      emptyLabel = '— нет',
-    ): string => (items.length > 0 ? items.join('\n') : emptyLabel);
+    const sectionLines = (items: string[], emptyLabel = '— нет'): string =>
+      items.length > 0 ? items.join('\n') : emptyLabel;
 
     const dictionaryLines = fromDictionary.map(
-      (item, index) => `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
+      (item, index) =>
+        `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
     );
     const translatedLines = translated.map(
-      (item, index) => `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
+      (item, index) =>
+        `${index + 1}. <b>${item.word}</b> — ${item.translation}`,
     );
     const untranslatedLines = untranslated.map(
       (item, index) => `${index + 1}. <b>${item.word}</b>`,

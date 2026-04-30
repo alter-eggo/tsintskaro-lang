@@ -6,6 +6,7 @@ import * as fs from 'fs';
 export interface DictionaryEntry {
   word: string;
   translation: string;
+  partOfSpeech?: string;
 }
 
 @Injectable()
@@ -69,13 +70,18 @@ export class DictionaryService implements OnModuleInit {
   private loadFromJson(filePath: string) {
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
-      const data = JSON.parse(raw) as { entries?: { word: string; translation: string }[] };
+      const data = JSON.parse(raw) as {
+        entries?: { word: string; translation: string; partOfSpeech?: string }[];
+      };
       const entries = data.entries ?? [];
       for (const e of entries) {
         if (e.word && e.translation) {
           this.entries.push({
             word: String(e.word).trim().toLowerCase(),
             translation: String(e.translation).trim(),
+            partOfSpeech: e.partOfSpeech
+              ? String(e.partOfSpeech).trim().toLowerCase()
+              : undefined,
           });
         }
       }
