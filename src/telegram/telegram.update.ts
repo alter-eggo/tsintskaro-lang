@@ -303,12 +303,7 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     await ctx.reply('🚀 Отправляю пару опросов (с задержкой 30 секунд)...');
-    const result = await this.pollScheduler.sendBoth();
-    await ctx.reply(
-      `Готово.\n` +
-        `Цинцкарское→русское: ${result.tsToRu ? '✅' : '❌'}\n` +
-        `Русское→цинцкарское: ${result.ruToTs ? '✅' : '❌'}`,
-    );
+    await this.pollScheduler.sendBoth();
   }
 
   @Command('threadid')
