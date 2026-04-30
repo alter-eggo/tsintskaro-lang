@@ -80,7 +80,7 @@ export class PollSchedulerService {
         quiz.options,
         {
           correct_option_id: quiz.correctIndex,
-          is_anonymous: true,
+          is_anonymous: false,
           message_thread_id: threadId ?? undefined,
         },
       );
