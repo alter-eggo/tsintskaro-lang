@@ -72,9 +72,12 @@ export class TelegramUpdate implements OnModuleInit {
     return ctx.chat?.type === 'private';
   }
 
+  private isAdmin(username: string | undefined): boolean {
+    return username === 'AAlxnv' || username === 'MEMazmanova';
+  }
+
   private async requireAdmin(ctx: Context): Promise<boolean> {
-    const username = ctx.from?.username;
-    const isAdmin = username === 'AAlxnv' || username === 'MEMazmanova';
+    const isAdmin = this.isAdmin(ctx.from?.username);
     if (!isAdmin) {
       await ctx.reply('Команды боту доступны только администраторам');
     }
@@ -96,11 +99,17 @@ export class TelegramUpdate implements OnModuleInit {
     };
     const text = message.text;
     const threadId = message.message_thread_id;
+    const username = message.from?.username || 'anonymous';
+
+    if (TelegramUpdate.BOT_MENTION_REGEX.test(text)) {
+      await this.handleBotMention(ctx, text, username, message.message_id);
+      return;
+    }
+
     this.logger.log(
       `[Chat ${chatId}${threadId ? ` / thread ${threadId}` : ''}] Received text: "${text}"`,
     );
 
-    const username = message.from?.username || 'anonymous';
     const sentAt = message.date ? new Date(message.date * 1000) : new Date();
     const count = await this.telegramService.addMessage(
       chatId,
@@ -116,6 +125,174 @@ export class TelegramUpdate implements OnModuleInit {
 
     if (count >= this.threshold) {
       await this.generateReport(ctx);
+    }
+  }
+
+  private static readonly BOT_MENTION_REGEX = /^\s*бот[\s,:!.\-—]/i;
+  private static readonly MAX_DELETE_BATCH = 10;
+
+  private async handleBotMention(
+    ctx: Context,
+    text: string,
+    username: string,
+    messageId: number | undefined,
+  ): Promise<void> {
+    const chatId = ctx.chat!.id;
+    this.logger.log(`[Chat ${chatId}] @${username} addressed bot: "${text}"`);
+
+    let result;
+    try {
+      result = await this.openaiService.processBotMention(text);
+    } catch (err) {
+      this.logger.error(`[Chat ${chatId}] AI processBotMention failed:`, err);
+      if (messageId != null) {
+        await ctx.reply('Не получилось обработать сообщение, попробуй ещё раз.', {
+          reply_parameters: { message_id: messageId },
+        });
+      }
+      return;
+    }
+
+    if (result.action === 'reply') {
+      this.logger.log(`[Chat ${chatId}] AI reply: ${result.message}`);
+      if (messageId != null) {
+        await ctx.reply(result.message, {
+          reply_parameters: { message_id: messageId },
+        });
+      }
+      return;
+    }
+
+    if (result.action === 'delete_words') {
+      if (!this.isAdmin(username)) {
+        this.logger.log(`[Chat ${chatId}] Non-admin @${username} tried to delete: ${result.words.join(', ')}`);
+        if (messageId != null) {
+          await ctx.reply('🚫 Удалять слова из словаря могут только администраторы.', {
+            reply_parameters: { message_id: messageId },
+          });
+        }
+        return;
+      }
+
+      if (result.words.length > TelegramUpdate.MAX_DELETE_BATCH) {
+        this.logger.warn(
+          `[Chat ${chatId}] @${username} delete batch too big: ${result.words.length} words — refused`,
+        );
+        if (messageId != null) {
+          await ctx.reply(
+            `🚫 Нельзя удалить больше ${TelegramUpdate.MAX_DELETE_BATCH} слов за один раз. Перечисли меньше слов или удаляй по частям.`,
+            { reply_parameters: { message_id: messageId } },
+          );
+        }
+        return;
+      }
+
+      try {
+        const { deleted, notFound } = await this.dictionaryService.deleteWords(result.words);
+        this.logger.log(
+          `[Chat ${chatId}] Admin @${username} deleted: [${deleted.join(', ')}], notFound: [${notFound.join(', ')}]`,
+        );
+
+        if (messageId != null) {
+          const lines: string[] = [];
+          if (deleted.length > 0) {
+            lines.push(deleted.length === 1 ? '🗑 удалил:' : `🗑 удалил (${deleted.length}):`);
+            for (const w of deleted) lines.push(`• ${w}`);
+          }
+          if (notFound.length > 0) {
+            if (lines.length > 0) lines.push('');
+            lines.push(`⚠️ нет в словаре: ${notFound.join(', ')}`);
+          }
+          if (lines.length === 0) {
+            lines.push('Нечего удалять.');
+          }
+
+          await ctx.reply(lines.join('\n'), {
+            reply_parameters: { message_id: messageId },
+          });
+
+          if (deleted.length > 0) {
+            try {
+              await ctx.telegram.setMessageReaction(chatId, messageId, [
+                { type: 'emoji', emoji: '👍' },
+              ]);
+            } catch (err) {
+              this.logger.warn(`Failed to set reaction: ${err}`);
+            }
+          }
+        }
+      } catch (err) {
+        this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
+        if (messageId != null) {
+          await ctx.reply('Ошибка при удалении слов из словаря.', {
+            reply_parameters: { message_id: messageId },
+          });
+        }
+      }
+      return;
+    }
+
+    // action === 'add_words'
+    const created: string[] = [];
+    const updated: string[] = [];
+    const failed: { word: string; err: unknown }[] = [];
+
+    for (const entry of result.entries) {
+      try {
+        const upserted = await this.dictionaryService.upsertWord({
+          word: entry.word,
+          translation: entry.translation,
+          partOfSpeech: entry.partOfSpeech,
+          addedBy: username,
+        });
+        const posTag = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
+        const line = `${entry.word} — ${entry.translation}${posTag}`;
+        (upserted.created ? created : updated).push(line);
+        this.logger.log(
+          `[Chat ${chatId}] Dictionary ${upserted.created ? 'created' : 'updated'} by @${username}: ${entry.word} = ${entry.translation}${posTag}`,
+        );
+      } catch (err) {
+        this.logger.error(`[Chat ${chatId}] upsertWord failed for "${entry.word}":`, err);
+        failed.push({ word: entry.word, err });
+      }
+    }
+
+    if (messageId != null) {
+      const lines: string[] = [];
+      if (created.length > 0) {
+        lines.push(created.length === 1 ? `✅ записал:` : `✅ записал (${created.length}):`);
+        for (const l of created) lines.push(`• ${l}`);
+      }
+      if (updated.length > 0) {
+        if (lines.length > 0) lines.push('');
+        lines.push(updated.length === 1 ? `🔄 обновил:` : `🔄 обновил (${updated.length}):`);
+        for (const l of updated) lines.push(`• ${l}`);
+      }
+      if (failed.length > 0) {
+        if (lines.length > 0) lines.push('');
+        lines.push(`⚠️ не получилось сохранить: ${failed.map((f) => f.word).join(', ')}`);
+      }
+
+      if (lines.length === 0) {
+        await ctx.reply('Не получилось ничего сохранить.', {
+          reply_parameters: { message_id: messageId },
+        });
+        return;
+      }
+
+      await ctx.reply(lines.join('\n'), {
+        reply_parameters: { message_id: messageId },
+      });
+
+      if (created.length + updated.length > 0) {
+        try {
+          await ctx.telegram.setMessageReaction(chatId, messageId, [
+            { type: 'emoji', emoji: '👍' },
+          ]);
+        } catch (err) {
+          this.logger.warn(`Failed to set reaction: ${err}`);
+        }
+      }
     }
   }
 
@@ -363,7 +540,7 @@ export class TelegramUpdate implements OnModuleInit {
 
       await this.deleteMessageIfPossible(ctx, statusMsg.message_id);
 
-      let report = this.formatReport(words);
+      let report = await this.formatReport(words);
       const summary = discussionResult.discussionSummary || '';
       if (summary) {
         const escapedSummary = summary
@@ -463,13 +640,13 @@ export class TelegramUpdate implements OnModuleInit {
     return many;
   }
 
-  private formatReport(
+  private async formatReport(
     words: Array<{
       word: string;
       possibleTranslation: string | null;
       context: string;
     }>,
-  ): string {
+  ): Promise<string> {
     // Deduplicate words by their lowercase form, keeping first occurrence
     const seen = new Set<string>();
     const uniqueWords = words.filter((w) => {
@@ -483,14 +660,14 @@ export class TelegramUpdate implements OnModuleInit {
     const translated: Array<{ word: string; translation: string }> = [];
     const untranslated: Array<{ word: string }> = [];
 
-    uniqueWords.forEach((w) => {
-      const dictionaryEntry = this.dictionaryService.findWord(w.word);
+    for (const w of uniqueWords) {
+      const dictionaryEntry = await this.dictionaryService.findWord(w.word);
       if (dictionaryEntry) {
         fromDictionary.push({
           word: w.word,
           translation: dictionaryEntry.translation,
         });
-        return;
+        continue;
       }
 
       const normalizedTranslation =
@@ -503,7 +680,7 @@ export class TelegramUpdate implements OnModuleInit {
       } else {
         untranslated.push({ word: w.word });
       }
-    });
+    }
 
     const sectionLines = (items: string[], emptyLabel = '— нет'): string =>
       items.length > 0 ? items.join('\n') : emptyLabel;

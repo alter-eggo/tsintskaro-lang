@@ -47,6 +47,18 @@ export interface ProcessDiscussionResult {
   duplicatesRemoved: number;
 }
 
+export interface DictionaryEntryInput {
+  word: string;
+  translation: string;
+  partOfSpeech: string | null;
+}
+
+/** Result of processing a "Бот, ..." message */
+export type BotMentionResult =
+  | { action: 'add_words'; entries: DictionaryEntryInput[] }
+  | { action: 'delete_words'; words: string[] }
+  | { action: 'reply'; message: string };
+
 const MODEL_NAME = 'gpt-5.2';
 
 @Injectable()
@@ -62,9 +74,114 @@ export class OpenaiService {
     });
   }
 
+  async processBotMention(text: string): Promise<BotMentionResult> {
+    const dictionary = await this.dictionaryService.getFormattedForPrompt();
+    const dictionarySection = dictionary
+      ? `\nТЕКУЩИЙ СЛОВАРЬ (используй для ответов на вопросы о значениях слов):\n${dictionary}\n`
+      : '';
+
+    const prompt = `Ты помощник Telegram-бота в чате жителей села Цинцкаро (Грузия). Они говорят по-русски и используют слова цинцкарского диалекта (смесь старого азербайджанского и восточно-анатолийского турецкого, записан кириллицей). Главная функция бота — поддерживать словарь цинцкарского.
+
+Пользователи обращаются к боту, начиная сообщение со слова "Бот". После этого они могут: добавить новое слово в словарь, спросить про значение слова, задать общий вопрос, поздороваться, поболтать.
+
+ТВОЯ ЗАДАЧА: понять что хочет пользователь и вернуть одно из двух действий.
+
+ВАРИАНТ 1 — ДОБАВИТЬ СЛОВА В СЛОВАРЬ. Выбирай этот вариант когда пользователь явно говорит "добавь", "запиши", "новое слово", "есть такое слово", "пиши", и при этом указывает пары "слово-перевод" (одну или несколько):
+{"action": "add_words", "entries": [{"word": "...", "translation": "...", "partOfSpeech": "..." или null}, ...]}
+
+ПРАВИЛА извлечения:
+- "entries" — массив. Может быть из одного элемента, может из нескольких если в сообщении сразу несколько пар.
+- "word" — цинцкарское слово, кириллицей, нижний регистр, без знаков препинания.
+- "translation" — перевод на русский: одно слово, фраза, описание, несколько вариантов через запятую. Сохраняй примеры в скобках. НЕ обрезай длинные переводы.
+- "partOfSpeech" — сокращённо ("сущ.", "гл.", "прил.", "нар.", "мест.", "межд.", "предл.", "союз", "числ.", "част.") если явно указана или однозначна. Иначе null.
+- Игнорируй обращение и вводные слова ("Бот", "добавь", "запиши", "новое слово", "пожалуйста", "это", "и" и т.п.) — они не часть слова/перевода.
+- Если в сообщении несколько слов — извлеки ВСЕ пары, не выбрасывай.
+
+ВАРИАНТ 2 — УДАЛИТЬ КОНКРЕТНЫЕ СЛОВА ИЗ СЛОВАРЯ. Выбирай этот вариант когда пользователь явно говорит "удали", "убери", "сотри", "это не цинцкарское слово", "ошибка, не записывай" и указывает какое именно слово (или несколько) убрать:
+{"action": "delete_words", "words": ["...", "..."]}
+
+ПРАВИЛА:
+- "words" — массив цинцкарских слов которые нужно удалить, кириллицей, в нижнем регистре, без знаков препинания.
+- Извлекай только сами слова, не переводы.
+- Максимум 10 слов за раз. Если просят больше — обрежь до 10.
+
+🚫 ЗАПРЕЩЕНО — массовое удаление. Если пользователь просит "удали ВСЕ слова", "удали весь словарь", "очисти словарь", "удали всё на букву X", "удали все существительные", "удали ту половину" и любые другие массовые/общие удаления — НЕ возвращай action "delete_words". Вместо этого верни:
+{"action": "reply", "message": "Массово удалить слова нельзя — это опасная операция. Если нужно удалить конкретные слова, перечисли их (до 10 за раз)."}
+
+ВАРИАНТ 3 — ОТВЕТИТЬ ПОЛЬЗОВАТЕЛЮ (всё остальное: вопросы, болтовня, приветствия, просьбы что-то рассказать или объяснить):
+{"action": "reply", "message": "твой ответ"}
+
+ПРАВИЛА для ответа:
+- На русском, дружелюбно, по делу. Максимум 3 предложения, лучше короче.
+- Если спрашивают значение цинцкарского слова — ищи в словаре выше. Если слова там нет — честно скажи "такого слова в нашем словаре нет". НЕ выдумывай переводы цинцкарских слов из своей фантазии.
+- Если просят перевести с русского на цинцкарский — ищи в словаре. Если нет — так и скажи.
+- На общие вопросы (не про цинцкарский) отвечай как обычный ассистент.
+- Если непонятно что хочет пользователь — мягко переспроси.
+${dictionarySection}
+Сообщение пользователя:
+"""
+${text}
+"""
+
+Ответь ТОЛЬКО валидным JSON.`;
+
+    const response = await this.openai.chat.completions.create({
+      model: MODEL_NAME,
+      messages: [{ role: 'user', content: prompt }],
+      response_format: { type: 'json_object' },
+    });
+
+    const content = response.choices[0].message.content || '{}';
+    const parsed = JSON.parse(content);
+
+    if (parsed.action === 'add_words' && Array.isArray(parsed.entries)) {
+      const entries: DictionaryEntryInput[] = [];
+      for (const raw of parsed.entries) {
+        if (
+          raw &&
+          typeof raw.word === 'string' &&
+          typeof raw.translation === 'string' &&
+          raw.word.trim() &&
+          raw.translation.trim()
+        ) {
+          const pos =
+            typeof raw.partOfSpeech === 'string' && raw.partOfSpeech.trim()
+              ? raw.partOfSpeech.trim()
+              : null;
+          entries.push({
+            word: raw.word.toLowerCase().trim(),
+            translation: raw.translation.trim(),
+            partOfSpeech: pos,
+          });
+        }
+      }
+      if (entries.length > 0) {
+        return { action: 'add_words', entries };
+      }
+    }
+
+    if (parsed.action === 'delete_words' && Array.isArray(parsed.words)) {
+      const words = parsed.words
+        .filter((w: unknown): w is string => typeof w === 'string' && w.trim().length > 0)
+        .map((w: string) => w.toLowerCase().trim());
+      if (words.length > 0) {
+        return { action: 'delete_words', words };
+      }
+    }
+
+    if (parsed.action === 'reply' && typeof parsed.message === 'string') {
+      return { action: 'reply', message: parsed.message.trim() };
+    }
+
+    return {
+      action: 'reply',
+      message: 'Не понял что нужно сделать. Можешь переформулировать?',
+    };
+  }
+
   async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
     const combinedText = messages.join('\n---\n');
-    const dictionary = this.dictionaryService.getFormattedForPrompt();
+    const dictionary = await this.dictionaryService.getFormattedForPrompt();
 
     const dictionarySection = dictionary
       ? `\nИзвестные слова из словаря (используй эти переводы):\n${dictionary}\n`
@@ -172,7 +289,7 @@ ${formattedMessages}
       .map((m) => `[${m.username}]: ${m.text}`)
       .join('\n');
 
-    const dictionary = this.dictionaryService.getFormattedForPrompt();
+    const dictionary = await this.dictionaryService.getFormattedForPrompt();
     const dictionarySection = dictionary
       ? `\nИзвестные слова из словаря (предпочтительные переводы):\n${dictionary}\n`
       : '';

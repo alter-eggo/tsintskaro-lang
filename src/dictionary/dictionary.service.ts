@@ -1,7 +1,8 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import * as XLSX from 'xlsx';
-import * as path from 'path';
-import * as fs from 'fs';
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
+import { Word } from './entities/word.entity';
+import { compareTsintskaroWords } from './sheets-parser';
 
 export interface DictionaryEntry {
   word: string;
@@ -9,139 +10,117 @@ export interface DictionaryEntry {
   partOfSpeech?: string;
 }
 
-@Injectable()
-export class DictionaryService implements OnModuleInit {
-  private readonly logger = new Logger(DictionaryService.name);
-  private entries: DictionaryEntry[] = [];
+export interface UpsertWordInput {
+  word: string;
+  translation: string;
+  partOfSpeech?: string | null;
+  addedBy?: string | null;
+}
 
-  onModuleInit() {
-    this.loadDictionary();
+@Injectable()
+export class DictionaryService {
+  private readonly logger = new Logger(DictionaryService.name);
+
+  private cache: DictionaryEntry[] | null = null;
+  private cacheById: Map<string, DictionaryEntry> | null = null;
+
+  constructor(
+    @InjectRepository(Word)
+    private readonly wordRepo: Repository<Word>,
+  ) {}
+
+  private invalidateCache() {
+    this.cache = null;
+    this.cacheById = null;
   }
 
   reload() {
-    this.entries = [];
-    this.loadDictionary();
+    this.invalidateCache();
   }
 
-  private loadDictionary() {
-    const jsonPaths = [
-      path.join(__dirname, '..', 'assets', 'dictionary.json'),
-      path.join(process.cwd(), 'src', 'assets', 'dictionary.json'),
-      path.join(process.cwd(), 'dist', 'assets', 'dictionary.json'),
-    ];
+  private async ensureCache(): Promise<void> {
+    if (this.cache && this.cacheById) return;
+    const rows = await this.wordRepo.find();
+    const entries: DictionaryEntry[] = rows.map((r) => ({
+      word: r.word,
+      translation: r.translation,
+      partOfSpeech: r.partOfSpeech ?? undefined,
+    }));
+    entries.sort((a, b) => compareTsintskaroWords(a.word, b.word));
+    this.cache = entries;
+    this.cacheById = new Map(entries.map((e) => [e.word, e]));
+    this.logger.log(`Loaded ${entries.length} dictionary entries from DB`);
+  }
 
-    for (const p of jsonPaths) {
-      try {
-        fs.accessSync(p);
-        this.logger.log(`Found dictionary JSON at: ${p}`);
-        this.loadFromJson(p);
-        return;
-      } catch {
-        // File not found, try next
-      }
+  async getEntries(): Promise<DictionaryEntry[]> {
+    await this.ensureCache();
+    return this.cache!;
+  }
+
+  async getFormattedForPrompt(): Promise<string> {
+    await this.ensureCache();
+    if (this.cache!.length === 0) return '';
+    return this.cache!.map((e) => `${e.word} = ${e.translation}`).join('\n');
+  }
+
+  async findWord(word: string): Promise<DictionaryEntry | undefined> {
+    await this.ensureCache();
+    return this.cacheById!.get(word.toLowerCase().trim());
+  }
+
+  async deleteWords(words: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    const normalized = Array.from(
+      new Set(words.map((w) => w.toLowerCase().trim()).filter((w) => w.length > 0)),
+    );
+    if (normalized.length === 0) {
+      return { deleted: [], notFound: [] };
     }
 
-    const xlsxPaths = [
-      path.join(__dirname, '..', 'assets', 'disctionary.xlsx'),
-      path.join(process.cwd(), 'src', 'assets', 'disctionary.xlsx'),
-      path.join(process.cwd(), 'dist', 'assets', 'disctionary.xlsx'),
-    ];
+    const existing = await this.wordRepo.find({
+      where: { word: In(normalized) },
+      select: { word: true },
+    });
+    const existingSet = new Set(existing.map((e) => e.word));
 
-    let filePath: string | null = null;
-    for (const p of xlsxPaths) {
-      try {
-        fs.accessSync(p);
-        filePath = p;
-        this.logger.log(`Found dictionary at: ${p}`);
-        break;
-      } catch {
-        // File not found at this path, try next
-      }
+    const deleted = normalized.filter((w) => existingSet.has(w));
+    const notFound = normalized.filter((w) => !existingSet.has(w));
+
+    if (deleted.length > 0) {
+      await this.wordRepo.delete({ word: In(deleted) });
+      this.invalidateCache();
     }
 
-    if (!filePath) {
-      this.logger.error(`Dictionary not found. Tried JSON: ${jsonPaths.join(', ')} and xlsx: ${xlsxPaths.join(', ')}`);
-      return;
+    return { deleted, notFound };
+  }
+
+  async upsertWord(input: UpsertWordInput): Promise<{ created: boolean; word: Word }> {
+    const normalizedWord = input.word.toLowerCase().trim();
+    const existing = await this.wordRepo.findOne({ where: { word: normalizedWord } });
+
+    if (existing) {
+      existing.translation = input.translation;
+      if (input.partOfSpeech !== undefined) {
+        existing.partOfSpeech = input.partOfSpeech;
+      }
+      if (input.addedBy !== undefined) {
+        existing.addedBy = input.addedBy;
+      }
+      existing.source = 'chat';
+      const saved = await this.wordRepo.save(existing);
+      this.invalidateCache();
+      return { created: false, word: saved };
     }
 
-    this.loadFromXlsx(filePath);
-  }
-
-  private loadFromJson(filePath: string) {
-    try {
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const data = JSON.parse(raw) as {
-        entries?: { word: string; translation: string; partOfSpeech?: string }[];
-      };
-      const entries = data.entries ?? [];
-      for (const e of entries) {
-        if (e.word && e.translation) {
-          this.entries.push({
-            word: String(e.word).trim().toLowerCase(),
-            translation: String(e.translation).trim(),
-            partOfSpeech: e.partOfSpeech
-              ? String(e.partOfSpeech).trim().toLowerCase()
-              : undefined,
-          });
-        }
-      }
-      this.logger.log(`Loaded ${this.entries.length} dictionary entries from JSON: ${filePath}`);
-      if (this.entries.length > 0) {
-        const sample = this.entries.slice(0, 3).map((e) => `${e.word}=${e.translation}`).join(', ');
-        this.logger.log(`Sample entries: ${sample}`);
-      }
-    } catch (error) {
-      this.logger.error('Failed to load dictionary from JSON:', error);
-    }
-  }
-
-  private loadFromXlsx(filePath: string) {
-    try {
-      const workbook = XLSX.readFile(filePath);
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1 });
-      const startRow = this.looksLikeHeader(rows[0]) ? 1 : 0;
-
-      for (let i = startRow; i < rows.length; i++) {
-        const row = rows[i];
-        if (row && row[0] && row[1]) {
-          this.entries.push({
-            word: String(row[0]).trim().toLowerCase(),
-            translation: String(row[1]).trim(),
-          });
-        }
-      }
-
-      this.logger.log(`Loaded ${this.entries.length} dictionary entries`);
-      if (this.entries.length > 0) {
-        const sample = this.entries.slice(0, 3).map((e) => `${e.word}=${e.translation}`).join(', ');
-        this.logger.log(`Sample entries: ${sample}`);
-      }
-    } catch (error) {
-      this.logger.error('Failed to load dictionary:', error);
-    }
-  }
-
-  private looksLikeHeader(row: string[]): boolean {
-    if (!row || !row[0]) return false;
-    const firstCell = String(row[0]).toLowerCase();
-    return ['word', 'слово', 'söz', 'სიტყვა'].some(h => firstCell.includes(h));
-  }
-
-  getEntries(): DictionaryEntry[] {
-    return this.entries;
-  }
-
-  getFormattedForPrompt(): string {
-    if (this.entries.length === 0) return '';
-    
-    return this.entries
-      .map(e => `${e.word} = ${e.translation}`)
-      .join('\n');
-  }
-
-  findWord(word: string): DictionaryEntry | undefined {
-    return this.entries.find(e => e.word === word.toLowerCase().trim());
+    const created = this.wordRepo.create({
+      word: normalizedWord,
+      translation: input.translation,
+      partOfSpeech: input.partOfSpeech ?? null,
+      comments: null,
+      source: 'chat',
+      addedBy: input.addedBy ?? null,
+    });
+    const saved = await this.wordRepo.save(created);
+    this.invalidateCache();
+    return { created: true, word: saved };
   }
 }

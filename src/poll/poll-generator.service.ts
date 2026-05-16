@@ -31,7 +31,7 @@ export class PollGeneratorService {
   ) { }
 
   async generate(direction: PollDirection): Promise<GeneratedQuiz | null> {
-    const entries = this.dictionary.getEntries();
+    const entries = await this.dictionary.getEntries();
     if (entries.length < OPTIONS_PER_QUIZ) {
       this.logger.warn(
         `Not enough dictionary entries (${entries.length}) to build a quiz`,

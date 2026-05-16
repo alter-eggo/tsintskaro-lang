@@ -11,6 +11,7 @@ import { PollHistory } from './poll/entities/poll-history.entity';
 import { CollectedMessage } from './telegram/entities/collected-message.entity';
 import { SummaryConfig } from './telegram/entities/summary-config.entity';
 import { SummaryReport } from './telegram/entities/summary-report.entity';
+import { Word } from './dictionary/entities/word.entity';
 import configuration from './config/configuration';
 
 @Module({
@@ -31,6 +32,7 @@ import configuration from './config/configuration';
           CollectedMessage,
           SummaryConfig,
           SummaryReport,
+          Word,
         ],
         synchronize: true,
       }),
