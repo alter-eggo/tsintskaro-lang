@@ -5,6 +5,14 @@
   "author": "",
   "private": true,
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@nestjs/core"
+    ]
+  },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -r src/assets dist/",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
