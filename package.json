@@ -6,7 +6,7 @@
   "private": true,
   "license": "UNLICENSED",
   "engines": {
-    "node": ">=20"
+    "node": "22.x"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
