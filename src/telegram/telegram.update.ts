@@ -1210,7 +1210,6 @@ export class TelegramUpdate implements OnModuleInit {
     }
     const result = await this.factDayScheduler.sendNext(true);
     if (result.sent) {
-      await ctx.reply(`✅ Отправил исторический квиз ${result.quizNumber}.`);
       return;
     }
     if (result.reason === 'not_configured') {
