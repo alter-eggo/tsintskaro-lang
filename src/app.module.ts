@@ -8,9 +8,12 @@ import { OpenaiModule } from './openai/openai.module';
 import { PollModule } from './poll/poll.module';
 import { PollConfig } from './poll/entities/poll-config.entity';
 import { PollHistory } from './poll/entities/poll-history.entity';
+import { FactDayModule } from './fact-day/fact-day.module';
+import { FactDayConfig } from './fact-day/entities/fact-day-config.entity';
 import { CollectedMessage } from './telegram/entities/collected-message.entity';
 import { SummaryConfig } from './telegram/entities/summary-config.entity';
 import { SummaryReport } from './telegram/entities/summary-report.entity';
+import { BotMemory } from './telegram/entities/bot-memory.entity';
 import { Word } from './dictionary/entities/word.entity';
 import configuration from './config/configuration';
 
@@ -29,9 +32,11 @@ import configuration from './config/configuration';
         entities: [
           PollConfig,
           PollHistory,
+          FactDayConfig,
           CollectedMessage,
           SummaryConfig,
           SummaryReport,
+          BotMemory,
           Word,
         ],
         synchronize: true,
@@ -48,6 +53,7 @@ import configuration from './config/configuration';
     TelegramModule,
     OpenaiModule,
     PollModule,
+    FactDayModule,
   ],
 })
 export class AppModule {}

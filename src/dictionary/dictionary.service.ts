@@ -17,6 +17,11 @@ export interface UpsertWordInput {
   addedBy?: string | null;
 }
 
+export interface DictionaryLeaderboardEntry {
+  username: string;
+  wordsCount: number;
+}
+
 @Injectable()
 export class DictionaryService {
   private readonly logger = new Logger(DictionaryService.name);
@@ -68,9 +73,13 @@ export class DictionaryService {
     return this.cacheById!.get(word.toLowerCase().trim());
   }
 
-  async deleteWords(words: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+  async deleteWords(
+    words: string[],
+  ): Promise<{ deleted: string[]; notFound: string[] }> {
     const normalized = Array.from(
-      new Set(words.map((w) => w.toLowerCase().trim()).filter((w) => w.length > 0)),
+      new Set(
+        words.map((w) => w.toLowerCase().trim()).filter((w) => w.length > 0),
+      ),
     );
     if (normalized.length === 0) {
       return { deleted: [], notFound: [] };
@@ -93,16 +102,20 @@ export class DictionaryService {
     return { deleted, notFound };
   }
 
-  async upsertWord(input: UpsertWordInput): Promise<{ created: boolean; word: Word }> {
+  async upsertWord(
+    input: UpsertWordInput,
+  ): Promise<{ created: boolean; word: Word }> {
     const normalizedWord = input.word.toLowerCase().trim();
-    const existing = await this.wordRepo.findOne({ where: { word: normalizedWord } });
+    const existing = await this.wordRepo.findOne({
+      where: { word: normalizedWord },
+    });
 
     if (existing) {
       existing.translation = input.translation;
       if (input.partOfSpeech !== undefined) {
         existing.partOfSpeech = input.partOfSpeech;
       }
-      if (input.addedBy !== undefined) {
+      if (input.addedBy !== undefined && !existing.addedBy) {
         existing.addedBy = input.addedBy;
       }
       existing.source = 'chat';
@@ -122,5 +135,25 @@ export class DictionaryService {
     const saved = await this.wordRepo.save(created);
     this.invalidateCache();
     return { created: true, word: saved };
+  }
+
+  async getLeaderboard(limit = 10): Promise<DictionaryLeaderboardEntry[]> {
+    const rows = await this.wordRepo
+      .createQueryBuilder('word')
+      .select('word.addedBy', 'username')
+      .addSelect('COUNT(word.id)', 'words_count')
+      .where('word.addedBy IS NOT NULL')
+      .andWhere("word.addedBy <> ''")
+      .andWhere('word.source = :source', { source: 'chat' })
+      .groupBy('word.addedBy')
+      .orderBy('COUNT(word.id)', 'DESC')
+      .addOrderBy('word.addedBy', 'ASC')
+      .limit(limit)
+      .getRawMany<{ username: string; words_count: string }>();
+
+    return rows.map((row) => ({
+      username: row.username,
+      wordsCount: Number(row.words_count),
+    }));
   }
 }

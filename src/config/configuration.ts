@@ -1,10 +1,12 @@
 export default () => {
   const isDev = process.env.NODE_ENV !== 'production';
   const pollEnableInDev = process.env.POLL_ENABLE_IN_DEV === 'true';
+  const factDayEnableInDev = process.env.FACT_DAY_ENABLE_IN_DEV === 'true';
 
   return {
     isDev,
     pollEnableInDev,
+    factDayEnableInDev,
     telegramToken: isDev
       ? process.env.TELEGRAM_BOT_TOKEN_DEV
       : process.env.TELEGRAM_BOT_TOKEN,

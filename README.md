@@ -10,25 +10,28 @@ This tool helps collect, analyze, and translate the Tsintskaro dialect—a uniqu
 
 ## ✨ Features
 
-*   **Cultural Preservation**: Automatically identifies ancestral dialect words mixed into Russian conversations in Telegram groups.
-*   **AI Analysis**: Uses **OpenAI (GPT-4o)** to distinguish dialect words from standard Russian and infer meanings from context.
-*   **Dictionary Integration**: Cross-references findings with a curated digital dictionary (`.xlsx`) to validate and catalog the language.
-*   **Community Reporting**: Every 100 messages (or on demand) the bot generates one report: agreed and disputed dialect words plus a detailed description of the discussion. All in Russian.
-*   **Admin Tools**: `/report` (create report now), `/status`, `/clear`.
+- **Cultural Preservation**: Automatically identifies ancestral dialect words mixed into Russian conversations in Telegram groups.
+- **AI Analysis**: Uses **OpenAI (GPT-4o)** to distinguish dialect words from standard Russian and infer meanings from context.
+- **Dictionary Integration**: Cross-references findings with a curated digital dictionary (`.xlsx`) to validate and catalog the language.
+- **Community Reporting**: Every 100 messages (or on demand) the bot generates one report: agreed and disputed dialect words plus a detailed description of the discussion. All in Russian.
+- **Fact of the Day**: Sends one historical fact about Tsintskaro every day at 11:00 Asia/Tbilisi to the thread where `/startfactday` was called. It can be paused with `/stopfactday`.
+- **Dictionary Leaderboard**: `/leaderboard` shows who added the most words through the chat.
+- **Bot Memory**: Admins can manage stored bot instructions from Telegram with `/memory`, `/memoryadd`, `/memoryedit`, and `/memorydel`.
+- **Admin Tools**: `/report` (create report now), `/status`, `/clear`, `/startfactday`, `/stopfactday`, `/factdaystatus`, `/factdaynow`, `/memory`.
 
 ## 🛠 Technical Stack
 
-*   **Framework**: [NestJS](https://nestjs.com/) (Node.js)
-*   **Platform**: Telegram Bot API (`nestjs-telegraf`)
-*   **NLP**: OpenAI API for linguistic analysis
-*   **Data Storage**: Excel-based dictionary management (`xlsx`)
+- **Framework**: [NestJS](https://nestjs.com/) (Node.js)
+- **Platform**: Telegram Bot API (`nestjs-telegraf`)
+- **NLP**: OpenAI API for linguistic analysis
+- **Data Storage**: Excel-based dictionary management (`xlsx`)
 
 ## 🚀 Setup & Installation
 
 ### Prerequisites
 
-*   Node.js (v18+)
-*   pnpm
+- Node.js (v18+)
+- pnpm
 
 ### Installation
 
@@ -45,6 +48,7 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 OPENAI_API_KEY=your_openai_api_key
 # Optional
 MESSAGE_THRESHOLD=100
+FACT_DAY_ENABLE_IN_DEV=false
 ```
 
 ### Running the app

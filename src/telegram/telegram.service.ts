@@ -4,6 +4,22 @@ import { In, IsNull, Repository } from 'typeorm';
 import { CollectedMessage } from './entities/collected-message.entity';
 import { SummaryConfig } from './entities/summary-config.entity';
 import { SummaryReport } from './entities/summary-report.entity';
+import { BotMemory } from './entities/bot-memory.entity';
+
+export const GLOBAL_BOT_MEMORY_CHAT_ID = 0;
+const DEFAULT_WORKING_LINKS_MEMORY_KEY = 'working-links-site-rule';
+const DEFAULT_GLOBAL_MEMORIES = [
+  {
+    memoryKey: DEFAULT_WORKING_LINKS_MEMORY_KEY,
+    text:
+      'Если пользователь просит скинуть рабочие ссылки, нужно прислать ссылку на сайт. ' +
+      'Точный URL сайта можно хранить отдельной записью памяти в формате: Сайт: https://...',
+  },
+  {
+    memoryKey: 'working-links-site-url',
+    text: 'Сайт: https://tsintskaro.vercel.app',
+  },
+] as const;
 
 interface CreateSummaryReportParams {
   sourceChatId: number;
@@ -18,6 +34,18 @@ interface CreateSummaryReportParams {
   createdBy: string | null;
 }
 
+export interface BotMemoryEntry {
+  id: number;
+  chatId: number;
+  threadId: number | null;
+  text: string;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedBy: string | null;
+  updatedAt: Date;
+  memoryKey: string | null;
+}
+
 @Injectable()
 export class TelegramService {
   private readonly logger = new Logger(TelegramService.name);
@@ -29,6 +57,8 @@ export class TelegramService {
     private readonly summaryConfigRepo: Repository<SummaryConfig>,
     @InjectRepository(SummaryReport)
     private readonly summaryReportRepo: Repository<SummaryReport>,
+    @InjectRepository(BotMemory)
+    private readonly botMemoryRepo: Repository<BotMemory>,
   ) {}
 
   async addMessage(
@@ -81,6 +111,166 @@ export class TelegramService {
     return this.messageRepo.count({
       where: { chatId, reportId: IsNull(), clearedAt: IsNull() },
     });
+  }
+
+  async getRecentMessages(
+    chatId: number,
+    threadId: number | null,
+    limit = 50,
+  ): Promise<{ username: string; text: string; sentAt: Date }[]> {
+    const where = threadId != null ? { chatId, threadId } : { chatId };
+    const rows = await this.messageRepo.find({
+      where,
+      order: { sentAt: 'DESC', id: 'DESC' },
+      take: limit,
+      select: { username: true, text: true, sentAt: true },
+    });
+    // Return in chronological order (oldest first) for natural reading
+    return rows.reverse().map((m) => ({
+      username: m.username,
+      text: m.text,
+      sentAt: m.sentAt,
+    }));
+  }
+
+  async addBotMemory(
+    chatId: number,
+    threadId: number | null,
+    text: string,
+    createdBy: string | null,
+  ): Promise<BotMemory> {
+    const entity = this.botMemoryRepo.create({
+      chatId,
+      threadId,
+      memoryKey: null,
+      text: text.trim(),
+      active: true,
+      createdBy,
+      updatedBy: createdBy,
+    });
+    const saved = await this.botMemoryRepo.save(entity);
+    this.logger.log(
+      `Bot memory added: chat=${chatId}, thread=${threadId ?? 'none'}, by=${createdBy ?? 'unknown'}`,
+    );
+    return saved;
+  }
+
+  async getBotMemory(chatId: number, limit = 50): Promise<BotMemoryEntry[]> {
+    const rows = await this.getVisibleBotMemoryRows(chatId, limit);
+    return rows.map((m) => this.toBotMemoryEntry(m));
+  }
+
+  async listBotMemory(chatId: number, limit = 50): Promise<BotMemoryEntry[]> {
+    const rows = await this.getVisibleBotMemoryRows(chatId, limit);
+    return rows.map((m) => this.toBotMemoryEntry(m));
+  }
+
+  async updateBotMemory(
+    chatId: number,
+    id: number,
+    text: string,
+    updatedBy: string | null,
+  ): Promise<BotMemoryEntry | null> {
+    await this.ensureDefaultGlobalMemory();
+    const entry = await this.botMemoryRepo.findOne({
+      where: [
+        { id, chatId, active: true },
+        { id, chatId: GLOBAL_BOT_MEMORY_CHAT_ID, active: true },
+      ],
+    });
+    if (!entry) return null;
+
+    entry.text = text.trim();
+    entry.updatedBy = updatedBy;
+    const saved = await this.botMemoryRepo.save(entry);
+    this.logger.log(
+      `Bot memory #${id} updated: chat=${entry.chatId}, by=${updatedBy ?? 'unknown'}`,
+    );
+    return this.toBotMemoryEntry(saved);
+  }
+
+  async deleteBotMemory(
+    chatId: number,
+    id: number,
+    updatedBy: string | null,
+  ): Promise<boolean> {
+    await this.ensureDefaultGlobalMemory();
+    const entry = await this.botMemoryRepo.findOne({
+      where: [
+        { id, chatId, active: true },
+        { id, chatId: GLOBAL_BOT_MEMORY_CHAT_ID, active: true },
+      ],
+    });
+    if (!entry) return false;
+
+    entry.active = false;
+    entry.updatedBy = updatedBy;
+    await this.botMemoryRepo.save(entry);
+    this.logger.log(
+      `Bot memory #${id} disabled: chat=${entry.chatId}, by=${updatedBy ?? 'unknown'}`,
+    );
+    return true;
+  }
+
+  private async getVisibleBotMemoryRows(
+    chatId: number,
+    limit: number,
+  ): Promise<BotMemory[]> {
+    await this.ensureDefaultGlobalMemory();
+    const [globalRows, chatRows] = await Promise.all([
+      this.botMemoryRepo.find({
+        where: { chatId: GLOBAL_BOT_MEMORY_CHAT_ID, active: true },
+        order: { createdAt: 'ASC', id: 'ASC' },
+      }),
+      this.botMemoryRepo.find({
+        where: { chatId, active: true },
+        order: { createdAt: 'DESC', id: 'DESC' },
+        take: limit,
+      }),
+    ]);
+
+    return [...globalRows, ...chatRows].sort((a, b) => {
+      const byDate = a.createdAt.getTime() - b.createdAt.getTime();
+      return byDate !== 0 ? byDate : a.id - b.id;
+    });
+  }
+
+  async ensureDefaultGlobalMemory(): Promise<void> {
+    for (const defaultMemory of DEFAULT_GLOBAL_MEMORIES) {
+      const existing = await this.botMemoryRepo.findOne({
+        where: { memoryKey: defaultMemory.memoryKey },
+      });
+      if (existing) continue;
+
+      await this.botMemoryRepo.save(
+        this.botMemoryRepo.create({
+          chatId: GLOBAL_BOT_MEMORY_CHAT_ID,
+          threadId: null,
+          memoryKey: defaultMemory.memoryKey,
+          text: defaultMemory.text,
+          active: true,
+          createdBy: 'system',
+          updatedBy: 'system',
+        }),
+      );
+      this.logger.log(
+        `Default global bot memory created: ${defaultMemory.memoryKey}`,
+      );
+    }
+  }
+
+  private toBotMemoryEntry(memory: BotMemory): BotMemoryEntry {
+    return {
+      id: memory.id,
+      chatId: memory.chatId,
+      threadId: memory.threadId,
+      text: memory.text,
+      createdBy: memory.createdBy,
+      createdAt: memory.createdAt,
+      updatedBy: memory.updatedBy,
+      updatedAt: memory.updatedAt,
+      memoryKey: memory.memoryKey,
+    };
   }
 
   async setSummaryTarget(
