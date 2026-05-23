@@ -13,7 +13,7 @@ const DEFAULT_GLOBAL_MEMORIES = [
     memoryKey: DEFAULT_WORKING_LINKS_MEMORY_KEY,
     text:
       'Если пользователь просит скинуть рабочие ссылки, нужно прислать ссылку на сайт. ' +
-      'Точный URL сайта можно хранить отдельной записью памяти в формате: Сайт: https://...',
+      'Точный URL сайта хранится отдельной записью памяти с пометкой "Сайт:".',
   },
   {
     memoryKey: 'working-links-site-url',

@@ -170,7 +170,8 @@ export class TelegramUpdate implements OnModuleInit {
   private static readonly LEADERBOARD_REQUEST_REGEX =
     /(?:лидер|топ|рейтинг|таблиц\w*\s+лидер|кто\s+(?:больше|больше\s+всех|больше\s+всего|много)[\s\S]{0,40}(?:слов|слова|добав)|кто[\s\S]{0,40}(?:добавил|добавляет)[\s\S]{0,40}(?:слов|слова))/i;
 
-  private static readonly URL_REGEX = /https?:\/\/[^\s<>()"']+/i;
+  private static readonly URL_REGEX =
+    /https?:\/\/[^\s<>()"']*[A-Za-z0-9-]+\.[A-Za-z]{2,}[^\s<>()"']*/i;
 
   private async handleBotMention(
     ctx: Context,
@@ -533,7 +534,7 @@ export class TelegramUpdate implements OnModuleInit {
 
     const message = siteUrl
       ? `Рабочая ссылка: ${siteUrl}`
-      : 'Ссылка на сайт пока не сохранена. Добавь её в память: /memoryadd Сайт: https://...';
+      : 'Ссылка на сайт пока не сохранена. Добавь её в память командой /memoryadd Сайт: и вставь полный URL.';
 
     if (messageId != null) {
       await ctx.reply(message, {
