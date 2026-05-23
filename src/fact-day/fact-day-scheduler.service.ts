@@ -4,14 +4,17 @@ import { Cron } from '@nestjs/schedule';
 import { InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { FactDayConfigService } from './fact-day-config.service';
-import { TSINTSKARO_HISTORY_FACTS } from './tsintskaro-history-facts';
+import {
+  TSINTSKARO_HISTORY_QUIZZES,
+  TsintskaroHistoryQuiz,
+} from './tsintskaro-history-quizzes';
 
 export const FACT_DAY_CRON = '0 11 * * *';
 export const FACT_DAY_TZ = 'Asia/Tbilisi';
 
 type FactDaySendResult = {
   sent: boolean;
-  factNumber?: number;
+  quizNumber?: number;
   reason?: 'not_configured' | 'disabled' | 'already_sent' | 'send_failed';
 };
 
@@ -43,14 +46,14 @@ export class FactDaySchedulerService {
     const target = await this.factDayConfig.get();
     if (!target) {
       this.logger.log(
-        'Skipping fact day — target chat not configured (run /startfactday)',
+        'Skipping history quiz — target chat not configured (run /startfactday)',
       );
       return { sent: false, reason: 'not_configured' };
     }
 
     if (target.enabled === false) {
       this.logger.log(
-        `Skipping fact day — disabled for chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
+        `Skipping history quiz — disabled for chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
       );
       return { sent: false, reason: 'disabled' };
     }
@@ -58,37 +61,41 @@ export class FactDaySchedulerService {
     const today = this.getDateInTimeZone(new Date(), FACT_DAY_TZ);
     if (!ignoreDailyGuard && target.lastSentDate === today) {
       this.logger.log(
-        `Skipping fact day — already sent today (${today}) to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
+        `Skipping history quiz — already sent today (${today}) to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
       );
       return { sent: false, reason: 'already_sent' };
     }
 
-    const factIndex = this.normalizeFactIndex(target.nextFactIndex);
-    const fact = TSINTSKARO_HISTORY_FACTS[factIndex];
-    const factNumber = factIndex + 1;
+    const quizIndex = this.normalizeFactIndex(target.nextFactIndex);
+    const sourceQuiz = TSINTSKARO_HISTORY_QUIZZES[quizIndex];
+    const quiz = this.prepareQuiz(sourceQuiz);
+    const quizNumber = quizIndex + 1;
 
     try {
-      await this.bot.telegram.sendMessage(
+      await this.bot.telegram.sendQuiz(
         target.chatId,
-        this.formatFact(fact, factNumber),
+        quiz.question,
+        quiz.options,
         {
-          parse_mode: 'HTML',
+          correct_option_id: quiz.correctIndex,
+          explanation: quiz.explanation,
+          is_anonymous: false,
           message_thread_id: target.threadId ?? undefined,
         },
       );
       await this.factDayConfig.markSent(
         target.id,
-        factIndex,
-        TSINTSKARO_HISTORY_FACTS.length,
+        quizIndex,
+        TSINTSKARO_HISTORY_QUIZZES.length,
         today,
       );
       this.logger.log(
-        `Sent fact day #${factNumber}: chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
+        `Sent history quiz #${quizNumber}: chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
       );
-      return { sent: true, factNumber };
+      return { sent: true, quizNumber };
     } catch (err) {
       this.logger.error(
-        `Failed to send fact day to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
+        `Failed to send history quiz to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
         err,
       );
       return { sent: false, reason: 'send_failed' };
@@ -96,23 +103,26 @@ export class FactDaySchedulerService {
   }
 
   getFactsCount(): number {
-    return TSINTSKARO_HISTORY_FACTS.length;
+    return TSINTSKARO_HISTORY_QUIZZES.length;
   }
 
   private normalizeFactIndex(index: number): number {
     return (
-      ((index % TSINTSKARO_HISTORY_FACTS.length) +
-        TSINTSKARO_HISTORY_FACTS.length) %
-      TSINTSKARO_HISTORY_FACTS.length
+      ((index % TSINTSKARO_HISTORY_QUIZZES.length) +
+        TSINTSKARO_HISTORY_QUIZZES.length) %
+      TSINTSKARO_HISTORY_QUIZZES.length
     );
   }
 
-  private formatFact(fact: string, factNumber: number): string {
-    return [
-      '📜 <b>Факт дня из истории Цинцкаро</b>',
-      '',
-      `<b>Факт ${factNumber}/${TSINTSKARO_HISTORY_FACTS.length}.</b> ${this.escapeHtml(fact)}`,
-    ].join('\n');
+  private prepareQuiz(quiz: TsintskaroHistoryQuiz): TsintskaroHistoryQuiz {
+    const correctOption = quiz.options[quiz.correctIndex];
+    const options = this.shuffle(quiz.options);
+    return {
+      ...quiz,
+      options,
+      correctIndex: options.indexOf(correctOption),
+      explanation: this.truncateExplanation(quiz.explanation),
+    };
   }
 
   private getDateInTimeZone(date: Date, timeZone: string): string {
@@ -127,10 +137,17 @@ export class FactDaySchedulerService {
     return `${part('year')}-${part('month')}-${part('day')}`;
   }
 
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+  private truncateExplanation(explanation: string): string {
+    if (explanation.length <= 200) return explanation;
+    return explanation.slice(0, 199) + '…';
+  }
+
+  private shuffle<T>(arr: readonly T[]): T[] {
+    const copy = [...arr];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
   }
 }

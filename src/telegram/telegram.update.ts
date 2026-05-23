@@ -52,11 +52,17 @@ export class TelegramUpdate implements OnModuleInit {
       { command: 'leaderboard', description: 'Топ добавивших слова' },
       {
         command: 'startfactday',
-        description: 'Запустить факт дня в этом топике',
+        description: 'Запустить исторический квиз в этом топике',
       },
-      { command: 'stopfactday', description: 'Отключить факт дня' },
-      { command: 'factdaystatus', description: 'Куда сейчас идёт факт дня' },
-      { command: 'factdaynow', description: 'Отправить факт дня сейчас' },
+      { command: 'stopfactday', description: 'Отключить исторический квиз' },
+      {
+        command: 'factdaystatus',
+        description: 'Куда сейчас идёт исторический квиз',
+      },
+      {
+        command: 'factdaynow',
+        description: 'Отправить исторический квиз сейчас',
+      },
       { command: 'memory', description: 'Показать память бота' },
       { command: 'memoryadd', description: 'Добавить запись в память' },
       { command: 'memoryedit', description: 'Изменить запись памяти' },
@@ -85,7 +91,7 @@ export class TelegramUpdate implements OnModuleInit {
         '/status - Показать количество собранных сообщений\n' +
         '/clear - Очистить буфер без отчёта\n' +
         '/setsummarythread - Слать отчёты в этот топик\n' +
-        '/startfactday - Запустить факт дня в этом топике\n' +
+        '/startfactday - Запустить исторический квиз в этом топике\n' +
         '/leaderboard - Топ добавивших слова\n' +
         '/memory - Память бота',
     );
@@ -1134,11 +1140,11 @@ export class TelegramUpdate implements OnModuleInit {
     await this.factDayConfigService.set(chatId, threadId, username);
 
     await ctx.reply(
-      `✅ Рубрика "Факт дня из истории Цинцкаро" запущена в этом топике.\n` +
+      `✅ Исторический квиз Цинцкаро запущен в этом топике.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
         `Расписание: каждый день в 11:00 (${FACT_DAY_TZ}).\n` +
-        `Всего фактов: ${this.factDayScheduler.getFactsCount()}.`,
+        `Всего вопросов: ${this.factDayScheduler.getFactsCount()}.`,
       { parse_mode: 'HTML' },
     );
   }
@@ -1153,12 +1159,12 @@ export class TelegramUpdate implements OnModuleInit {
     const disabled = await this.factDayConfigService.disable();
     if (!disabled) {
       await ctx.reply(
-        '⚠️ Факт дня ещё не настроен. Включи через /startfactday в нужном топике.',
+        '⚠️ Исторический квиз ещё не настроен. Включи через /startfactday в нужном топике.',
       );
       return;
     }
     await ctx.reply(
-      '🛑 Факт дня отключён. Настройка сохранена, включить снова можно через /startfactday.',
+      '🛑 Исторический квиз отключён. Настройка сохранена, включить снова можно через /startfactday.',
     );
   }
 
@@ -1172,23 +1178,23 @@ export class TelegramUpdate implements OnModuleInit {
     const target = await this.factDayConfigService.get();
     if (!target) {
       await ctx.reply(
-        '⚠️ Факт дня не настроен.\nВызови /startfactday в нужном топике.',
+        '⚠️ Исторический квиз не настроен.\nВызови /startfactday в нужном топике.',
       );
       return;
     }
     const setAt =
       target.setAt instanceof Date ? target.setAt : new Date(target.setAt);
-    const factsCount = this.factDayScheduler.getFactsCount();
-    const nextFactNumber =
-      (((target.nextFactIndex % factsCount) + factsCount) % factsCount) + 1;
+    const quizCount = this.factDayScheduler.getFactsCount();
+    const nextQuizNumber =
+      (((target.nextFactIndex % quizCount) + quizCount) % quizCount) + 1;
     await ctx.reply(
-      `📍 Факт дня:\n` +
+      `📍 Исторический квиз:\n` +
         `статус: ${target.enabled === false ? 'отключён' : 'включён'}\n` +
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${target.setBy}\n` +
         `когда: ${setAt.toISOString()}\n\n` +
-        `следующий факт: ${nextFactNumber}/${factsCount}\n` +
+        `следующий вопрос: ${nextQuizNumber}/${quizCount}\n` +
         `последняя отправка: ${target.lastSentDate ?? 'ещё не было'}\n` +
         `расписание: каждый день в 11:00 (${FACT_DAY_TZ}).`,
       { parse_mode: 'HTML' },
@@ -1204,7 +1210,7 @@ export class TelegramUpdate implements OnModuleInit {
     }
     const result = await this.factDayScheduler.sendNext(true);
     if (result.sent) {
-      await ctx.reply(`✅ Отправил факт ${result.factNumber}.`);
+      await ctx.reply(`✅ Отправил исторический квиз ${result.quizNumber}.`);
       return;
     }
     if (result.reason === 'not_configured') {
@@ -1212,10 +1218,14 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (result.reason === 'disabled') {
-      await ctx.reply('⚠️ Факт дня отключён. Включи через /startfactday.');
+      await ctx.reply(
+        '⚠️ Исторический квиз отключён. Включи через /startfactday.',
+      );
       return;
     }
-    await ctx.reply('❌ Не получилось отправить факт дня. Проверь логи бота.');
+    await ctx.reply(
+      '❌ Не получилось отправить исторический квиз. Проверь логи бота.',
+    );
   }
 
   @Command('threadid')
@@ -1241,10 +1251,26 @@ export class TelegramUpdate implements OnModuleInit {
     const sourceThreadId = sourceMessage?.message_thread_id ?? null;
     const storedMessages = await this.telegramService.getActiveMessages(chatId);
     const messagesText = storedMessages.map((m) => m.text);
-    const messages = storedMessages.map((m) => ({
-      text: m.text,
-      username: m.username,
-    }));
+    const summaryLinks = new Map<
+      string,
+      { url: string; username: string; number: number }
+    >();
+    const messages = storedMessages.map((m, index) => {
+      const ref = `m${index + 1}`;
+      const link = this.buildTelegramMessageLink(m.chatId, m.telegramMessageId);
+      if (link) {
+        summaryLinks.set(ref, {
+          url: link,
+          username: m.username,
+          number: index + 1,
+        });
+      }
+      return {
+        text: m.text,
+        username: m.username,
+        ref: link ? ref : undefined,
+      };
+    });
 
     if (messagesText.length === 0) {
       await ctx.reply('Сообщений пока нет.');
@@ -1264,15 +1290,13 @@ export class TelegramUpdate implements OnModuleInit {
       ]);
 
       let report = await this.formatReport(words);
-      const summary = discussionResult.discussionSummary || '';
+      const summary = this.shortenDiscussionSummary(
+        discussionResult.discussionSummary || '',
+      );
       if (summary) {
-        const escapedSummary = summary
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
         report +=
-          '\n\n---\n\n📝 <b>ПОДРОБНОЕ ОПИСАНИЕ ОБСУЖДЕНИЯ:</b>\n' +
-          escapedSummary;
+          '\n\n---\n\n📝 <b>КОРОТКОЕ САММАРИ:</b>\n' +
+          this.formatDiscussionSummary(summary, summaryLinks);
       }
 
       const savedReport = await this.telegramService.createSummaryReport({
@@ -1323,6 +1347,59 @@ export class TelegramUpdate implements OnModuleInit {
       parse_mode: 'HTML',
       message_thread_id: threadId ?? undefined,
     });
+  }
+
+  private shortenDiscussionSummary(summary: string): string {
+    const compact = summary
+      .trim()
+      .replace(/@(?=[A-Za-z0-9_]{3,32}\b)/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+/g, ' ');
+
+    if (compact.length <= 700) return compact;
+
+    const boundary = compact.lastIndexOf('.', 680);
+    const cutAt = boundary >= 300 ? boundary + 1 : 699;
+    return compact.slice(0, cutAt).trimEnd() + '…';
+  }
+
+  private formatDiscussionSummary(
+    summary: string,
+    links: Map<string, { url: string; username: string; number: number }>,
+  ): string {
+    const escaped = summary
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    return escaped.replace(/\[(m\d+)\]/g, (match, ref: string) => {
+      const link = links.get(ref);
+      if (!link) return match;
+      const label = `${this.escapeHtml(link.username)}, сообщение ${link.number}`;
+      return `<a href="${link.url}">${label}</a>`;
+    });
+  }
+
+  private escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  private buildTelegramMessageLink(
+    chatId: number,
+    messageId: number | null,
+  ): string | null {
+    if (messageId == null) return null;
+
+    const chatIdText = String(chatId);
+    if (!chatIdText.startsWith('-100')) return null;
+
+    const internalChatId = chatIdText.slice(4);
+    if (!internalChatId) return null;
+
+    return `https://t.me/c/${internalChatId}/${messageId}`;
   }
 
   private async deleteMessageIfPossible(
