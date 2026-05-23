@@ -17,9 +17,25 @@ export interface UpsertWordInput {
   addedBy?: string | null;
 }
 
+export interface UpdateWordInput {
+  oldWord: string;
+  newWord?: string | null;
+  translation?: string | null;
+  partOfSpeech?: string | null;
+  updatedBy?: string | null;
+}
+
 export interface DictionaryLeaderboardEntry {
   username: string;
   wordsCount: number;
+}
+
+export interface UpdateWordResult {
+  status: 'updated' | 'merged' | 'not_found' | 'ambiguous' | 'empty';
+  requestedOldWord: string;
+  resolvedOldWord?: string;
+  word?: Word;
+  candidates?: string[];
 }
 
 @Injectable()
@@ -37,6 +53,91 @@ export class DictionaryService {
   private invalidateCache() {
     this.cache = null;
     this.cacheById = null;
+  }
+
+  private normalizeWordInput(word: string): string {
+    return word
+      .toLowerCase()
+      .trim()
+      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
+      .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '')
+      .replace(/\s+/g, ' ');
+  }
+
+  private foldWordForLookup(word: string): string {
+    return this.normalizeWordInput(word)
+      .replace(/[aâãáàäā]/gi, 'а')
+      .replace(/[c]/gi, 'с')
+      .replace(/[eëéèē]/gi, 'е')
+      .replace(/[oôóòöō]/gi, 'о')
+      .replace(/[p]/gi, 'р')
+      .replace(/[x]/gi, 'х')
+      .replace(/[yŷûúùüū]/gi, 'у')
+      .replace(/ё/g, 'е')
+      .replace(/[^0-9а-я]+/gi, '');
+  }
+
+  private normalizeTranslationForCompare(translation: string): string {
+    return translation
+      .toLowerCase()
+      .trim()
+      .replace(/[ё]/g, 'е')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
+      .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '');
+  }
+
+  private mergeTranslations(existing: string, incoming: string): string {
+    const current = existing.trim();
+    const next = incoming.trim();
+    if (!current) return next;
+    if (!next) return current;
+
+    const currentNormalized = this.normalizeTranslationForCompare(current);
+    const nextNormalized = this.normalizeTranslationForCompare(next);
+    const existingParts = current
+      .split(/\s*(?:;|\n|\/)\s*/g)
+      .map((part) => this.normalizeTranslationForCompare(part))
+      .filter((part) => part.length > 0);
+
+    if (
+      currentNormalized === nextNormalized ||
+      existingParts.includes(nextNormalized)
+    ) {
+      return current;
+    }
+
+    return `${next}; ${current}`;
+  }
+
+  private async resolveWordEntity(
+    word: string,
+  ): Promise<{ entity: Word | null; candidates: Word[] }> {
+    const normalized = this.normalizeWordInput(word);
+    if (!normalized) {
+      return { entity: null, candidates: [] };
+    }
+
+    const exact = await this.wordRepo.findOne({ where: { word: normalized } });
+    if (exact) {
+      return { entity: exact, candidates: [exact] };
+    }
+
+    const folded = this.foldWordForLookup(normalized);
+    if (!folded) {
+      return { entity: null, candidates: [] };
+    }
+
+    const rows = await this.wordRepo.find();
+    const candidates = rows.filter(
+      (row) => this.foldWordForLookup(row.word) === folded,
+    );
+
+    if (candidates.length === 1) {
+      return { entity: candidates[0], candidates };
+    }
+
+    return { entity: null, candidates };
   }
 
   reload() {
@@ -102,26 +203,107 @@ export class DictionaryService {
     return { deleted, notFound };
   }
 
+  async updateWord(input: UpdateWordInput): Promise<UpdateWordResult> {
+    const requestedOldWord = this.normalizeWordInput(input.oldWord);
+    const normalizedNewWord =
+      input.newWord != null && input.newWord.trim()
+        ? this.normalizeWordInput(input.newWord)
+        : null;
+    const translation =
+      input.translation != null && input.translation.trim()
+        ? input.translation.trim()
+        : null;
+
+    if (
+      !requestedOldWord ||
+      (!normalizedNewWord && !translation && input.partOfSpeech === undefined)
+    ) {
+      return { status: 'empty', requestedOldWord };
+    }
+
+    const resolvedOld = await this.resolveWordEntity(requestedOldWord);
+    if (!resolvedOld.entity) {
+      return {
+        status: resolvedOld.candidates.length > 1 ? 'ambiguous' : 'not_found',
+        requestedOldWord,
+        candidates: resolvedOld.candidates.map((candidate) => candidate.word),
+      };
+    }
+
+    const currentWord = resolvedOld.entity;
+    const targetWord = normalizedNewWord ?? currentWord.word;
+    const resolvedOldWord = currentWord.word;
+
+    if (targetWord !== currentWord.word) {
+      const resolvedTarget = await this.resolveWordEntity(targetWord);
+      if (
+        resolvedTarget.entity &&
+        resolvedTarget.entity.id !== currentWord.id
+      ) {
+        const target = resolvedTarget.entity;
+        if (translation) {
+          target.translation = translation;
+        }
+        if (input.partOfSpeech !== undefined) {
+          target.partOfSpeech = input.partOfSpeech;
+        }
+        target.source = 'chat';
+        const saved = await this.wordRepo.save(target);
+        await this.wordRepo.delete({ id: currentWord.id });
+        this.invalidateCache();
+        return {
+          status: 'merged',
+          requestedOldWord,
+          resolvedOldWord,
+          word: saved,
+        };
+      }
+    }
+
+    currentWord.word = targetWord;
+    if (translation) {
+      currentWord.translation = translation;
+    }
+    if (input.partOfSpeech !== undefined) {
+      currentWord.partOfSpeech = input.partOfSpeech;
+    }
+    currentWord.source = 'chat';
+
+    const saved = await this.wordRepo.save(currentWord);
+    this.invalidateCache();
+
+    return {
+      status: 'updated',
+      requestedOldWord,
+      resolvedOldWord,
+      word: saved,
+    };
+  }
+
   async upsertWord(
     input: UpsertWordInput,
-  ): Promise<{ created: boolean; word: Word }> {
+  ): Promise<{ created: boolean; word: Word; translationAdded: boolean }> {
     const normalizedWord = input.word.toLowerCase().trim();
     const existing = await this.wordRepo.findOne({
       where: { word: normalizedWord },
     });
 
     if (existing) {
-      existing.translation = input.translation;
-      if (input.partOfSpeech !== undefined) {
+      const previousTranslation = existing.translation;
+      existing.translation = this.mergeTranslations(
+        existing.translation,
+        input.translation,
+      );
+      if (input.partOfSpeech !== undefined && !existing.partOfSpeech) {
         existing.partOfSpeech = input.partOfSpeech;
       }
-      if (input.addedBy !== undefined && !existing.addedBy) {
-        existing.addedBy = input.addedBy;
-      }
-      existing.source = 'chat';
       const saved = await this.wordRepo.save(existing);
       this.invalidateCache();
-      return { created: false, word: saved };
+      return {
+        created: false,
+        word: saved,
+        translationAdded: saved.translation !== previousTranslation,
+      };
     }
 
     const created = this.wordRepo.create({
@@ -134,7 +316,7 @@ export class DictionaryService {
     });
     const saved = await this.wordRepo.save(created);
     this.invalidateCache();
-    return { created: true, word: saved };
+    return { created: true, word: saved, translationAdded: true };
   }
 
   async getLeaderboard(limit = 10): Promise<DictionaryLeaderboardEntry[]> {

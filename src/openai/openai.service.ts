@@ -53,6 +53,13 @@ export interface DictionaryEntryInput {
   partOfSpeech: string | null;
 }
 
+export interface DictionaryUpdateInput {
+  oldWord: string;
+  newWord: string | null;
+  translation: string | null;
+  partOfSpeech?: string | null;
+}
+
 export interface BotMemoryInput {
   text: string;
   createdBy: string | null;
@@ -62,6 +69,7 @@ export interface BotMemoryInput {
 /** Result of processing a "Бот, ..." or "Баласи, ..." message */
 export type BotMentionResult =
   | { action: 'add_words'; entries: DictionaryEntryInput[] }
+  | { action: 'update_words'; entries: DictionaryUpdateInput[] }
   | { action: 'delete_words'; words: string[] }
   | { action: 'add_memory'; text: string }
   | { action: 'reply'; message: string };
@@ -127,7 +135,19 @@ export class OpenaiService {
 - Игнорируй обращение и вводные слова ("Бот", "Баласи", "добавь", "запиши", "новое слово", "пожалуйста", "это", "и" и т.п.) — они не часть слова/перевода.
 - Если в сообщении несколько слов — извлеки ВСЕ пары, не выбрасывай.
 
-ВАРИАНТ 2 — УДАЛИТЬ КОНКРЕТНЫЕ СЛОВА ИЗ СЛОВАРЯ. Выбирай этот вариант когда пользователь явно говорит "удали", "убери", "сотри", "это не цинцкарское слово", "ошибка, не записывай" и указывает какое именно слово (или несколько) убрать:
+ВАРИАНТ 2 — ИЗМЕНИТЬ УЖЕ ЗАПИСАННОЕ СЛОВО. Выбирай этот вариант когда пользователь явно говорит "измени", "исправь", "поправь", "обнови", "правильно так", "а не ..." и хочет заменить неправильное слово, написание или перевод:
+{"action": "update_words", "entries": [{"oldWord": "...", "newWord": "..." или null, "translation": "..." или null, "partOfSpeech": "..." или null}, ...]}
+
+ПРАВИЛА:
+- "oldWord" — старое/ошибочное цинцкарское слово, которое уже может быть в словаре. Если пользователь пишет "а не X" — X почти всегда oldWord.
+- "newWord" — правильное цинцкарское слово. Если меняется только перевод, поставь null.
+- "translation" — новый русский перевод. Если меняется только написание слова, поставь null.
+- "partOfSpeech" — ставь только если пользователь явно указал часть речи, иначе null.
+- Пример: "Баласи, измени мелодия это гхайдâ, а не хгайда" → oldWord "хгайда", newWord "гхайдâ", translation "мелодия".
+- Пример: "Баласи, исправь хгайда на гхайдâ" → oldWord "хгайда", newWord "гхайдâ", translation null.
+- Пример: "Баласи, у хгайда перевод мелодия" → oldWord "хгайда", newWord null, translation "мелодия".
+
+ВАРИАНТ 3 — УДАЛИТЬ КОНКРЕТНЫЕ СЛОВА ИЗ СЛОВАРЯ. Выбирай этот вариант когда пользователь явно говорит "удали", "убери", "сотри", "это не цинцкарское слово", "ошибка, не записывай" и указывает какое именно слово (или несколько) убрать:
 {"action": "delete_words", "words": ["...", "..."]}
 
 ПРАВИЛА:
@@ -138,7 +158,7 @@ export class OpenaiService {
 🚫 ЗАПРЕЩЕНО — массовое удаление. Если пользователь просит "удали ВСЕ слова", "удали весь словарь", "очисти словарь", "удали всё на букву X", "удали все существительные", "удали ту половину" и любые другие массовые/общие удаления — НЕ возвращай action "delete_words". Вместо этого верни:
 {"action": "reply", "message": "Массово удалить слова нельзя — это опасная операция. Если нужно удалить конкретные слова, перечисли их (до 10 за раз)."}
 
-ВАРИАНТ 3 — ДОБАВИТЬ ФАКТ В ПАМЯТЬ БОТА. Выбирай этот вариант когда пользователь явно говорит "добавь в память", "запомни", "сохрани в памяти" и указывает что именно запомнить:
+ВАРИАНТ 4 — ДОБАВИТЬ ФАКТ В ПАМЯТЬ БОТА. Выбирай этот вариант когда пользователь явно говорит "добавь в память", "запомни", "сохрани в памяти" и указывает что именно запомнить:
 {"action": "add_memory", "text": "короткий факт или инструкция для памяти"}
 
 ПРАВИЛА:
@@ -146,7 +166,7 @@ export class OpenaiService {
 - Не сохраняй пустой текст. Если пользователь не написал что именно запомнить — верни reply и спроси что добавить в память.
 - Не используй add_memory для добавления слов в словарь, если пользователь явно говорит про слово и перевод.
 
-ВАРИАНТ 4 — ОТВЕТИТЬ ПОЛЬЗОВАТЕЛЮ (всё остальное: вопросы, болтовня, приветствия, просьбы что-то рассказать или объяснить):
+ВАРИАНТ 5 — ОТВЕТИТЬ ПОЛЬЗОВАТЕЛЮ (всё остальное: вопросы, болтовня, приветствия, просьбы что-то рассказать или объяснить):
 {"action": "reply", "message": "твой ответ"}
 
 ПРАВИЛА для ответа:
@@ -199,6 +219,38 @@ ${text}
       }
       if (entries.length > 0) {
         return { action: 'add_words', entries };
+      }
+    }
+
+    if (parsed.action === 'update_words' && Array.isArray(parsed.entries)) {
+      const entries: DictionaryUpdateInput[] = [];
+      for (const raw of parsed.entries) {
+        if (raw && typeof raw.oldWord === 'string' && raw.oldWord.trim()) {
+          const newWord =
+            typeof raw.newWord === 'string' && raw.newWord.trim()
+              ? raw.newWord.toLowerCase().trim()
+              : null;
+          const translation =
+            typeof raw.translation === 'string' && raw.translation.trim()
+              ? raw.translation.trim()
+              : null;
+          const partOfSpeech =
+            typeof raw.partOfSpeech === 'string' && raw.partOfSpeech.trim()
+              ? raw.partOfSpeech.trim()
+              : undefined;
+
+          if (newWord || translation || partOfSpeech) {
+            entries.push({
+              oldWord: raw.oldWord.toLowerCase().trim(),
+              newWord,
+              translation,
+              partOfSpeech,
+            });
+          }
+        }
+      }
+      if (entries.length > 0) {
+        return { action: 'update_words', entries };
       }
     }
 
