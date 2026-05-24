@@ -2,7 +2,11 @@ import { Update, Ctx, Hears, Command, Start, InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { BotMemoryEntry, TelegramService } from './telegram.service';
 import { DictionaryService } from '../dictionary/dictionary.service';
-import { DictionaryUpdateInput, OpenaiService } from '../openai/openai.service';
+import {
+  DictionaryEntryInput,
+  DictionaryUpdateInput,
+  OpenaiService,
+} from '../openai/openai.service';
 import { PollConfigService } from '../poll/poll-config.service';
 import { PollSchedulerService } from '../poll/poll-scheduler.service';
 import { FactDayConfigService } from '../fact-day/fact-day-config.service';
@@ -196,7 +200,7 @@ export class TelegramUpdate implements OnModuleInit {
     /(?:рабоч\w*\s+ссыл|ссылк\w*[\s\S]{0,40}рабоч|скин\w*[\s\S]{0,40}ссыл|пришл\w*[\s\S]{0,40}ссыл|дай[\s\S]{0,40}ссыл)/i;
 
   private static readonly LEADERBOARD_REQUEST_REGEX =
-    /(?:лидер|топ|рейтинг|таблиц\w*\s+лидер|кто\s+(?:больше|больше\s+всех|больше\s+всего|много)[\s\S]{0,40}(?:слов|слова|добав)|кто[\s\S]{0,40}(?:добавил|добавляет)[\s\S]{0,40}(?:слов|слова))/i;
+    /(?:(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь|хочу|нужен|нужна)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:лидер|топ|рейтинг|таблиц\w*\s+лидер)|(?:^|[\s,.:;!?])(?:лидер|топ|рейтинг)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь)(?:$|[\s,.:;!?])|кто\s+(?:больше|больше\s+всех|больше\s+всего|много)[\s\S]{0,40}(?:слов|слова|добав)|кто[\s\S]{0,40}(?:добавил|добавляет)[\s\S]{0,40}(?:слов|слова))/i;
 
   private static readonly URL_REGEX =
     /https?:\/\/[^\s<>()"']*[A-Za-z0-9-]+\.[A-Za-z]{2,}[^\s<>()"']*/i;
@@ -224,16 +228,28 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    if (this.isLeaderboardRequest(text)) {
-      await this.replyWithLeaderboard(ctx, messageId);
-      return;
-    }
-
     const directDictionaryUpdate = this.extractDirectDictionaryUpdate(text);
     if (directDictionaryUpdate) {
       await this.handleDictionaryUpdates(ctx, chatId, username, messageId, [
         directDictionaryUpdate,
       ]);
+      return;
+    }
+
+    const directDictionaryEntries = this.extractDirectDictionaryEntries(text);
+    if (directDictionaryEntries.length > 0) {
+      await this.handleDictionaryAdditions(
+        ctx,
+        chatId,
+        username,
+        messageId,
+        directDictionaryEntries,
+      );
+      return;
+    }
+
+    if (this.isLeaderboardRequest(text)) {
+      await this.replyWithLeaderboard(ctx, messageId);
       return;
     }
 
@@ -391,12 +407,102 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     // action === 'add_words'
+    await this.handleDictionaryAdditions(
+      ctx,
+      chatId,
+      username,
+      messageId,
+      result.entries,
+    );
+  }
+
+  private extractDirectDictionaryEntries(text: string): DictionaryEntryInput[] {
+    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
+    const entries: DictionaryEntryInput[] = [];
+    const seen = new Set<string>();
+
+    for (const line of body.split(/\r?\n/g)) {
+      const entry = this.extractDictionaryEntryLine(line);
+      if (!entry) continue;
+
+      const key = `${entry.word}\u0000${entry.translation}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+    }
+
+    if (!this.hasDictionaryAddIntent(body) && entries.length < 3) {
+      return [];
+    }
+
+    return entries;
+  }
+
+  private extractDictionaryEntryLine(
+    line: string,
+  ): DictionaryEntryInput | null {
+    const trimmed = this.stripDictionaryPairIntent(
+      line.trim().replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ''),
+    );
+    const match = trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/);
+    if (!match) return null;
+
+    const word = this.cleanDictionaryWord(match[1]);
+    const translation = this.cleanDictionaryTranslation(match[2]);
+    if (
+      !word ||
+      !translation ||
+      !this.isLikelyDictionaryWord(word) ||
+      this.isLikelyLeaderboardLine(word, translation)
+    ) {
+      return null;
+    }
+
+    return { word, translation, partOfSpeech: null };
+  }
+
+  private hasDictionaryAddIntent(text: string): boolean {
+    return /(?:^|[\s,.:;!?])(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить|нов(?:ое|ые|ых)\s+слов\w*|слова\s+в\s+словарь|в\s+словарь)(?:$|[\s,.:;!?])/i.test(
+      text,
+    );
+  }
+
+  private stripDictionaryPairIntent(line: string): string {
+    return line.replace(
+      /^(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить)\s+(?:(?:это|слово|перевод|запись)\s+)?/i,
+      '',
+    );
+  }
+
+  private isLikelyDictionaryWord(word: string): boolean {
+    return (
+      word.length <= 80 &&
+      /[а-яёâãáàäāôóòöōûŷúùüū]/i.test(word) &&
+      !/[@#/:\\\d]/.test(word)
+    );
+  }
+
+  private isLikelyLeaderboardLine(word: string, translation: string): boolean {
+    return (
+      word.startsWith('@') ||
+      /(?:^|\s)@\w+/.test(word) ||
+      /^\d+\s+слов[ао]?$/i.test(translation)
+    );
+  }
+
+  private async handleDictionaryAdditions(
+    ctx: Context,
+    chatId: number,
+    username: string,
+    messageId: number | undefined,
+    entries: DictionaryEntryInput[],
+  ): Promise<void> {
     const created: string[] = [];
     const expanded: string[] = [];
     const unchanged: string[] = [];
     const failed: { word: string; err: unknown }[] = [];
 
-    for (const entry of result.entries) {
+    for (const entry of entries) {
       try {
         const upserted = await this.dictionaryService.upsertWord({
           word: entry.word,
