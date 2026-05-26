@@ -5,6 +5,8 @@ import { InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { FactDayConfigService } from './fact-day-config.service';
 import {
+  formatHistoryQuizExplanation,
+  formatHistoryQuizQuestion,
   TSINTSKARO_HISTORY_QUIZZES,
   TsintskaroHistoryQuiz,
 } from './tsintskaro-history-quizzes';
@@ -72,7 +74,7 @@ export class FactDaySchedulerService {
 
     const quizIndex = this.normalizeFactIndex(target.nextFactIndex);
     const sourceQuiz = TSINTSKARO_HISTORY_QUIZZES[quizIndex];
-    const quiz = this.prepareQuiz(sourceQuiz);
+    const quiz = this.prepareQuiz(sourceQuiz, quizIndex);
     const quizNumber = quizIndex + 1;
 
     try {
@@ -119,14 +121,18 @@ export class FactDaySchedulerService {
     );
   }
 
-  private prepareQuiz(quiz: TsintskaroHistoryQuiz): TsintskaroHistoryQuiz {
+  private prepareQuiz(
+    quiz: TsintskaroHistoryQuiz,
+    quizIndex: number,
+  ): TsintskaroHistoryQuiz {
     const correctOption = quiz.options[quiz.correctIndex];
     const options = this.shuffle(quiz.options);
     return {
       ...quiz,
+      question: formatHistoryQuizQuestion(quiz, quizIndex),
       options,
       correctIndex: options.indexOf(correctOption),
-      explanation: this.truncateExplanation(quiz.explanation),
+      explanation: formatHistoryQuizExplanation(quiz.explanation),
     };
   }
 
@@ -154,11 +160,6 @@ export class FactDaySchedulerService {
     const part = (type: string) =>
       parts.find((item) => item.type === type)?.value ?? '';
     return `${part('year')}-${part('month')}-${part('day')}-${part('hour')}`;
-  }
-
-  private truncateExplanation(explanation: string): string {
-    if (explanation.length <= 200) return explanation;
-    return explanation.slice(0, 199) + '…';
   }
 
   private shuffle<T>(arr: readonly T[]): T[] {

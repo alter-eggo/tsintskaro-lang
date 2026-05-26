@@ -5,6 +5,59 @@ export interface TsintskaroHistoryQuiz {
   explanation: string;
 }
 
+export const MAX_TELEGRAM_QUIZ_QUESTION_LENGTH = 300;
+export const MAX_TELEGRAM_QUIZ_EXPLANATION_LENGTH = 200;
+
+type QuizContextRange = {
+  from: number;
+  to: number;
+  title: string;
+};
+
+const HISTORY_QUIZ_CONTEXT_RANGES: QuizContextRange[] = [
+  { from: 1, to: 3, title: 'основание села' },
+  { from: 4, to: 16, title: 'Понт и Трапезунд' },
+  { from: 17, to: 22, title: 'община Гавра и память о предках' },
+  { from: 23, to: 25, title: 'переселение христиан в начале XIX века' },
+  { from: 26, to: 29, title: 'Пасинлер перед переселением 1813 года' },
+  { from: 30, to: 42, title: 'основание и первые годы Цинцкаро' },
+  { from: 43, to: 50, title: 'поездка в Пасинлер в 2025 году' },
+  { from: 51, to: 59, title: 'жизнь Цинцкаро в XIX веке' },
+  { from: 60, to: 65, title: 'Квирацховели и связи греческих сел' },
+  { from: 66, to: 71, title: 'историческая память Цинцкаро' },
+  { from: 72, to: 79, title: 'переселения после войны 1828-1829 годов' },
+  { from: 80, to: 102, title: 'семьи, школа и священники Цинцкаро' },
+];
+
+export function getHistoryQuizContext(quizIndex: number): string | null {
+  const quizNumber = quizIndex + 1;
+  const range = HISTORY_QUIZ_CONTEXT_RANGES.find(
+    ({ from, to }) => quizNumber >= from && quizNumber <= to,
+  );
+  return range ? `История Цинцкаро: ${range.title}` : null;
+}
+
+export function formatHistoryQuizQuestion(
+  quiz: TsintskaroHistoryQuiz,
+  quizIndex: number,
+): string {
+  const context = getHistoryQuizContext(quizIndex);
+  const question = context ? `${context}\n${quiz.question}` : quiz.question;
+  return truncateTelegramQuizText(question, MAX_TELEGRAM_QUIZ_QUESTION_LENGTH);
+}
+
+export function formatHistoryQuizExplanation(explanation: string): string {
+  return truncateTelegramQuizText(
+    explanation,
+    MAX_TELEGRAM_QUIZ_EXPLANATION_LENGTH,
+  );
+}
+
+function truncateTelegramQuizText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength - 1) + '…';
+}
+
 export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
   {
     question: 'В каком году было основано село Цинцкаро?',
@@ -92,7 +145,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
   },
   {
     question:
-      'Что происходило с частью негреческого населения в античный и византийский периоды?',
+      'Что происходило с частью негреческого населения Понта в античный и византийский периоды?',
     options: [
       'Постепенная эллинизация',
       'Полное переселение в Европу',
@@ -105,14 +158,14 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
   },
   {
     question:
-      'До какого века продолжалась постепенная эллинизация части населения региона?',
+      'До какого века в Понте продолжалась постепенная эллинизация части населения?',
     options: ['До XV века', 'До V века', 'До XVIII века', 'До XX века'],
     correctIndex: 0,
     explanation:
       'Постепенная эллинизация части населения продолжалась до XV века н.э.',
   },
   {
-    question: 'Какая империя возникла в регионе после 1204 года?',
+    question: 'Какая империя возникла в Понте после 1204 года?',
     options: [
       'Трапезундская империя',
       'Византийская империя',
@@ -136,7 +189,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Османское завоевание Трапезунда произошло в 1461 году.',
   },
   {
-    question: 'Какие процессы усилились со второй половины XV века?',
+    question: 'Какие процессы усилились в Понте со второй половины XV века?',
     options: [
       'Тюркизация и исламизация',
       'Латинизация и германизация',
@@ -148,7 +201,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Со второй половины XV века усиливались тюркизация и исламизация.',
   },
   {
-    question: 'Что происходило с частью христиан после османского завоевания?',
+    question:
+      'Что происходило с частью христиан Понта после османского завоевания?',
     options: [
       'Их переселяли в другие районы империи',
       'Их массово отправляли в Афины',
@@ -160,7 +214,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'После 1461 года начались организованные переселения части христиан.',
   },
   {
-    question: 'Чьим населением заселяли земли переселенных христиан?',
+    question: 'Чьим населением заселяли земли переселенных христиан Понта?',
     options: [
       'Тюркским мусульманским населением',
       'Итальянскими колонистами',
@@ -215,7 +269,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Аргирополь соответствует современному Гюмюшхане.',
   },
   {
-    question: 'Почему могли сохраниться воспоминания о прежних местах жизни?',
+    question:
+      'Почему у цинцкаройцев могли сохраниться воспоминания о прежних местах жизни?',
     options: [
       'Из-за позднейших трагических переселений',
       'Из-за морской торговли с Афинами',
@@ -227,7 +282,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Память о прежних местах могла сохраниться благодаря трагическим переселениям XVIII-XIX и начала XX веков.',
   },
   {
-    question: 'Какую политику начала Российская империя в начале XIX века?',
+    question:
+      'Какую политику переселения начала Российская империя в начале XIX века?',
     options: [
       'Организованное переселение христиан в Грузию',
       'Выселение христиан из Грузии',
@@ -246,7 +302,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Комитет по переселению единоверцев был создан в Тифлисе.',
   },
   {
-    question: 'Чем занимался Комитет по переселению единоверцев?',
+    question: 'Чем занимался Комитет по переселению единоверцев в Грузию?',
     options: [
       'Транспортом и материальной поддержкой',
       'Строительством морских портов',
@@ -343,7 +399,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Земли принадлежали грузинскому князю Р. Бараташвили из села Марабда.',
   },
   {
-    question: 'Что делало российское правительство для владельца этих земель?',
+    question:
+      'Что делало российское правительство для владельца земель будущего Цинцкаро?',
     options: [
       'Выплачивало компенсацию',
       'Назначило его священником',
@@ -368,7 +425,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'В первых потоках переселилось около 100 семей.',
   },
   {
-    question: 'Сколько голов крупного рогатого скота пригнали переселенцы?',
+    question:
+      'Сколько голов крупного рогатого скота пригнали переселенцы в Цинцкаро?',
     options: ['Примерно 450-500', 'Около 30', 'Более 3000', 'Ровно 1179'],
     correctIndex: 0,
     explanation:
@@ -381,7 +439,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Переселенцы строили землянки, называемые бачали авлар.',
   },
   {
-    question: 'Из чего была крыша первых домов-полуземлянок?',
+    question: 'Из чего была крыша первых домов-полуземлянок в Цинцкаро?',
     options: [
       'Из утрамбованной земли',
       'Из красной черепицы',
@@ -392,7 +450,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Крыша дома была из утрамбованной земли.',
   },
   {
-    question: 'Где в первые годы часто содержался скот?',
+    question: 'Где в первые годы жизни Цинцкаро часто содержался скот?',
     options: [
       'Рядом с жилыми комнатами',
       'На отдельном острове',
@@ -462,7 +520,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Айдин перечислил шесть окрестных сел Пасинлера.',
   },
   {
-    question: 'Какое село также называли Старым Пасеном?',
+    question:
+      'Какое село в окрестностях Пасинлера также называли Старым Пасеном?',
     options: ['Сулбахар-Гюльбахар', 'Атра', 'Марабда', 'Бешташени'],
     correctIndex: 0,
     explanation: 'Сулбахар — Гюльбахар указан как Старый Пасен.',
@@ -535,19 +594,19 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Некоторые мастера выезжали на заработки в Персию.',
   },
   {
-    question: 'На какой реке жители построили водяные мельницы?',
+    question: 'На какой реке жители Цинцкаро построили водяные мельницы?',
     options: ['На Алгети', 'На Куре', 'На Риони', 'На Арагви'],
     correctIndex: 0,
     explanation: 'Водяные мельницы были построены на реке Алгети.',
   },
   {
-    question: 'Как далеко от села находились водяные мельницы на Алгети?',
+    question: 'Как далеко от Цинцкаро находились водяные мельницы на Алгети?',
     options: ['Примерно в 3 км', 'В 30 км', 'В 300 м', 'В 50 км'],
     correctIndex: 0,
     explanation: 'Мельницы находились примерно в 3 км от села.',
   },
   {
-    question: 'Как называлось место, где вода была соленой?',
+    question: 'Как называлось место около Цинцкаро, где вода была соленой?',
     options: ['Чети Пунгар', 'Эй Пунгар', 'Андон', 'Чапарли'],
     correctIndex: 0,
     explanation: 'Чети Пунгар упомянут как место, где вода была соленой.',
@@ -559,7 +618,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'Жители Цинцкаро построили родник Эй Пунгар.',
   },
   {
-    question: 'Какие источники находились недалеко от села?',
+    question: 'Какие источники находились недалеко от Цинцкаро?',
     options: [
       'Чапарли и Андон',
       'Орду и Котиора',
@@ -597,7 +656,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
   },
   {
     question:
-      'Сколько учеников было в церковно-приходской школе при новой церкви?',
+      'Сколько учеников было в церковно-приходской школе при новой церкви Цинцкаро?',
     options: ['30 учеников', '81 ученик', '1179 учеников', '100 учеников'],
     correctIndex: 0,
     explanation:
@@ -605,7 +664,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
   },
   {
     question:
-      'С какими районами поддерживались связи через другие греческие села?',
+      'С какими районами Цинцкаро поддерживало связи через другие греческие села?',
     options: [
       'Цалкским, Дманисским и Марнеульским',
       'Только с Афинами и Пиреем',
@@ -669,7 +728,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Цинцкаро описывается как узел памяти между Понтом, Анатолией, Кавказом и Грецией.',
   },
   {
-    question: 'Что сохранила община, несмотря на многократные переселения?',
+    question:
+      'Что сохранила цинцкаройская община, несмотря на многократные переселения?',
     options: [
       'Веру и традиции',
       'Только торговые печати',
@@ -865,7 +925,8 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
     explanation: 'В 1886 году население составляло 1179 человек.',
   },
   {
-    question: 'Кто сыграл значительную роль в духовном воспитании сельчан?',
+    question:
+      'Кто сыграл значительную роль в духовном воспитании жителей Цинцкаро?',
     options: [
       'Павел Михайлович Севастянов и его сын Александр',
       'Г. Олофсон и Т. Томель',
@@ -877,7 +938,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Значительную роль сыграли священники Павел Михайлович Севастянов и его сын Александр.',
   },
   {
-    question: 'Откуда были священники Севастяновы?',
+    question: 'Откуда были священники Севастяновы, служившие в Цинцкаро?',
     options: ['Из Цалкского района', 'Из Афин', 'Из Пасинлера', 'Из Гюмюшхане'],
     correctIndex: 0,
     explanation:
@@ -961,7 +1022,7 @@ export const TSINTSKARO_HISTORY_QUIZZES: TsintskaroHistoryQuiz[] = [
       'Священник Николай Александрович Севастянов скончался в Цинцкаро в 1923 году.',
   },
   {
-    question: 'Где был похоронен Николай Александрович Севастянов?',
+    question: 'Где в Цинцкаро был похоронен Николай Александрович Севастянов?',
     options: [
       'Возле церкви',
       'В Пасинлере',
