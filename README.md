@@ -14,7 +14,7 @@ This tool helps collect, analyze, and translate the Tsintskaro dialect—a uniqu
 - **AI Analysis**: Uses **OpenAI (GPT-4o)** to distinguish dialect words from standard Russian and infer meanings from context.
 - **Dictionary Integration**: Cross-references findings with a curated digital dictionary (`.xlsx`) to validate and catalog the language.
 - **Community Reporting**: Every 100 messages (or on demand) the bot generates one report: agreed and disputed dialect words plus a detailed description of the discussion. All in Russian.
-- **Fact of the Day**: Sends one historical fact about Tsintskaro every day at 11:00 Asia/Tbilisi to the thread where `/startfactday` was called. It can be paused with `/stopfactday`.
+- **Historical Quizzes**: Sends regular Tsintskaro history quizzes at 08:00, 10:00, 18:00, 20:00, and 22:00 Asia/Tbilisi to the thread where `/startfactday` was called. It can be paused with `/stopfactday`.
 - **Dictionary Leaderboard**: `/leaderboard` shows who added the most words through the chat.
 - **Bot Memory**: Admins can manage stored bot instructions from Telegram with `/memory`, `/memoryadd`, `/memoryedit`, and `/memorydel`.
 - **Admin Tools**: `/report` (create report now), `/status`, `/clear`, `/startfactday`, `/stopfactday`, `/factdaystatus`, `/factdaynow`, `/memory`.

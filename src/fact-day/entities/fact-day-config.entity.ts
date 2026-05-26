@@ -31,6 +31,9 @@ export class FactDayConfig {
   @Column({ type: 'date', nullable: true })
   lastSentDate: string | null;
 
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  lastSentSlot: string | null;
+
   @Column({ type: 'int', nullable: true })
   lastFactNumber: number | null;
 }

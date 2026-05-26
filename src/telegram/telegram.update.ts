@@ -11,7 +11,7 @@ import { PollConfigService } from '../poll/poll-config.service';
 import { PollSchedulerService } from '../poll/poll-scheduler.service';
 import { FactDayConfigService } from '../fact-day/fact-day-config.service';
 import {
-  FACT_DAY_TZ,
+  FACT_DAY_SCHEDULE_LABEL,
   FactDaySchedulerService,
 } from '../fact-day/fact-day-scheduler.service';
 import { ConfigService } from '@nestjs/config';
@@ -1249,7 +1249,7 @@ export class TelegramUpdate implements OnModuleInit {
       `✅ Исторический квиз Цинцкаро запущен в этом топике.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
-        `Расписание: каждый день в 11:00 (${FACT_DAY_TZ}).\n` +
+        `Расписание: ${FACT_DAY_SCHEDULE_LABEL}.\n` +
         `Всего вопросов: ${this.factDayScheduler.getFactsCount()}.`,
       { parse_mode: 'HTML' },
     );
@@ -1302,7 +1302,7 @@ export class TelegramUpdate implements OnModuleInit {
         `когда: ${setAt.toISOString()}\n\n` +
         `следующий вопрос: ${nextQuizNumber}/${quizCount}\n` +
         `последняя отправка: ${target.lastSentDate ?? 'ещё не было'}\n` +
-        `расписание: каждый день в 11:00 (${FACT_DAY_TZ}).`,
+        `расписание: ${FACT_DAY_SCHEDULE_LABEL}.`,
       { parse_mode: 'HTML' },
     );
   }

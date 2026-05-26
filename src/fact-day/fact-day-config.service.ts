@@ -44,6 +44,7 @@ export class FactDayConfigService {
       enabled: true,
       nextFactIndex: 0,
       lastSentDate: null,
+      lastSentSlot: null,
       lastFactNumber: null,
     });
     const saved = await this.repo.save(entity);
@@ -80,10 +81,12 @@ export class FactDayConfigService {
     sentFactIndex: number,
     factsCount: number,
     sentDate: string,
+    sentSlot: string,
   ): Promise<void> {
     await this.repo.update(configId, {
       nextFactIndex: (sentFactIndex + 1) % factsCount,
       lastSentDate: sentDate,
+      lastSentSlot: sentSlot,
       lastFactNumber: sentFactIndex + 1,
     });
   }

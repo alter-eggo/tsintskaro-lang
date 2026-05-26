@@ -9,8 +9,10 @@ import {
   TsintskaroHistoryQuiz,
 } from './tsintskaro-history-quizzes';
 
-export const FACT_DAY_CRON = '0 11 * * *';
+export const FACT_DAY_CRON = '0 8,10,18,20,22 * * *';
 export const FACT_DAY_TZ = 'Asia/Tbilisi';
+export const FACT_DAY_SCHEDULE_LABEL =
+  'каждый день в 08:00, 10:00, 18:00, 20:00 и 22:00 (Asia/Tbilisi)';
 
 type FactDaySendResult = {
   sent: boolean;
@@ -58,10 +60,12 @@ export class FactDaySchedulerService {
       return { sent: false, reason: 'disabled' };
     }
 
-    const today = this.getDateInTimeZone(new Date(), FACT_DAY_TZ);
-    if (!ignoreDailyGuard && target.lastSentDate === today) {
+    const now = new Date();
+    const today = this.getDateInTimeZone(now, FACT_DAY_TZ);
+    const currentSlot = this.getHourSlotInTimeZone(now, FACT_DAY_TZ);
+    if (!ignoreDailyGuard && target.lastSentSlot === currentSlot) {
       this.logger.log(
-        `Skipping history quiz — already sent today (${today}) to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
+        `Skipping history quiz — already sent in slot ${currentSlot} to chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
       );
       return { sent: false, reason: 'already_sent' };
     }
@@ -88,6 +92,7 @@ export class FactDaySchedulerService {
         quizIndex,
         TSINTSKARO_HISTORY_QUIZZES.length,
         today,
+        currentSlot,
       );
       this.logger.log(
         `Sent history quiz #${quizNumber}: chat=${target.chatId}, thread=${target.threadId ?? 'none'}`,
@@ -135,6 +140,20 @@ export class FactDaySchedulerService {
     const part = (type: string) =>
       parts.find((item) => item.type === type)?.value ?? '';
     return `${part('year')}-${part('month')}-${part('day')}`;
+  }
+
+  private getHourSlotInTimeZone(date: Date, timeZone: string): string {
+    const parts = new Intl.DateTimeFormat('en', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      hour12: false,
+    }).formatToParts(date);
+    const part = (type: string) =>
+      parts.find((item) => item.type === type)?.value ?? '';
+    return `${part('year')}-${part('month')}-${part('day')}-${part('hour')}`;
   }
 
   private truncateExplanation(explanation: string): string {
