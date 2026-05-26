@@ -74,7 +74,7 @@ export type BotMentionResult =
   | { action: 'add_memory'; text: string }
   | { action: 'reply'; message: string };
 
-const MODEL_NAME = 'gpt-5.2';
+const MODEL_NAME = 'gpt-5.5';
 
 @Injectable()
 export class OpenaiService {
