@@ -21,6 +21,7 @@ describe('TelegramUpdate bot mentions', () => {
         action: 'reply',
         message: 'ok',
       })),
+      normalizeDictionaryEntries: jest.fn(async () => []),
     };
     const telegramService = {
       getRecentMessages: jest.fn(async () => []),
@@ -106,10 +107,121 @@ describe('TelegramUpdate bot mentions', () => {
       partOfSpeech: null,
       addedBy: 'AAlxnv',
     });
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
+      word: 'шûла-пûлав',
+      translation: 'поминальное блюдо',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
     expect(ctx.reply).toHaveBeenCalledWith(
       expect.stringContaining('✅ записал (34):'),
       { reply_parameters: { message_id: 123 } },
     );
+  });
+
+  it('adds a direct word list when the dash touches the word', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const text = `Бот, проанализируй и добавь слова:
+Âйсûч- меньше,  нехватка,
+Артых - лишнее,
+Артых âйсûч сôйлâмâ- лишнего не болтай,
+Ŷшŷч- простуда,
+Вурух- ушиб,
+Сахглам- здоровый,
+Джŷмâнни- в положении, ( беременная),
+Ушах этмах- рожать,
+Мeшâт этмах- помешать кому- то,
+Дамламах- капать,
+Урâч гхарышмах- тошнота, тошнить,
+Аяхланмах- встать на ноги,(выздороветь),
+Гхолтух- подмышка,
+Гхолтухгун алти- под  мышкой,
+Гыгарт - клюв,
+Чâнджâ- челюсть,
+Бурнун дâлиджи- ноздря,
+Дирсâч- локоть,
+Гхабурхга- ребро`;
+
+    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
+
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(19);
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
+      word: 'âйсûч',
+      translation: 'меньше, нехватка',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
+      word: 'артых âйсûч сôйлâмâ',
+      translation: 'лишнего не болтай',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(7, {
+      word: 'джŷмâнни',
+      translation: 'в положении, ( беременная)',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(12, {
+      word: 'аяхланмах',
+      translation: 'встать на ноги,(выздороветь)',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(19, {
+      word: 'гхабурхга',
+      translation: 'ребро',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('✅ записал (19):'),
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('uses AI normalization when a direct word list is not fully parseable', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    openaiService.normalizeDictionaryEntries.mockResolvedValueOnce([
+      {
+        word: 'âйсûч',
+        translation: 'меньше, нехватка',
+        partOfSpeech: null,
+      },
+      { word: 'артых', translation: 'лишнее', partOfSpeech: null },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      `Бот, проверь и добавь слова:
+Âйсûч меньше, нехватка
+Артых - лишнее`,
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.normalizeDictionaryEntries).toHaveBeenCalledWith(
+      `проверь и добавь слова:
+Âйсûч меньше, нехватка
+Артых - лишнее`,
+    );
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(2);
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
+      word: 'âйсûч',
+      translation: 'меньше, нехватка',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
+      word: 'артых',
+      translation: 'лишнее',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
   });
 
   it('still replies with the leaderboard for an explicit leaderboard request', async () => {

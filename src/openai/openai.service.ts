@@ -283,6 +283,88 @@ ${text}
     };
   }
 
+  async normalizeDictionaryEntries(
+    text: string,
+  ): Promise<DictionaryEntryInput[]> {
+    const prompt = `Ты помощник по подготовке словарных записей цинцкарского диалекта.
+
+Пользователь прислал сообщение для добавления слов в словарь. Формат может быть неаккуратным: нет пробелов вокруг дефиса, вместо дефиса может быть двоеточие, слово и перевод могут быть просто через пробел, могут быть лишние вводные фразы.
+
+Твоя задача — извлечь только явные пары "цинцкарское слово или фраза" + "русский перевод" и вернуть их в структурированном виде.
+
+Правила:
+- Не выдумывай слова и переводы. Если у строки нет понятного русского перевода, пропусти её.
+- Не исправляй орфографию цинцкарского слова по догадке. Можно только убрать лишнюю пунктуацию и привести к нижнему регистру.
+- Сохраняй несколько значений в переводе через запятую или точку с запятой, если они были в исходном тексте.
+- Сохраняй пояснения в скобках.
+- Игнорируй обращение к боту, команды, заголовки, просьбы, пустые строки, рейтинги и строки с @username.
+- Если одна и та же пара повторяется, верни её один раз.
+
+Ответь ТОЛЬКО валидным JSON:
+{
+  "entries": [
+    {
+      "word": "цинцкарское слово или фраза",
+      "translation": "русский перевод",
+      "partOfSpeech": null
+    }
+  ]
+}
+
+Сообщение:
+"""
+${text}
+"""`;
+
+    const response = await this.openai.chat.completions.create({
+      model: MODEL_NAME,
+      messages: [{ role: 'user', content: prompt }],
+      response_format: { type: 'json_object' },
+    });
+
+    const content = response.choices[0].message.content || '{}';
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed.entries)) {
+      return [];
+    }
+
+    const entries: DictionaryEntryInput[] = [];
+    const seen = new Set<string>();
+    for (const raw of parsed.entries) {
+      if (
+        !raw ||
+        typeof raw.word !== 'string' ||
+        typeof raw.translation !== 'string'
+      ) {
+        continue;
+      }
+
+      const word = raw.word
+        .toLowerCase()
+        .trim()
+        .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
+        .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '')
+        .replace(/\s+/g, ' ');
+      const translation = raw.translation
+        .trim()
+        .replace(/^[\s"'«»“”„`.,;:!?]+/g, '')
+        .replace(/[\s"'«»“”„`.,;:!?]+$/g, '')
+        .replace(/\s+/g, ' ');
+      if (!word || !translation) continue;
+
+      const partOfSpeech =
+        typeof raw.partOfSpeech === 'string' && raw.partOfSpeech.trim()
+          ? raw.partOfSpeech.trim()
+          : null;
+      const key = `${word}\u0000${translation}\u0000${partOfSpeech ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push({ word, translation, partOfSpeech });
+    }
+
+    return entries;
+  }
+
   async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
     const combinedText = messages.join('\n---\n');
     const dictionary = await this.dictionaryService.getFormattedForPrompt();

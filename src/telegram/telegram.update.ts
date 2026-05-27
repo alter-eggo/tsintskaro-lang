@@ -236,7 +236,10 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    const directDictionaryEntries = this.extractDirectDictionaryEntries(text);
+    const directDictionaryEntries = await this.extractDirectDictionaryEntries(
+      text,
+      chatId,
+    );
     if (directDictionaryEntries.length > 0) {
       await this.handleDictionaryAdditions(
         ctx,
@@ -416,8 +419,37 @@ export class TelegramUpdate implements OnModuleInit {
     );
   }
 
-  private extractDirectDictionaryEntries(text: string): DictionaryEntryInput[] {
+  private async extractDirectDictionaryEntries(
+    text: string,
+    chatId: number,
+  ): Promise<DictionaryEntryInput[]> {
     const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
+    const localEntries = this.extractDirectDictionaryEntriesLocally(body);
+
+    if (!this.shouldUseAiDictionaryParser(body, localEntries)) {
+      return localEntries;
+    }
+
+    try {
+      const aiEntries = await this.openaiService.normalizeDictionaryEntries(body);
+      if (aiEntries.length > localEntries.length) {
+        this.logger.log(
+          `[Chat ${chatId}] AI dictionary parser extracted ${aiEntries.length} entries instead of ${localEntries.length}`,
+        );
+        return this.deduplicateDictionaryEntries(aiEntries);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `[Chat ${chatId}] AI dictionary parser failed, using local parser result: ${err}`,
+      );
+    }
+
+    return localEntries;
+  }
+
+  private extractDirectDictionaryEntriesLocally(
+    body: string,
+  ): DictionaryEntryInput[] {
     const entries: DictionaryEntryInput[] = [];
     const seen = new Set<string>();
 
@@ -438,13 +470,98 @@ export class TelegramUpdate implements OnModuleInit {
     return entries;
   }
 
+  private shouldUseAiDictionaryParser(
+    body: string,
+    localEntries: DictionaryEntryInput[],
+  ): boolean {
+    if (!this.hasDictionaryAddIntent(body)) {
+      return false;
+    }
+
+    const candidateLineCount = this.countLikelyDictionaryCandidateLines(body);
+    if (candidateLineCount > 0 && localEntries.length < candidateLineCount) {
+      return true;
+    }
+
+    return (
+      localEntries.length === 0 && this.hasLooseDictionaryEntrySignals(body)
+    );
+  }
+
+  private countLikelyDictionaryCandidateLines(body: string): number {
+    return body
+      .split(/\r?\n/g)
+      .filter((line) => this.isLikelyDictionaryCandidateLine(line)).length;
+  }
+
+  private isLikelyDictionaryCandidateLine(line: string): boolean {
+    const trimmed = line.trim().replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '');
+    if (!trimmed) return false;
+    if (this.isDictionaryInstructionLine(trimmed)) return false;
+    if (this.isNonDictionaryListLine(trimmed)) return false;
+    if (this.extractDictionaryEntryLine(trimmed)) return true;
+
+    const normalized = this.stripDictionaryPairIntent(trimmed);
+    if (!this.hasLooseDictionaryEntrySignals(normalized)) return false;
+
+    const tokens = normalized.split(/\s+/g).filter(Boolean);
+    return tokens.length >= 2 && tokens.length <= 16;
+  }
+
+  private isDictionaryInstructionLine(line: string): boolean {
+    if (
+      this.hasDictionaryAddIntent(line) &&
+      /(?:^|[\s,.:;!?])слова?:?\s*$/i.test(line)
+    ) {
+      return true;
+    }
+
+    return /^(?:проанализируй|проверь|посмотри|разбери|добавь|добавить|запиши|записать|нов(?:ое|ые|ых)\s+)?(?:эти\s+)?слова?:?\s*$/i.test(
+      line,
+    );
+  }
+
+  private isNonDictionaryListLine(line: string): boolean {
+    return (
+      /^🏆/.test(line) ||
+      /топ\s+добавивш/i.test(line) ||
+      line.startsWith('@') ||
+      /(?:^|\s)@\w+/.test(line) ||
+      /^\d+\s+слов[ао]?$/i.test(line)
+    );
+  }
+
+  private hasLooseDictionaryEntrySignals(text: string): boolean {
+    return (
+      /[а-яёâãáàäāôóòöōûŷúùüū]/i.test(text) &&
+      (/(?:[-—=:]|значит|означает|перевод|это)/i.test(text) ||
+        text.split(/\s+/g).filter(Boolean).length >= 2)
+    );
+  }
+
+  private deduplicateDictionaryEntries(
+    entries: DictionaryEntryInput[],
+  ): DictionaryEntryInput[] {
+    const deduplicated: DictionaryEntryInput[] = [];
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      const key = `${entry.word}\u0000${entry.translation}\u0000${entry.partOfSpeech ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduplicated.push(entry);
+    }
+    return deduplicated;
+  }
+
   private extractDictionaryEntryLine(
     line: string,
   ): DictionaryEntryInput | null {
     const trimmed = this.stripDictionaryPairIntent(
       line.trim().replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ''),
     );
-    const match = trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/);
+    const match =
+      trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
+      trimmed.match(/^(.+?)(?:[-—=])\s+(.+?)\s*;?\s*$/);
     if (!match) return null;
 
     const word = this.cleanDictionaryWord(match[1]);
@@ -649,8 +766,8 @@ export class TelegramUpdate implements OnModuleInit {
   private cleanDictionaryTranslation(value: string): string {
     return value
       .trim()
-      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
-      .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '')
+      .replace(/^[\s"'«»“”„`.,;:!?]+/g, '')
+      .replace(/[\s"'«»“”„`.,;:!?]+$/g, '')
       .replace(/\s+/g, ' ');
   }
 
