@@ -1,8 +1,12 @@
 import { Update, Ctx, Hears, Command, Start, InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { BotMemoryEntry, TelegramService } from './telegram.service';
-import { DictionaryService } from '../dictionary/dictionary.service';
 import {
+  DictionaryEntry,
+  DictionaryService,
+} from '../dictionary/dictionary.service';
+import {
+  BotDictionaryContextEntry,
   DictionaryEntryInput,
   DictionaryUpdateInput,
   OpenaiService,
@@ -16,6 +20,11 @@ import {
 } from '../fact-day/fact-day-scheduler.service';
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
+
+interface SpellingCorrectionByTranslation {
+  newWord: string;
+  translation: string;
+}
 
 @Update()
 export class TelegramUpdate implements OnModuleInit {
@@ -196,6 +205,8 @@ export class TelegramUpdate implements OnModuleInit {
 
   private static readonly BOT_MEMORY_LIMIT = 50;
 
+  private static readonly BOT_DICTIONARY_CONTEXT_LIMIT = 5;
+
   private static readonly WORKING_LINKS_REQUEST_REGEX =
     /(?:рабоч\w*\s+ссыл|ссылк\w*[\s\S]{0,40}рабоч|скин\w*[\s\S]{0,40}ссыл|пришл\w*[\s\S]{0,40}ссыл|дай[\s\S]{0,40}ссыл)/i;
 
@@ -228,6 +239,19 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
+    const spellingCorrection =
+      await this.extractSpellingCorrectionByTranslation(text);
+    if (spellingCorrection) {
+      await this.handleSpellingCorrectionByTranslation(
+        ctx,
+        chatId,
+        username,
+        messageId,
+        spellingCorrection,
+      );
+      return;
+    }
+
     const directDictionaryUpdate = this.extractDirectDictionaryUpdate(text);
     if (directDictionaryUpdate) {
       await this.handleDictionaryUpdates(ctx, chatId, username, messageId, [
@@ -256,7 +280,11 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    const [recentMessages, botMemory] = await Promise.all([
+    if (await this.replyToDictionaryLookup(ctx, text, messageId)) {
+      return;
+    }
+
+    const [recentMessages, botMemory, dictionaryEntries] = await Promise.all([
       this.telegramService.getRecentMessages(
         chatId,
         threadId,
@@ -266,9 +294,10 @@ export class TelegramUpdate implements OnModuleInit {
         chatId,
         TelegramUpdate.BOT_MEMORY_LIMIT,
       ),
+      this.getDictionaryContextEntries(text),
     ]);
     this.logger.log(
-      `[Chat ${chatId}] Loaded ${recentMessages.length} recent messages and ${botMemory.length} memory entries for AI context`,
+      `[Chat ${chatId}] Loaded ${recentMessages.length} recent messages, ${botMemory.length} memory entries and ${dictionaryEntries.length} dictionary entries for AI context`,
     );
 
     if (this.isWorkingLinksRequest(text)) {
@@ -282,6 +311,7 @@ export class TelegramUpdate implements OnModuleInit {
         text,
         recentMessages,
         botMemory,
+        dictionaryEntries,
       );
     } catch (err) {
       this.logger.error(`[Chat ${chatId}] AI processBotMention failed:`, err);
@@ -431,7 +461,8 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     try {
-      const aiEntries = await this.openaiService.normalizeDictionaryEntries(body);
+      const aiEntries =
+        await this.openaiService.normalizeDictionaryEntries(body);
       if (aiEntries.length > localEntries.length) {
         this.logger.log(
           `[Chat ${chatId}] AI dictionary parser extracted ${aiEntries.length} entries instead of ${localEntries.length}`,
@@ -453,7 +484,7 @@ export class TelegramUpdate implements OnModuleInit {
     const entries: DictionaryEntryInput[] = [];
     const seen = new Set<string>();
 
-    for (const line of body.split(/\r?\n/g)) {
+    for (const line of this.splitDictionaryEntryLines(body)) {
       const entry = this.extractDictionaryEntryLine(line);
       if (!entry) continue;
 
@@ -468,6 +499,255 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     return entries;
+  }
+
+  private async extractSpellingCorrectionByTranslation(
+    text: string,
+  ): Promise<SpellingCorrectionByTranslation | null> {
+    const body = text
+      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
+      .trim()
+      .replace(/\s+/g, ' ');
+
+    const match = body.match(
+      /^(?:измени|исправь|поправь|обнови)\s+(?:правописани[ея]|написани[ея]|орфографи[юя])\s+(?:слова?\s+)?(.+?)\s*(?:=|—|-|:)\s*(.+?)[.!?]*$/i,
+    );
+    if (!match) return null;
+
+    const newWord = this.cleanDictionaryWord(match[1]);
+    const translation = this.cleanDictionaryTranslation(match[2]);
+    if (!newWord || !translation || !this.isLikelyDictionaryWord(newWord)) {
+      return null;
+    }
+
+    return { newWord, translation };
+  }
+
+  private async handleSpellingCorrectionByTranslation(
+    ctx: Context,
+    chatId: number,
+    username: string,
+    messageId: number | undefined,
+    correction: SpellingCorrectionByTranslation,
+  ): Promise<void> {
+    const matches = await this.dictionaryService.findByTranslation(
+      correction.translation,
+    );
+
+    if (matches.length === 1) {
+      await this.handleDictionaryUpdates(ctx, chatId, username, messageId, [
+        {
+          oldWord: matches[0].word,
+          newWord: correction.newWord,
+          translation: correction.translation,
+        },
+      ]);
+      return;
+    }
+
+    if (messageId == null) return;
+
+    if (matches.length === 0) {
+      await ctx.reply(
+        `⚠️ не нашёл в словаре слово с переводом «${correction.translation}». Не стал создавать новую запись.`,
+        { reply_parameters: { message_id: messageId } },
+      );
+      return;
+    }
+
+    const candidates = matches
+      .slice(0, 5)
+      .map((entry) => entry.word)
+      .join(', ');
+    await ctx.reply(
+      `⚠️ нашёл несколько слов с переводом «${correction.translation}»: ${candidates}. Напиши старое слово явно: «Баласи, исправь старое_слово на ${correction.newWord}».`,
+      { reply_parameters: { message_id: messageId } },
+    );
+  }
+
+  private async replyToDictionaryLookup(
+    ctx: Context,
+    text: string,
+    messageId: number | undefined,
+  ): Promise<boolean> {
+    if (!this.isDictionaryLookupRequest(text)) {
+      return false;
+    }
+
+    const candidates = this.extractDictionaryLookupCandidates(text);
+    if (candidates.length === 0) {
+      return false;
+    }
+
+    const entries = await this.findDictionaryLookupEntries(
+      candidates,
+      this.isRussianToTsintskaroLookupRequest(text),
+    );
+    const message =
+      entries.length > 0
+        ? this.formatDictionaryLookupReply(entries)
+        : `Такого слова в нашем словаре нет: ${candidates.join(', ')}.`;
+
+    if (messageId != null) {
+      await ctx.reply(message, {
+        reply_parameters: { message_id: messageId },
+      });
+      return true;
+    }
+
+    await ctx.reply(message);
+    return true;
+  }
+
+  private async getDictionaryContextEntries(
+    text: string,
+  ): Promise<BotDictionaryContextEntry[]> {
+    const candidates = this.extractDictionaryLookupCandidates(text);
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const entries = await this.findDictionaryLookupEntries(
+      candidates,
+      this.isRussianToTsintskaroLookupRequest(text),
+    );
+
+    return entries.map((entry) => ({
+      word: entry.word,
+      translation: entry.translation,
+      partOfSpeech: entry.partOfSpeech,
+    }));
+  }
+
+  private async findDictionaryLookupEntries(
+    candidates: string[],
+    reverseLookup: boolean,
+  ): Promise<DictionaryEntry[]> {
+    const entries: DictionaryEntry[] = [];
+    const seen = new Set<string>();
+
+    for (const candidate of candidates.slice(0, 8)) {
+      const found = reverseLookup
+        ? await this.dictionaryService.findByTranslation(candidate)
+        : [await this.dictionaryService.findWord(candidate)].filter(
+            (entry): entry is DictionaryEntry => Boolean(entry),
+          );
+
+      for (const entry of found) {
+        const key = entry.word.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push(entry);
+        if (entries.length >= TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT) {
+          return entries;
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  private formatDictionaryLookupReply(entries: DictionaryEntry[]): string {
+    if (entries.length === 1) {
+      const entry = entries[0];
+      const pos = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
+      return `${entry.word} — ${entry.translation}${pos}`;
+    }
+
+    return [
+      'Нашёл в словаре:',
+      ...entries.map((entry) => {
+        const pos = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
+        return `• ${entry.word} — ${entry.translation}${pos}`;
+      }),
+    ].join('\n');
+  }
+
+  private isDictionaryLookupRequest(text: string): boolean {
+    return /(?:как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русский|на\s+цинцкарск|по-цинцкарск)/i.test(
+      text,
+    );
+  }
+
+  private isRussianToTsintskaroLookupRequest(text: string): boolean {
+    return /(?:на\s+цинцкарск|по-цинцкарск)/i.test(text);
+  }
+
+  private extractDictionaryLookupCandidates(text: string): string[] {
+    const body = text
+      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    const candidates: string[] = [];
+
+    const quoted = /[«"“„](.+?)[»"”]/g;
+    for (const match of body.matchAll(quoted)) {
+      this.addDictionaryLookupCandidate(candidates, match[1]);
+    }
+
+    const patterns = [
+      /(?:как\s+перевести(?:\s+на\s+(?:русский|цинцкарский))?|переведи(?:\s+на\s+(?:русский|цинцкарский))?)\s+(.+?)(?:[?.!]|$)/i,
+      /(?:что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова)\s+(.+?)(?:[?.!]|$)/i,
+    ];
+
+    for (const pattern of patterns) {
+      const match = body.match(pattern);
+      if (match) {
+        this.addDictionaryLookupCandidate(candidates, match[1]);
+      }
+    }
+
+    return candidates;
+  }
+
+  private addDictionaryLookupCandidate(
+    candidates: string[],
+    rawValue: string,
+  ): void {
+    const candidate = this.cleanDictionaryLookupCandidate(rawValue);
+    if (
+      !candidate ||
+      candidates.includes(candidate) ||
+      !this.isLikelyDictionaryWord(candidate)
+    ) {
+      return;
+    }
+
+    candidates.push(candidate);
+  }
+
+  private cleanDictionaryLookupCandidate(value: string): string {
+    return this.cleanDictionaryWord(value)
+      .replace(/^(?:слово|слова|фраза|фразу)\s+/i, '')
+      .replace(/^(?:на|по)\s+(?:русский|цинцкарский)\s+/i, '')
+      .replace(/\s+(?:на|по)\s+(?:русский|цинцкарский)$/i, '')
+      .trim();
+  }
+
+  private splitDictionaryEntryLines(body: string): string[] {
+    const lines: string[] = [];
+
+    for (const rawLine of body.split(/\r?\n/g)) {
+      const segments = rawLine.split(';');
+      let current = '';
+
+      for (const segment of segments) {
+        const trimmed = segment.trim();
+        if (!trimmed) continue;
+
+        if (current && this.extractDictionaryEntryLine(trimmed)) {
+          lines.push(current);
+          current = trimmed;
+          continue;
+        }
+
+        current = current ? `${current}; ${trimmed}` : trimmed;
+      }
+
+      if (current) lines.push(current);
+    }
+
+    return lines;
   }
 
   private shouldUseAiDictionaryParser(
@@ -561,7 +841,8 @@ export class TelegramUpdate implements OnModuleInit {
     );
     const match =
       trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
-      trimmed.match(/^(.+?)(?:[-—=])\s+(.+?)\s*;?\s*$/);
+      trimmed.match(/^(.+?)(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
+      trimmed.match(/^(.+?)\s*:\s+(.+?)\s*;?\s*$/);
     if (!match) return null;
 
     const word = this.cleanDictionaryWord(match[1]);

@@ -66,6 +66,12 @@ export interface BotMemoryInput {
   createdAt: Date;
 }
 
+export interface BotDictionaryContextEntry {
+  word: string;
+  translation: string;
+  partOfSpeech?: string | null;
+}
+
 /** Result of processing a "Бот, ..." or "Баласи, ..." message */
 export type BotMentionResult =
   | { action: 'add_words'; entries: DictionaryEntryInput[] }
@@ -93,10 +99,15 @@ export class OpenaiService {
     text: string,
     recentMessages: { username: string; text: string; sentAt: Date }[] = [],
     botMemory: BotMemoryInput[] = [],
+    dictionaryEntries: BotDictionaryContextEntry[] = [],
   ): Promise<BotMentionResult> {
-    const dictionary = await this.dictionaryService.getFormattedForPrompt();
-    const dictionarySection = dictionary
-      ? `\nТЕКУЩИЙ СЛОВАРЬ (используй для ответов на вопросы о значениях слов):\n${dictionary}\n`
+    const dictionarySection = dictionaryEntries.length
+      ? `\nНАЙДЕННЫЕ СЛОВА В СЛОВАРЕ (используй для ответов на вопросы о значениях слов):\n${dictionaryEntries
+          .map((e) => {
+            const pos = e.partOfSpeech ? ` (${e.partOfSpeech})` : '';
+            return `${e.word} = ${e.translation}${pos}`;
+          })
+          .join('\n')}\n`
       : '';
 
     const contextSection =
@@ -171,8 +182,8 @@ export class OpenaiService {
 
 ПРАВИЛА для ответа:
 - На русском, дружелюбно, по делу. Максимум 3-4 предложения. Для пересказов переписки можно до 6.
-- Если спрашивают значение цинцкарского слова — ищи в словаре выше. Если слова там нет — честно скажи "такого слова в нашем словаре нет". НЕ выдумывай переводы цинцкарских слов из своей фантазии.
-- Если просят перевести с русского на цинцкарский — ищи в словаре. Если нет — так и скажи.
+  - Если спрашивают значение цинцкарского слова — используй раздел НАЙДЕННЫЕ СЛОВА В СЛОВАРЕ, если он есть. Если нужного слова там нет — честно скажи "такого слова в нашем словаре нет". НЕ выдумывай переводы цинцкарских слов из своей фантазии.
+  - Если просят перевести с русского на цинцкарский — используй раздел НАЙДЕННЫЕ СЛОВА В СЛОВАРЕ. Если подходящего слова там нет — так и скажи.
 - Если спрашивают о сохранённой памяти — используй раздел ПАМЯТЬ БОТА. Если памяти нет — скажи, что пока ничего не запомнил.
 - Если спрашивают о недавней переписке ("о чём говорили", "что обсуждали", "перескажи", "кто что писал") — используй раздел НЕДАВНИЕ СООБЩЕНИЯ ниже. Отвечай обобщённо по темам, не цитируй дословно длинными кусками. Если переписки нет — скажи "нечего пересказывать".
 - Если просят "рабочие ссылки" или ссылку на сайт — используй URL из ПАМЯТИ БОТА. Если URL не указан, скажи что ссылку ещё нужно добавить в память.

@@ -12,6 +12,17 @@ describe('TelegramUpdate bot mentions', () => {
           partOfSpeech: input.partOfSpeech ?? null,
         },
       })),
+      updateWord: jest.fn(async (input) => ({
+        status: 'updated',
+        resolvedOldWord: input.oldWord,
+        word: {
+          word: input.newWord ?? input.oldWord,
+          translation: input.translation ?? 'old translation',
+          partOfSpeech: input.partOfSpeech ?? null,
+        },
+      })),
+      findWord: jest.fn(async () => undefined),
+      findByTranslation: jest.fn(async () => []),
       getLeaderboard: jest.fn(async () => [
         { username: 'anonymous', wordsCount: 410 },
       ]),
@@ -224,6 +235,68 @@ describe('TelegramUpdate bot mentions', () => {
     });
   });
 
+  it('adds several direct word pairs from one semicolon-separated line', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Бот, добавь Хатâ - проблема; неприятность; Артых - лишнее; Ширин - сладкий; сахарный',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(3);
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
+      word: 'хатâ',
+      translation: 'проблема; неприятность',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
+      word: 'артых',
+      translation: 'лишнее',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
+      word: 'ширин',
+      translation: 'сладкий; сахарный',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+  });
+
+  it('adds direct word pairs written with colons', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      `Бот, добавь слова:
+Хатâ: проблема
+Артых: лишнее`,
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(2);
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
+      word: 'хатâ',
+      translation: 'проблема',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
+      word: 'артых',
+      translation: 'лишнее',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+  });
+
   it('still replies with the leaderboard for an explicit leaderboard request', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
 
@@ -240,6 +313,106 @@ describe('TelegramUpdate bot mentions', () => {
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
     expect(ctx.reply).toHaveBeenCalledWith(
       '🏆 Топ добавивших слова:\n1. @anonymous — 410 слов',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('answers a direct dictionary lookup locally without OpenAI', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findWord.mockResolvedValueOnce({
+      word: 'сахгкал оти',
+      translation: 'укроп',
+      partOfSpeech: 'сущ.',
+    });
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, как перевести на русский «Сахгкал оти»?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('сахгкал оти');
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('сахгкал оти — укроп (сущ.)', {
+      reply_parameters: { message_id: 123 },
+    });
+  });
+
+  it('passes only matching dictionary entries into general AI context', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findWord.mockResolvedValueOnce({
+      word: 'сахгкал оти',
+      translation: 'укроп',
+      partOfSpeech: null,
+    });
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, составь пример со словом «Сахгкал оти»',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, составь пример со словом «Сахгкал оти»',
+      [],
+      [],
+      [{ word: 'сахгкал оти', translation: 'укроп', partOfSpeech: null }],
+    );
+  });
+
+  it('corrects spelling by translation instead of adding a bad word', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findByTranslation.mockResolvedValueOnce([
+      {
+        word: 'сагхал оти',
+        translation: 'укроп',
+        partOfSpeech: null,
+      },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправь правописание слова сахгкал оти - укроп',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
+      oldWord: 'сагхал оти',
+      newWord: 'сахгкал оти',
+      translation: 'укроп',
+      partOfSpeech: undefined,
+      updatedBy: 'AAlxnv',
+    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('✅ поправил:'),
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('does not create a word when spelling correction cannot be matched', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправь правописание слова сахгкал оти - укроп',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '⚠️ не нашёл в словаре слово с переводом «укроп». Не стал создавать новую запись.',
       { reply_parameters: { message_id: 123 } },
     );
   });

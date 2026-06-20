@@ -171,7 +171,38 @@ export class DictionaryService {
 
   async findWord(word: string): Promise<DictionaryEntry | undefined> {
     await this.ensureCache();
-    return this.cacheById!.get(word.toLowerCase().trim());
+    const normalized = this.normalizeWordInput(word);
+    if (!normalized) return undefined;
+
+    const exact = this.cacheById!.get(normalized);
+    if (exact) return exact;
+
+    const folded = this.foldWordForLookup(normalized);
+    if (!folded) return undefined;
+
+    const candidates = this.cache!.filter(
+      (entry) => this.foldWordForLookup(entry.word) === folded,
+    );
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  async findByTranslation(translation: string): Promise<DictionaryEntry[]> {
+    await this.ensureCache();
+    const normalized = this.normalizeTranslationForCompare(translation);
+    if (!normalized) return [];
+
+    return this.cache!.filter((entry) => {
+      const entryTranslation = this.normalizeTranslationForCompare(
+        entry.translation,
+      );
+      if (entryTranslation === normalized) return true;
+
+      const parts = entry.translation
+        .split(/\s*(?:;|,|\/|\n)\s*/g)
+        .map((part) => this.normalizeTranslationForCompare(part))
+        .filter((part) => part.length > 0);
+      return parts.includes(normalized);
+    });
   }
 
   async deleteWords(
