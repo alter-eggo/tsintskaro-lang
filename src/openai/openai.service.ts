@@ -1,12 +1,22 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
+import type {
+  ChatCompletion,
+  ChatCompletionCreateParamsNonStreaming,
+} from 'openai/resources/chat/completions';
 import { DictionaryService } from '../dictionary/dictionary.service';
+import { OpenaiUsagePurpose, OpenaiUsageService } from './openai-usage.service';
 
-interface ExtractedWord {
+export interface ExtractedWord {
   word: string;
   possibleTranslation: string | null;
   context: string;
+}
+
+interface DiscussionAnalysisWord extends ExtractedWord {
+  partOfSpeech: string | null;
+  username: string | null;
 }
 
 /** Raw entry from chat: one suggestion per participant */
@@ -15,12 +25,6 @@ export interface ProcessDiscussionEntry {
   translation: string;
   partOfSpeech: string;
   username: string;
-}
-
-/** Result of processDiscussion: summary + flat entries for dedup in code */
-export interface ProcessDiscussionRawResult {
-  discussionSummary: string;
-  entries: ProcessDiscussionEntry[];
 }
 
 /** Agreed word (single translation) */
@@ -45,6 +49,12 @@ export interface ProcessDiscussionResult {
   disputedWords: DisputedWord[];
   totalExtracted: number;
   duplicatesRemoved: number;
+}
+
+export interface DiscussionAnalysisResult {
+  discussionSummary: string;
+  words: ExtractedWord[];
+  discussionResult: ProcessDiscussionResult;
 }
 
 export interface DictionaryEntryInput {
@@ -80,19 +90,150 @@ export type BotMentionResult =
   | { action: 'add_memory'; text: string }
   | { action: 'reply'; message: string };
 
-const MODEL_NAME = 'gpt-5.5';
+const BOT_MENTION_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'bot_mention_action',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'add_words',
+            'update_words',
+            'delete_words',
+            'add_memory',
+            'reply',
+          ],
+        },
+        entries: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              word: { type: ['string', 'null'] },
+              translation: { type: ['string', 'null'] },
+              partOfSpeech: { type: ['string', 'null'] },
+              oldWord: { type: ['string', 'null'] },
+              newWord: { type: ['string', 'null'] },
+            },
+            required: [
+              'word',
+              'translation',
+              'partOfSpeech',
+              'oldWord',
+              'newWord',
+            ],
+          },
+        },
+        words: { type: 'array', items: { type: 'string' } },
+        text: { type: ['string', 'null'] },
+        message: { type: ['string', 'null'] },
+      },
+      required: ['action', 'entries', 'words', 'text', 'message'],
+    },
+  },
+} as const;
+
+const DICTIONARY_ENTRIES_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'dictionary_entries',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        entries: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              word: { type: 'string' },
+              translation: { type: 'string' },
+              partOfSpeech: { type: ['string', 'null'] },
+            },
+            required: ['word', 'translation', 'partOfSpeech'],
+          },
+        },
+      },
+      required: ['entries'],
+    },
+  },
+} as const;
+
+const DISCUSSION_ANALYSIS_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'discussion_analysis',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        discussionSummary: { type: 'string' },
+        words: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              word: { type: 'string' },
+              possibleTranslation: { type: ['string', 'null'] },
+              context: { type: 'string' },
+              partOfSpeech: { type: ['string', 'null'] },
+              username: { type: ['string', 'null'] },
+            },
+            required: [
+              'word',
+              'possibleTranslation',
+              'context',
+              'partOfSpeech',
+              'username',
+            ],
+          },
+        },
+      },
+      required: ['discussionSummary', 'words'],
+    },
+  },
+} as const;
 
 @Injectable()
 export class OpenaiService {
+  private readonly logger = new Logger(OpenaiService.name);
   private openai: OpenAI;
+  private readonly botModel: string;
+  private readonly extractionModel: string;
+  private readonly reportModel: string;
+  private readonly botMaxCompletionTokens: number;
+  private readonly extractionMaxCompletionTokens: number;
+  private readonly reportMaxCompletionTokens: number;
 
   constructor(
     private config: ConfigService,
     private dictionaryService: DictionaryService,
+    private openaiUsageService: OpenaiUsageService,
   ) {
     this.openai = new OpenAI({
       apiKey: this.config.get('openaiKey'),
     });
+    this.botModel = this.config.get<string>('openaiBotModel') || 'gpt-5.4-mini';
+    this.extractionModel =
+      this.config.get<string>('openaiExtractionModel') || 'gpt-5.4-nano';
+    this.reportModel =
+      this.config.get<string>('openaiReportModel') || 'gpt-5.4-mini';
+    this.botMaxCompletionTokens =
+      this.config.get<number>('openaiBotMaxCompletionTokens') || 800;
+    this.extractionMaxCompletionTokens =
+      this.config.get<number>('openaiExtractionMaxCompletionTokens') || 3000;
+    this.reportMaxCompletionTokens =
+      this.config.get<number>('openaiReportMaxCompletionTokens') || 4000;
   }
 
   async processBotMention(
@@ -127,82 +268,41 @@ export class OpenaiService {
             .join('\n')}\n`
         : '';
 
-    const prompt = `Ты помощник Общества Цинцкаро в Telegram-чате жителей, потомков и друзей села Цинцкаро (Грузия). Они говорят по-русски и используют слова цинцкарского диалекта (смесь старого азербайджанского и восточно-анатолийского турецкого, записан кириллицей).
+    const systemPrompt = `Ты помощник Общества Цинцкаро в Telegram-чате. Отвечай по-русски, дружелюбно и кратко.
 
-ТЫ НЕ ТОЛЬКО СЛОВАРЬ. Ты универсальный помощник сообщества: помогаешь с объявлениями, ссылками, фактами, историей, пересказом переписки, организационными вопросами, формулировками сообщений, идеями для проектов Общества Цинцкаро и обычными вопросами участников. Словарь, память и недавняя переписка — твои инструменты, а не единственная роль.
+Выбери одно действие:
+- add_words — только когда пользователь явно просит добавить одну или несколько пар «цинцкарское слово — русский перевод»;
+- update_words — когда явно просит исправить слово, написание или перевод;
+- delete_words — только для перечисленных конкретных слов, максимум 10;
+- add_memory — только при явной просьбе запомнить конкретный факт;
+- reply — для вопросов, общения и всех остальных случаев.
 
-Пользователи обращаются к боту, начиная сообщение со слова "Бот" или "Баласи". После этого они могут: добавить новое слово в словарь, добавить факт в память бота, спросить про значение слова, задать вопрос о недавней переписке в чате, задать общий вопрос, поздороваться, поболтать.
+Для слов используй нижний регистр, не выдумывай переводы и сохраняй все явно указанные значения. Массовое удаление запрещено: ответь, что нужно перечислить до 10 конкретных слов. В неиспользуемых полях структурированного ответа возвращай пустой массив или null.
 
-ТВОЯ ЗАДАЧА: понять что хочет пользователь и вернуть одно из действий ниже.
+В reply пиши 3–4 предложения, для пересказа — максимум 6. Для цинцкарских переводов используй только переданный словарь; если слова нет, честно скажи об этом. Для вопросов о памяти и переписке используй только соответствующие разделы контекста. Если фактов недостаточно, попроси уточнение.`;
 
-ВАРИАНТ 1 — ДОБАВИТЬ СЛОВА В СЛОВАРЬ. Выбирай этот вариант когда пользователь явно говорит "добавь", "запиши", "новое слово", "есть такое слово", "пиши", и при этом указывает пары "слово-перевод" (одну или несколько):
-{"action": "add_words", "entries": [{"word": "...", "translation": "...", "partOfSpeech": "..." или null}, ...]}
+    const userPrompt = `${dictionarySection}${memorySection}${contextSection}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
 
-ПРАВИЛА извлечения:
-- "entries" — массив. Может быть из одного элемента, может из нескольких если в сообщении сразу несколько пар.
-- "word" — цинцкарское слово, кириллицей, нижний регистр, без знаков препинания.
-- "translation" — перевод на русский: одно слово, фраза, описание, несколько вариантов через запятую. Сохраняй примеры в скобках. НЕ обрезай длинные переводы.
-- "partOfSpeech" — сокращённо ("сущ.", "гл.", "прил.", "нар.", "мест.", "межд.", "предл.", "союз", "числ.", "част.") если явно указана или однозначна. Иначе null.
-- Игнорируй обращение и вводные слова ("Бот", "Баласи", "добавь", "запиши", "новое слово", "пожалуйста", "это", "и" и т.п.) — они не часть слова/перевода.
-- Если в сообщении несколько слов — извлеки ВСЕ пары, не выбрасывай.
-
-ВАРИАНТ 2 — ИЗМЕНИТЬ УЖЕ ЗАПИСАННОЕ СЛОВО. Выбирай этот вариант когда пользователь явно говорит "измени", "исправь", "поправь", "обнови", "правильно так", "а не ..." и хочет заменить неправильное слово, написание или перевод:
-{"action": "update_words", "entries": [{"oldWord": "...", "newWord": "..." или null, "translation": "..." или null, "partOfSpeech": "..." или null}, ...]}
-
-ПРАВИЛА:
-- "oldWord" — старое/ошибочное цинцкарское слово, которое уже может быть в словаре. Если пользователь пишет "а не X" — X почти всегда oldWord.
-- "newWord" — правильное цинцкарское слово. Если меняется только перевод, поставь null.
-- "translation" — новый русский перевод. Если меняется только написание слова, поставь null.
-- "partOfSpeech" — ставь только если пользователь явно указал часть речи, иначе null.
-- Пример: "Баласи, измени мелодия это гхайдâ, а не хгайда" → oldWord "хгайда", newWord "гхайдâ", translation "мелодия".
-- Пример: "Баласи, исправь хгайда на гхайдâ" → oldWord "хгайда", newWord "гхайдâ", translation null.
-- Пример: "Баласи, у хгайда перевод мелодия" → oldWord "хгайда", newWord null, translation "мелодия".
-
-ВАРИАНТ 3 — УДАЛИТЬ КОНКРЕТНЫЕ СЛОВА ИЗ СЛОВАРЯ. Выбирай этот вариант когда пользователь явно говорит "удали", "убери", "сотри", "это не цинцкарское слово", "ошибка, не записывай" и указывает какое именно слово (или несколько) убрать:
-{"action": "delete_words", "words": ["...", "..."]}
-
-ПРАВИЛА:
-- "words" — массив цинцкарских слов которые нужно удалить, кириллицей, в нижнем регистре, без знаков препинания.
-- Извлекай только сами слова, не переводы.
-- Максимум 10 слов за раз. Если просят больше — обрежь до 10.
-
-🚫 ЗАПРЕЩЕНО — массовое удаление. Если пользователь просит "удали ВСЕ слова", "удали весь словарь", "очисти словарь", "удали всё на букву X", "удали все существительные", "удали ту половину" и любые другие массовые/общие удаления — НЕ возвращай action "delete_words". Вместо этого верни:
-{"action": "reply", "message": "Массово удалить слова нельзя — это опасная операция. Если нужно удалить конкретные слова, перечисли их (до 10 за раз)."}
-
-ВАРИАНТ 4 — ДОБАВИТЬ ФАКТ В ПАМЯТЬ БОТА. Выбирай этот вариант когда пользователь явно говорит "добавь в память", "запомни", "сохрани в памяти" и указывает что именно запомнить:
-{"action": "add_memory", "text": "короткий факт или инструкция для памяти"}
-
-ПРАВИЛА:
-- "text" — только то, что нужно сохранить, без обращения "Бот"/"Баласи" и без команды "добавь в память".
-- Не сохраняй пустой текст. Если пользователь не написал что именно запомнить — верни reply и спроси что добавить в память.
-- Не используй add_memory для добавления слов в словарь, если пользователь явно говорит про слово и перевод.
-
-ВАРИАНТ 5 — ОТВЕТИТЬ ПОЛЬЗОВАТЕЛЮ (всё остальное: вопросы, болтовня, приветствия, просьбы что-то рассказать или объяснить):
-{"action": "reply", "message": "твой ответ"}
-
-ПРАВИЛА для ответа:
-- На русском, дружелюбно, по делу. Максимум 3-4 предложения. Для пересказов переписки можно до 6.
-  - Если спрашивают значение цинцкарского слова — используй раздел НАЙДЕННЫЕ СЛОВА В СЛОВАРЕ, если он есть. Если нужного слова там нет — честно скажи "такого слова в нашем словаре нет". НЕ выдумывай переводы цинцкарских слов из своей фантазии.
-  - Если просят перевести с русского на цинцкарский — используй раздел НАЙДЕННЫЕ СЛОВА В СЛОВАРЕ. Если подходящего слова там нет — так и скажи.
-- Если спрашивают о сохранённой памяти — используй раздел ПАМЯТЬ БОТА. Если памяти нет — скажи, что пока ничего не запомнил.
-- Если спрашивают о недавней переписке ("о чём говорили", "что обсуждали", "перескажи", "кто что писал") — используй раздел НЕДАВНИЕ СООБЩЕНИЯ ниже. Отвечай обобщённо по темам, не цитируй дословно длинными кусками. Если переписки нет — скажи "нечего пересказывать".
-- Если просят "рабочие ссылки" или ссылку на сайт — используй URL из ПАМЯТИ БОТА. Если URL не указан, скажи что ссылку ещё нужно добавить в память.
-- На общие вопросы отвечай как обычный ассистент, но с учётом роли помощника Общества Цинцкаро: дружелюбно, полезно, без канцелярита.
-- Если вопрос связан с Обществом Цинцкаро, наследием, встречами, сайтом, организацией, объявлениями или коммуникацией — помогай как координатор сообщества. Если не хватает фактов, честно скажи что нужно уточнить.
-- Если непонятно что хочет пользователь — мягко переспроси.
-${dictionarySection}${memorySection}${contextSection}
-Сообщение пользователя:
-"""
-${text}
-"""
-
-Ответь ТОЛЬКО валидным JSON.`;
-
-    const response = await this.openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
-    });
+    const response = await this.createChatCompletion(
+      'bot_mention',
+      `Обращение к боту: ${text}`,
+      {
+        model: this.botModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: BOT_MENTION_RESPONSE_FORMAT,
+        reasoning_effort: 'none',
+        max_completion_tokens: this.botMaxCompletionTokens,
+      },
+      {
+        userTextLength: text.length,
+        recentMessages: recentMessages.length,
+        memoryEntries: botMemory.length,
+        dictionaryEntries: dictionaryEntries.length,
+      },
+    );
 
     const content = response.choices[0].message.content || '{}';
     const parsed = JSON.parse(content);
@@ -297,41 +397,25 @@ ${text}
   async normalizeDictionaryEntries(
     text: string,
   ): Promise<DictionaryEntryInput[]> {
-    const prompt = `Ты помощник по подготовке словарных записей цинцкарского диалекта.
+    const systemPrompt = `Извлеки из сообщения только явные пары «цинцкарское слово или фраза — русский перевод».
 
-Пользователь прислал сообщение для добавления слов в словарь. Формат может быть неаккуратным: нет пробелов вокруг дефиса, вместо дефиса может быть двоеточие, слово и перевод могут быть просто через пробел, могут быть лишние вводные фразы.
+Не выдумывай и не исправляй написание по догадке. Убери только внешнюю пунктуацию, приведи слово к нижнему регистру, сохрани несколько значений и пояснения в скобках. Пропускай строки без понятного перевода, команды, заголовки, рейтинги и @username. Дубликаты верни один раз. Часть речи указывай только когда она явно дана или однозначна.`;
 
-Твоя задача — извлечь только явные пары "цинцкарское слово или фраза" + "русский перевод" и вернуть их в структурированном виде.
-
-Правила:
-- Не выдумывай слова и переводы. Если у строки нет понятного русского перевода, пропусти её.
-- Не исправляй орфографию цинцкарского слова по догадке. Можно только убрать лишнюю пунктуацию и привести к нижнему регистру.
-- Сохраняй несколько значений в переводе через запятую или точку с запятой, если они были в исходном тексте.
-- Сохраняй пояснения в скобках.
-- Игнорируй обращение к боту, команды, заголовки, просьбы, пустые строки, рейтинги и строки с @username.
-- Если одна и та же пара повторяется, верни её один раз.
-
-Ответь ТОЛЬКО валидным JSON:
-{
-  "entries": [
-    {
-      "word": "цинцкарское слово или фраза",
-      "translation": "русский перевод",
-      "partOfSpeech": null
-    }
-  ]
-}
-
-Сообщение:
-"""
-${text}
-"""`;
-
-    const response = await this.openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
-    });
+    const response = await this.createChatCompletion(
+      'dictionary_normalization',
+      `Разбор словарной записи: ${text}`,
+      {
+        model: this.extractionModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: text },
+        ],
+        response_format: DICTIONARY_ENTRIES_RESPONSE_FORMAT,
+        reasoning_effort: 'none',
+        max_completion_tokens: this.extractionMaxCompletionTokens,
+      },
+      { textLength: text.length },
+    );
 
     const content = response.choices[0].message.content || '{}';
     const parsed = JSON.parse(content);
@@ -376,49 +460,131 @@ ${text}
     return entries;
   }
 
-  async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
-    const combinedText = messages.join('\n---\n');
-    const dictionary = await this.dictionaryService.getFormattedForPrompt();
-
+  async analyzeDiscussion(
+    messages: { text: string; username: string; ref?: string }[],
+  ): Promise<DiscussionAnalysisResult> {
+    const formattedMessages = messages
+      .map((m) => `${m.ref ? `[${m.ref}] ` : ''}[${m.username}]: ${m.text}`)
+      .join('\n');
+    const relevantDictionary =
+      await this.dictionaryService.findRelevantForPrompt(
+        messages.map((message) => message.text),
+        100,
+      );
+    const dictionary =
+      this.dictionaryService.formatEntriesForPrompt(relevantDictionary);
     const dictionarySection = dictionary
-      ? `\nИзвестные слова из словаря (используй эти переводы):\n${dictionary}\n`
+      ? `ИЗВЕСТНЫЕ СЛОВА ИЗ СЛОВАРЯ:\n${dictionary}\n\n`
       : '';
 
-    const prompt = `Ты лингвистический аналитик. Ниже сообщения из Telegram-чата жителей села Цинцкаро (Грузия). 
-    Они говорят по-русски, но вставляют слова из родного языка — смеси из старого азербайджанского диалекта и восточно-анатолийского диалекта турецкого языка, записанных кириллицей.
-${dictionarySection}
-Твоя задача:
-1. Найти слова, которые НЕ являются стандартным русским языком — это слова из цинцкарского диалекта
-2. Если слово есть в словаре выше — используй перевод оттуда
-3. Если слова нет в словаре — попробуй угадать перевод по контексту (если невозможно — напиши null)
-4. Добавь короткий контекст, где слово было использовано
+    const systemPrompt = `Проанализируй сообщения русскоязычного Telegram-чата жителей села Цинцкаро. Они используют цинцкарский диалект — смесь старого азербайджанского и восточно-анатолийского турецкого, записанную кириллицей.
 
-Сообщения:
-${combinedText}
+Сделай короткое саммари обсуждения: 2–4 пункта или 2–3 предложения, максимум 500 символов. Упомяни только главные темы, решения и разногласия. Не ставь @ перед именами. Можно использовать не более трёх ссылок вида [m1].
 
-Отвечай ТОЛЬКО в формате JSON:
-{
-  "words": [
-    {
-      "word": "нерусское слово",
-      "possibleTranslation": "перевод на русский или null",
-      "context": "короткая фраза где появилось"
-    }
-  ]
-}
+Найди все слова, не являющиеся стандартным русским языком. Для каждого верни короткий контекст, часть речи и автора. Если слово присутствует в переданном словаре, используй только словарный перевод. Для неизвестного слова попробуй определить перевод по контексту, иначе верни null. Если участники предлагают разные переводы или части речи, верни каждый вариант отдельным элементом.`;
+    const userPrompt = `${dictionarySection}СООБЩЕНИЯ:\n${formattedMessages}`;
 
-Если нерусских слов не найдено, верни {"words": []}`;
+    const response = await this.createChatCompletion(
+      'discussion_report',
+      `Единый отчёт по обсуждению: ${messages.length} сообщений`,
+      {
+        model: this.reportModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: DISCUSSION_ANALYSIS_RESPONSE_FORMAT,
+        reasoning_effort: 'none',
+        max_completion_tokens: this.reportMaxCompletionTokens,
+      },
+      {
+        messagesCount: messages.length,
+        dictionaryEntries: relevantDictionary.length,
+        dictionaryTextLength: dictionary.length,
+        formattedMessagesLength: formattedMessages.length,
+      },
+    );
 
-    const response = await this.openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
-    });
+    const content = response.choices[0].message.content || '{}';
+    const parsed = JSON.parse(content) as {
+      discussionSummary?: unknown;
+      words?: unknown;
+    };
+    const rawWords = Array.isArray(parsed.words) ? parsed.words : [];
+    const analyzedWords: DiscussionAnalysisWord[] = rawWords
+      .filter(
+        (raw): raw is Record<string, unknown> =>
+          Boolean(raw) &&
+          typeof raw === 'object' &&
+          typeof (raw as Record<string, unknown>).word === 'string',
+      )
+      .map((raw) => ({
+        word: String(raw.word).trim(),
+        possibleTranslation:
+          typeof raw.possibleTranslation === 'string' &&
+          raw.possibleTranslation.trim()
+            ? raw.possibleTranslation.trim()
+            : null,
+        context: typeof raw.context === 'string' ? raw.context.trim() : '',
+        partOfSpeech:
+          typeof raw.partOfSpeech === 'string' && raw.partOfSpeech.trim()
+            ? raw.partOfSpeech.trim()
+            : null,
+        username:
+          typeof raw.username === 'string' && raw.username.trim()
+            ? raw.username.trim().replace(/^@/, '')
+            : null,
+      }))
+      .filter((word) => word.word.length > 0);
 
-    const content = response.choices[0].message.content;
-    const parsed = JSON.parse(content);
+    const discussionEntries: ProcessDiscussionEntry[] = analyzedWords
+      .filter(
+        (
+          word,
+        ): word is DiscussionAnalysisWord & {
+          possibleTranslation: string;
+        } => Boolean(word.possibleTranslation),
+      )
+      .map((word) => ({
+        word: word.word,
+        translation: word.possibleTranslation,
+        partOfSpeech: word.partOfSpeech ?? '',
+        username: word.username ?? 'unknown',
+      }));
+    const { agreedWords, disputedWords, duplicatesRemoved } =
+      this.deduplicateAndSplit(discussionEntries);
+    const discussionSummary =
+      typeof parsed.discussionSummary === 'string' &&
+      parsed.discussionSummary.trim()
+        ? parsed.discussionSummary.trim()
+        : 'Подробное описание не сформировано.';
 
-    return parsed.words || [];
+    return {
+      discussionSummary,
+      words: analyzedWords.map(({ word, possibleTranslation, context }) => ({
+        word,
+        possibleTranslation,
+        context,
+      })),
+      discussionResult: {
+        discussionSummary,
+        agreedWords,
+        disputedWords,
+        totalExtracted: analyzedWords.length,
+        duplicatesRemoved,
+      },
+    };
+  }
+
+  async analyzeMessages(messages: string[]): Promise<ExtractedWord[]> {
+    const result = await this.analyzeDiscussion(
+      messages.map((text, index) => ({
+        text,
+        username: 'unknown',
+        ref: `m${index + 1}`,
+      })),
+    );
+    return result.words;
   }
 
   async compileList(
@@ -467,10 +633,17 @@ ${formattedMessages}
 🗑 <b>УДАЛЁННЫЕ СЛОВА</b> (если есть):
 - слово (причина, username)`;
 
-    const response = await this.openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: prompt }],
-    });
+    const response = await this.createChatCompletion(
+      'list_compilation',
+      `Составление обновлённого списка: ${messages.length} сообщений`,
+      {
+        model: this.reportModel,
+        messages: [{ role: 'user', content: prompt }],
+        reasoning_effort: 'none',
+        max_completion_tokens: this.reportMaxCompletionTokens,
+      },
+      { messagesCount: messages.length },
+    );
 
     return response.choices[0].message.content || 'Ошибка обработки';
   }
@@ -482,68 +655,8 @@ ${formattedMessages}
   async processDiscussion(
     messages: { text: string; username: string; ref?: string }[],
   ): Promise<ProcessDiscussionResult> {
-    const formattedMessages = messages
-      .map((m) => `${m.ref ? `[${m.ref}] ` : ''}[${m.username}]: ${m.text}`)
-      .join('\n');
-
-    const dictionary = await this.dictionaryService.getFormattedForPrompt();
-    const dictionarySection = dictionary
-      ? `\nИзвестные слова из словаря (предпочтительные переводы):\n${dictionary}\n`
-      : '';
-
-    const prompt = `Ты помощник по составлению словаря цинцкарского диалекта. Ниже — сообщения из Telegram-чата жителей села Цинцкаро. Они говорят по-русски и вставляют слова цинцкарского диалекта (смесь старого азербайджанского и восточно-анатолийского турецкого, записаны кириллицей).
-${dictionarySection}
-Твои задачи:
-1. Написать очень короткое саммари обсуждения на русском: 2-4 коротких пункта или 2-3 коротких предложения. Только главное: темы, важные решения/разногласия и общий итог. Не перечисляй всех участников и не пересказывай чат подробно. Максимум 500 символов.
-   - Не ставь символ @ перед именами пользователей.
-   - Если важно кто написал, указывай username без @.
-   - Если нужно сослаться на конкретную реплику, используй метку сообщения из списка: [m1], [m2] и т.п. Ставь не больше 1-3 таких ссылок на всё саммари.
-2. Извлечь из чата ВСЕ предложенные слова цинцкарского диалекта. Для каждого указать: слово (кириллицей), перевод на русский, часть речи (сокращённо: сущ., гл., прил., межд. и т.д.), имя пользователя (username), кто это предложил или уточнил.
-
-Если один и тот же вариант слова (слово + перевод + часть речи) повторяется несколькими людьми — всё равно выводи каждое вхождение отдельно (дубликаты будут удалены автоматически).
-Если по одному слову разные участники дают разные переводы или части речи — выводи каждый вариант с указанием username.
-
-Ответь ТОЛЬКО в формате JSON на русском:
-{
-  "discussionSummary": "Короткое саммари: 2-4 пункта или 2-3 коротких предложения, максимум 500 символов.",
-  "entries": [
-    {
-      "word": "слово цинцкарского диалекта кириллицей",
-      "translation": "перевод на русский",
-      "partOfSpeech": "сущ.",
-      "username": "username из сообщения"
-    }
-  ]
-}
-
-Сообщения:
-${formattedMessages}
-
-Если слов не найдено, верни: {"discussionSummary": "...", "entries": []}`;
-
-    const response = await this.openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
-    });
-
-    const content = response.choices[0].message.content;
-    const parsed = JSON.parse(content) as ProcessDiscussionRawResult;
-
-    const summary =
-      parsed.discussionSummary || 'Подробное описание не сформировано.';
-    const entries = parsed.entries || [];
-
-    const { agreedWords, disputedWords, duplicatesRemoved } =
-      this.deduplicateAndSplit(entries);
-
-    return {
-      discussionSummary: summary,
-      agreedWords,
-      disputedWords,
-      totalExtracted: entries.length,
-      duplicatesRemoved,
-    };
+    const result = await this.analyzeDiscussion(messages);
+    return result.discussionResult;
   }
 
   /**
@@ -617,5 +730,52 @@ ${formattedMessages}
     }
 
     return { agreedWords, disputedWords, duplicatesRemoved };
+  }
+
+  private async createChatCompletion(
+    purpose: OpenaiUsagePurpose,
+    detail: string,
+    params: ChatCompletionCreateParamsNonStreaming,
+    metadata: Record<string, unknown> = {},
+  ): Promise<ChatCompletion> {
+    const requestParams: ChatCompletionCreateParamsNonStreaming = {
+      ...params,
+      prompt_cache_key: params.prompt_cache_key ?? `tsintskaro:${purpose}:v2`,
+    };
+    const response = await this.openai.chat.completions.create(requestParams);
+    try {
+      await this.openaiUsageService.record({
+        purpose,
+        detail,
+        model: response.model || String(requestParams.model),
+        usage: response.usage,
+        metadata: {
+          ...metadata,
+          inputTextLength: this.getMessagesTextLength(requestParams.messages),
+          reasoningEffort: requestParams.reasoning_effort ?? null,
+          maxCompletionTokens: requestParams.max_completion_tokens ?? null,
+        },
+      });
+    } catch (err) {
+      this.logger.warn(`Failed to record OpenAI usage: ${err}`);
+    }
+    return response;
+  }
+
+  private getMessagesTextLength(
+    messages: ChatCompletionCreateParamsNonStreaming['messages'],
+  ): number {
+    let total = 0;
+    for (const message of messages) {
+      if (typeof message.content === 'string') {
+        total += message.content.length;
+        continue;
+      }
+      if (!Array.isArray(message.content)) continue;
+      for (const part of message.content as Array<{ text?: unknown }>) {
+        if (typeof part.text === 'string') total += part.text.length;
+      }
+    }
+    return total;
   }
 }

@@ -11,13 +11,14 @@ This tool helps collect, analyze, and translate the Tsintskaro dialect—a uniqu
 ## ✨ Features
 
 - **Cultural Preservation**: Automatically identifies ancestral dialect words mixed into Russian conversations in Telegram groups.
-- **AI Analysis**: Uses **OpenAI (GPT-4o)** to distinguish dialect words from standard Russian and infer meanings from context.
+- **AI Analysis**: Uses task-specific OpenAI models to distinguish dialect words from standard Russian, infer meanings, and answer community questions.
 - **Dictionary Integration**: Cross-references findings with a curated digital dictionary (`.xlsx`) to validate and catalog the language.
 - **Community Reporting**: Every 100 messages (or on demand) the bot generates one report: agreed and disputed dialect words plus a detailed description of the discussion. All in Russian.
 - **Historical Quizzes**: Sends regular Tsintskaro history quizzes at 08:00, 10:00, 18:00, 20:00, and 22:00 Asia/Tbilisi to the thread where `/startfactday` was called. It can be paused with `/stopfactday`.
 - **Dictionary Leaderboard**: `/leaderboard` shows who added the most words through the chat.
 - **Bot Memory**: Admins can manage stored bot instructions from Telegram with `/memory`, `/memoryadd`, `/memoryedit`, and `/memorydel`.
-- **Admin Tools**: `/report` (create report now), `/status`, `/clear`, `/startfactday`, `/stopfactday`, `/factdaystatus`, `/factdaynow`, `/memory`.
+- **OpenAI Token Reporting**: Daily report with token totals, cache hit rate, reasoning tokens, p95 input size, model breakdown, and concrete bot tasks that consumed tokens. Configure with `/settokenreport`; inspect today with `/tokenreport`.
+- **Admin Tools**: `/report` (create report now), `/status`, `/clear`, `/settokenreport`, `/tokenreport`, `/startfactday`, `/stopfactday`, `/factdaystatus`, `/factdaynow`, `/memory`.
 
 ## 🛠 Technical Stack
 
@@ -47,9 +48,20 @@ Create a `.env` file in the root directory (copy from `.env.example` if availabl
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 OPENAI_API_KEY=your_openai_api_key
 # Optional
+OPENAI_MODEL_BOT=gpt-5.4-mini
+OPENAI_MODEL_EXTRACTION=gpt-5.4-nano
+OPENAI_MODEL_REPORT=gpt-5.4-mini
+OPENAI_MAX_COMPLETION_TOKENS_BOT=800
+OPENAI_MAX_COMPLETION_TOKENS_EXTRACTION=3000
+OPENAI_MAX_COMPLETION_TOKENS_REPORT=4000
 MESSAGE_THRESHOLD=100
 FACT_DAY_ENABLE_IN_DEV=false
+OPENAI_USAGE_REPORT_ENABLE_IN_DEV=false
+OPENAI_USAGE_REPORT_CHAT_ID=123456789
+OPENAI_USAGE_REPORT_THREAD_ID=
 ```
+
+For a private daily token report, the recipient must first open the bot in Telegram and run `/settokenreport`. Telegram bots cannot reliably start a private chat by username alone.
 
 ### Running the app
 

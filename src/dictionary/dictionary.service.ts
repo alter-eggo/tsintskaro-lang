@@ -44,6 +44,8 @@ export class DictionaryService {
 
   private cache: DictionaryEntry[] | null = null;
   private cacheById: Map<string, DictionaryEntry> | null = null;
+  private cacheByFolded: Map<string, DictionaryEntry[]> | null = null;
+  private maxDictionaryPhraseWords = 1;
 
   constructor(
     @InjectRepository(Word)
@@ -53,6 +55,8 @@ export class DictionaryService {
   private invalidateCache() {
     this.cache = null;
     this.cacheById = null;
+    this.cacheByFolded = null;
+    this.maxDictionaryPhraseWords = 1;
   }
 
   private normalizeWordInput(word: string): string {
@@ -145,7 +149,7 @@ export class DictionaryService {
   }
 
   private async ensureCache(): Promise<void> {
-    if (this.cache && this.cacheById) return;
+    if (this.cache && this.cacheById && this.cacheByFolded) return;
     const rows = await this.wordRepo.find();
     const entries: DictionaryEntry[] = rows.map((r) => ({
       word: r.word,
@@ -155,6 +159,21 @@ export class DictionaryService {
     entries.sort((a, b) => compareTsintskaroWords(a.word, b.word));
     this.cache = entries;
     this.cacheById = new Map(entries.map((e) => [e.word, e]));
+    this.cacheByFolded = new Map();
+    for (const entry of entries) {
+      const folded = this.foldWordForLookup(entry.word);
+      if (folded) {
+        this.cacheByFolded.set(folded, [
+          ...(this.cacheByFolded.get(folded) ?? []),
+          entry,
+        ]);
+      }
+      this.maxDictionaryPhraseWords = Math.max(
+        this.maxDictionaryPhraseWords,
+        this.tokenizeLookupText(entry.word).length,
+      );
+    }
+    this.maxDictionaryPhraseWords = Math.min(this.maxDictionaryPhraseWords, 8);
     this.logger.log(`Loaded ${entries.length} dictionary entries from DB`);
   }
 
@@ -166,7 +185,76 @@ export class DictionaryService {
   async getFormattedForPrompt(): Promise<string> {
     await this.ensureCache();
     if (this.cache!.length === 0) return '';
-    return this.cache!.map((e) => `${e.word} = ${e.translation}`).join('\n');
+    return this.formatEntriesForPrompt(this.cache!);
+  }
+
+  formatEntriesForPrompt(entries: DictionaryEntry[]): string {
+    return entries.map((e) => `${e.word} = ${e.translation}`).join('\n');
+  }
+
+  async findRelevantForPrompt(
+    messages: string[],
+    limit = 100,
+  ): Promise<DictionaryEntry[]> {
+    await this.ensureCache();
+    if (limit <= 0 || messages.length === 0 || this.cache!.length === 0) {
+      return [];
+    }
+
+    const matches = new Map<
+      string,
+      { entry: DictionaryEntry; occurrences: number; exactOccurrences: number }
+    >();
+
+    for (const message of messages) {
+      const tokens = this.tokenizeLookupText(message);
+      for (let start = 0; start < tokens.length; start += 1) {
+        const maxLength = Math.min(
+          this.maxDictionaryPhraseWords,
+          tokens.length - start,
+        );
+        for (let length = 1; length <= maxLength; length += 1) {
+          const phrase = tokens.slice(start, start + length).join(' ');
+          const folded = this.foldWordForLookup(phrase);
+          if (!folded) continue;
+
+          for (const entry of this.cacheByFolded!.get(folded) ?? []) {
+            const key = `${entry.word}\u0000${entry.translation}`;
+            const current = matches.get(key) ?? {
+              entry,
+              occurrences: 0,
+              exactOccurrences: 0,
+            };
+            current.occurrences += 1;
+            if (
+              this.normalizePhraseForExactMatch(phrase) ===
+              this.normalizePhraseForExactMatch(entry.word)
+            ) {
+              current.exactOccurrences += 1;
+            }
+            matches.set(key, current);
+          }
+        }
+      }
+    }
+
+    return [...matches.values()]
+      .sort(
+        (a, b) =>
+          b.exactOccurrences - a.exactOccurrences ||
+          b.occurrences - a.occurrences ||
+          compareTsintskaroWords(a.entry.word, b.entry.word),
+      )
+      .slice(0, limit)
+      .map(({ entry }) => entry);
+  }
+
+  private tokenizeLookupText(value: string): string[] {
+    return value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  }
+
+  private normalizePhraseForExactMatch(value: string): string {
+    return this.tokenizeLookupText(value).join(' ');
   }
 
   async findWord(word: string): Promise<DictionaryEntry | undefined> {

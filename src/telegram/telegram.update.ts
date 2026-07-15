@@ -1,4 +1,12 @@
-import { Update, Ctx, Hears, Command, Start, InjectBot } from 'nestjs-telegraf';
+import {
+  Action,
+  Update,
+  Ctx,
+  Hears,
+  Command,
+  Start,
+  InjectBot,
+} from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
 import { BotMemoryEntry, TelegramService } from './telegram.service';
 import {
@@ -11,8 +19,16 @@ import {
   DictionaryUpdateInput,
   OpenaiService,
 } from '../openai/openai.service';
+import {
+  OpenaiUsageService,
+  OPENAI_USAGE_REPORT_TIME_ZONE,
+} from '../openai/openai-usage.service';
 import { PollConfigService } from '../poll/poll-config.service';
 import { PollSchedulerService } from '../poll/poll-scheduler.service';
+import {
+  DEFAULT_WORD_REVIEW_LIMIT,
+  WordReviewService,
+} from '../word-review/word-review.service';
 import { FactDayConfigService } from '../fact-day/fact-day-config.service';
 import {
   FACT_DAY_SCHEDULE_LABEL,
@@ -30,6 +46,7 @@ interface SpellingCorrectionByTranslation {
 export class TelegramUpdate implements OnModuleInit {
   private readonly threshold: number;
   private readonly logger = new Logger(TelegramUpdate.name);
+  private readonly reportOpenAiUnavailableNotifiedChats = new Set<number>();
 
   constructor(
     @InjectBot() private bot: Telegraf<Context>,
@@ -40,6 +57,8 @@ export class TelegramUpdate implements OnModuleInit {
     private pollScheduler: PollSchedulerService,
     private factDayConfigService: FactDayConfigService,
     private factDayScheduler: FactDaySchedulerService,
+    private wordReviewService: WordReviewService,
+    private openaiUsageService: OpenaiUsageService,
     private config: ConfigService,
   ) {
     this.threshold = this.config.get('messageThreshold') || 100;
@@ -62,6 +81,35 @@ export class TelegramUpdate implements OnModuleInit {
       { command: 'clearpollchat', description: 'Отключить опросы' },
       { command: 'pollstatus', description: 'Куда сейчас идут опросы' },
       { command: 'pollnow', description: 'Отправить пару опросов сейчас' },
+      {
+        command: 'settokenreport',
+        description: 'Слать ежедневный отчёт по OpenAI токенам сюда',
+      },
+      {
+        command: 'cleartokenreport',
+        description: 'Отключить ежедневный отчёт по токенам',
+      },
+      {
+        command: 'tokenreport',
+        description: 'Показать отчёт по OpenAI токенам за сегодня',
+      },
+      {
+        command: 'setreviewchat',
+        description: 'Слать слова на проверку в этот топик',
+      },
+      {
+        command: 'clearreviewchat',
+        description: 'Отключить проверку словаря',
+      },
+      {
+        command: 'reviewstatus',
+        description: 'Статус проверки словаря',
+      },
+      {
+        command: 'reviewnow',
+        description: 'Отправить слова на проверку сейчас',
+      },
+      { command: 'rules', description: 'Правила цинцкарского языка' },
       { command: 'leaderboard', description: 'Топ добавивших слова' },
       {
         command: 'startfactday',
@@ -104,7 +152,10 @@ export class TelegramUpdate implements OnModuleInit {
         '/status - Показать количество собранных сообщений\n' +
         '/clear - Очистить буфер без отчёта\n' +
         '/setsummarythread - Слать отчёты в этот топик\n' +
+        '/settokenreport - Слать ежедневный отчёт по OpenAI токенам сюда\n' +
+        '/tokenreport - Показать расход OpenAI токенов за сегодня\n' +
         '/startfactday - Запустить исторический квиз в этом топике\n' +
+        '/rules - Правила цинцкарского языка\n' +
         '/leaderboard - Топ добавивших слова\n' +
         '/memory - Память бота',
     );
@@ -156,13 +207,39 @@ export class TelegramUpdate implements OnModuleInit {
     const message = ctx.message as {
       message_id?: number;
       text: string;
-      from?: { username?: string };
+      from?: {
+        id?: number;
+        username?: string;
+        first_name?: string;
+        last_name?: string;
+      };
       message_thread_id?: number;
       date?: number;
+      reply_to_message?: { message_id?: number };
     };
     const text = message.text;
     const threadId = message.message_thread_id;
     const username = message.from?.username || 'anonymous';
+
+    const replyToMessageId = message.reply_to_message?.message_id;
+    const userId = message.from?.id;
+    if (replyToMessageId && userId) {
+      const correction = await this.wordReviewService.handleCorrectionReply({
+        chatId,
+        userId,
+        username: message.from?.username ?? null,
+        replyToMessageId,
+        text,
+      });
+      if (correction.status !== 'not_correction') {
+        if (correction.message) {
+          await ctx.reply(correction.message, {
+            reply_parameters: { message_id: message.message_id! },
+          });
+        }
+        return;
+      }
+    }
 
     if (TelegramUpdate.BOT_MENTION_REGEX.test(text)) {
       await this.handleBotMention(
@@ -197,11 +274,47 @@ export class TelegramUpdate implements OnModuleInit {
     }
   }
 
+  @Action(/^wr:(?:correct|fix):\d+:\d+$/)
+  async onWordReviewAction(@Ctx() ctx: Context) {
+    const callback = ctx.callbackQuery as
+      | { data?: string; from?: { id?: number; username?: string } }
+      | undefined;
+    const data = callback?.data;
+    const userId = ctx.from?.id ?? callback?.from?.id;
+    const chatId = ctx.chat?.id;
+    if (!data || !userId || !chatId) {
+      await ctx.answerCbQuery('Не получилось обработать ответ.');
+      return;
+    }
+
+    const firstName = ctx.from?.first_name?.trim() ?? '';
+    const lastName = ctx.from?.last_name?.trim() ?? '';
+    const displayName = ctx.from?.username
+      ? `@${ctx.from.username}`
+      : [firstName, lastName].filter(Boolean).join(' ') || 'Участник';
+
+    try {
+      const result = await this.wordReviewService.handleAction({
+        data,
+        chatId,
+        userId,
+        username: ctx.from?.username ?? null,
+        displayName,
+      });
+      await ctx.answerCbQuery(result.message || 'Ответ записан.');
+    } catch (error) {
+      this.logger.error('Word review button failed', error);
+      await ctx.answerCbQuery('Ошибка. Попробуйте ещё раз.');
+    }
+  }
+
   private static readonly BOT_MENTION_REGEX = /^\s*(?:бот|баласи)[\s,:!.\-—]/i;
   private static readonly MAX_DELETE_BATCH = 10;
   private static readonly MAX_UPDATE_BATCH = 5;
 
-  private static readonly BOT_CONTEXT_MESSAGE_LIMIT = 50;
+  private static readonly BOT_CONTEXT_SUMMARY_MESSAGE_LIMIT = 50;
+
+  private static readonly BOT_CONTEXT_MAX_CHARS = 12000;
 
   private static readonly BOT_MEMORY_LIMIT = 50;
 
@@ -209,6 +322,12 @@ export class TelegramUpdate implements OnModuleInit {
 
   private static readonly WORKING_LINKS_REQUEST_REGEX =
     /(?:рабоч\w*\s+ссыл|ссылк\w*[\s\S]{0,40}рабоч|скин\w*[\s\S]{0,40}ссыл|пришл\w*[\s\S]{0,40}ссыл|дай[\s\S]{0,40}ссыл)/i;
+
+  private static readonly RECENT_MESSAGES_CONTEXT_REGEX =
+    /(?:о\s+ч[её]м[\s\S]{0,30}(?:говор|пис|общал)|что[\s\S]{0,30}(?:обсужда|писал)|перескаж|переписк|недавн\w*\s+сообщ|последн\w*\s+сообщ|кто[\s\S]{0,30}писал|выше\s+(?:писал|говорил)|истори\w*\s+чат)/i;
+
+  private static readonly BOT_MEMORY_CONTEXT_REGEX =
+    /(?:памят|запомн|общество|цинцкар|наслед|истори\w*\s+сел|сайт|ссыл|встреч|мероприят|проект|организац|правил\w*\s+(?:язык|диалект|слов))/i;
 
   private static readonly LEADERBOARD_REQUEST_REGEX =
     /(?:(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь|хочу|нужен|нужна)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:лидер|топ|рейтинг|таблиц\w*\s+лидер)|(?:^|[\s,.:;!?])(?:лидер|топ|рейтинг)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь)(?:$|[\s,.:;!?])|кто\s+(?:больше|больше\s+всех|больше\s+всего|много)[\s\S]{0,40}(?:слов|слова|добав)|кто[\s\S]{0,40}(?:добавил|добавляет)[\s\S]{0,40}(?:слов|слова))/i;
@@ -284,26 +403,41 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    const [recentMessages, botMemory, dictionaryEntries] = await Promise.all([
-      this.telegramService.getRecentMessages(
-        chatId,
-        threadId,
-        TelegramUpdate.BOT_CONTEXT_MESSAGE_LIMIT,
-      ),
-      this.telegramService.getBotMemory(
+    if (this.isWorkingLinksRequest(text)) {
+      const botMemory = await this.telegramService.getBotMemory(
         chatId,
         TelegramUpdate.BOT_MEMORY_LIMIT,
-      ),
-      this.getDictionaryContextEntries(text),
-    ]);
-    this.logger.log(
-      `[Chat ${chatId}] Loaded ${recentMessages.length} recent messages, ${botMemory.length} memory entries and ${dictionaryEntries.length} dictionary entries for AI context`,
-    );
-
-    if (this.isWorkingLinksRequest(text)) {
+      );
       await this.replyWithWorkingLinks(ctx, messageId, botMemory);
       return;
     }
+
+    const needsRecentMessages = this.needsRecentMessagesContext(text);
+    const needsBotMemory = this.needsBotMemoryContext(text);
+    const [loadedRecentMessages, botMemory, dictionaryEntries] =
+      await Promise.all([
+        needsRecentMessages
+          ? this.telegramService.getRecentMessages(
+              chatId,
+              threadId,
+              TelegramUpdate.BOT_CONTEXT_SUMMARY_MESSAGE_LIMIT,
+            )
+          : Promise.resolve([]),
+        needsBotMemory
+          ? this.telegramService.getBotMemory(
+              chatId,
+              TelegramUpdate.BOT_MEMORY_LIMIT,
+            )
+          : Promise.resolve([]),
+        this.getDictionaryContextEntries(text),
+      ]);
+    const recentMessages = this.limitRecentMessagesByChars(
+      loadedRecentMessages,
+      TelegramUpdate.BOT_CONTEXT_MAX_CHARS,
+    );
+    this.logger.log(
+      `[Chat ${chatId}] Loaded ${recentMessages.length} recent messages, ${botMemory.length} memory entries and ${dictionaryEntries.length} dictionary entries for AI context`,
+    );
 
     let result;
     try {
@@ -833,6 +967,38 @@ export class TelegramUpdate implements OnModuleInit {
     return deduplicated;
   }
 
+  private normalizeCyrillicLookalikes(value: string): string {
+    return value
+      .replace(/a/g, 'а')
+      .replace(/c/g, 'с')
+      .replace(/e/g, 'е')
+      .replace(/o/g, 'о')
+      .replace(/p/g, 'р')
+      .replace(/x/g, 'х')
+      .replace(/y/g, 'у');
+  }
+
+  private stripDictionaryWordNoise(value: string): string {
+    let word = value;
+    let previous = '';
+
+    while (word !== previous) {
+      previous = word;
+      word = word
+        .replace(/^[\s"'«»“”„`.,;:!?()[\]{}\-—]+/g, '')
+        .replace(/[\s"'«»“”„`.,;:!?()[\]{}\-—]+$/g, '')
+        .replace(/^(?:в\s+словар(?:ь|е)|словар(?:ь|е))\s+/i, '')
+        .replace(
+          /^(?:правописани[ея]|написани[ея]|орфографи[яю])\s+(?:слова?\s+)?/i,
+          '',
+        )
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    return word;
+  }
+
   private extractDictionaryEntryLine(
     line: string,
   ): DictionaryEntryInput | null {
@@ -876,7 +1042,10 @@ export class TelegramUpdate implements OnModuleInit {
     return (
       word.length <= 80 &&
       /[а-яёâãáàäāôóòöōûŷúùüū]/i.test(word) &&
-      !/[@#/:\\\d]/.test(word)
+      !/[@#/:\\\d]/.test(word) &&
+      !/(?:^|\s)(?:это|переводится|значит|означает|словарь|словаре|правописание|написание)(?:\s|$)/i.test(
+        word,
+      )
     );
   }
 
@@ -900,7 +1069,16 @@ export class TelegramUpdate implements OnModuleInit {
     const unchanged: string[] = [];
     const failed: { word: string; err: unknown }[] = [];
 
-    for (const entry of entries) {
+    for (const rawEntry of entries) {
+      const entry = this.sanitizeDictionaryEntryForSave(rawEntry);
+      if (!entry) {
+        this.logger.warn(
+          `[Chat ${chatId}] Skipped suspicious dictionary entry by @${username}: ${rawEntry.word} = ${rawEntry.translation}`,
+        );
+        failed.push({ word: rawEntry.word, err: 'suspicious_entry' });
+        continue;
+      }
+
       try {
         const upserted = await this.dictionaryService.upsertWord({
           word: entry.word,
@@ -1036,12 +1214,16 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   private cleanDictionaryWord(value: string): string {
-    return value
+    const word = value
       .toLowerCase()
       .trim()
-      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
-      .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '')
+      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}\-—]+/g, '')
+      .replace(/[\s"'«»“”„`.,;:!?()[\]{}\-—]+$/g, '')
       .replace(/\s+/g, ' ');
+
+    return this.normalizeCyrillicLookalikes(
+      this.stripDictionaryWordNoise(word),
+    );
   }
 
   private cleanDictionaryTranslation(value: string): string {
@@ -1050,6 +1232,57 @@ export class TelegramUpdate implements OnModuleInit {
       .replace(/^[\s"'«»“”„`.,;:!?]+/g, '')
       .replace(/[\s"'«»“”„`.,;:!?]+$/g, '')
       .replace(/\s+/g, ' ');
+  }
+
+  private extractTrailingPartOfSpeech(translation: string): {
+    translation: string;
+    partOfSpeech: string | null;
+  } {
+    const match = translation.match(
+      /\s*\((сущ\.?|гл\.?|прил\.?|нар\.?|мест\.?|межд\.?|предл\.?|союз|числ\.?|част\.?)\)\s*$/i,
+    );
+    if (!match) {
+      return { translation, partOfSpeech: null };
+    }
+
+    return {
+      translation: translation.slice(0, match.index).trim(),
+      partOfSpeech: match[1].trim(),
+    };
+  }
+
+  private cleanDictionaryTranslationNoise(translation: string): string {
+    return this.cleanDictionaryTranslation(
+      translation.replace(
+        /\s*\((?:есть|нет)\s+в\s+(?:эталонном\s+)?словар[еьи][^)]*\)\s*/gi,
+        ' ',
+      ),
+    );
+  }
+
+  private sanitizeDictionaryEntryForSave(
+    entry: DictionaryEntryInput,
+  ): DictionaryEntryInput | null {
+    const word = this.cleanDictionaryWord(entry.word);
+    let translation = this.cleanDictionaryTranslation(entry.translation);
+    let partOfSpeech = entry.partOfSpeech?.trim() || null;
+
+    const extracted = this.extractTrailingPartOfSpeech(translation);
+    translation = this.cleanDictionaryTranslationNoise(extracted.translation);
+    if (!partOfSpeech && extracted.partOfSpeech) {
+      partOfSpeech = extracted.partOfSpeech;
+    }
+
+    if (
+      !word ||
+      !translation ||
+      !this.isLikelyDictionaryWord(word) ||
+      this.isLikelyLeaderboardLine(word, translation)
+    ) {
+      return null;
+    }
+
+    return { word, translation, partOfSpeech };
   }
 
   private async handleDictionaryUpdates(
@@ -1230,6 +1463,34 @@ export class TelegramUpdate implements OnModuleInit {
     return TelegramUpdate.WORKING_LINKS_REQUEST_REGEX.test(text);
   }
 
+  private needsRecentMessagesContext(text: string): boolean {
+    return TelegramUpdate.RECENT_MESSAGES_CONTEXT_REGEX.test(text);
+  }
+
+  private needsBotMemoryContext(text: string): boolean {
+    return TelegramUpdate.BOT_MEMORY_CONTEXT_REGEX.test(text);
+  }
+
+  private limitRecentMessagesByChars(
+    messages: { username: string; text: string; sentAt: Date }[],
+    maxChars: number,
+  ): { username: string; text: string; sentAt: Date }[] {
+    const selected: { username: string; text: string; sentAt: Date }[] = [];
+    let totalChars = 0;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      const estimatedChars = message.text.length + message.username.length + 24;
+      if (selected.length > 0 && totalChars + estimatedChars > maxChars) {
+        break;
+      }
+      selected.unshift(message);
+      totalChars += estimatedChars;
+    }
+
+    return selected;
+  }
+
   private isLeaderboardRequest(text: string): boolean {
     return TelegramUpdate.LEADERBOARD_REQUEST_REGEX.test(text);
   }
@@ -1365,6 +1626,43 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     await this.replyWithLeaderboard(ctx);
+  }
+
+  @Command('rules')
+  async onRules(@Ctx() ctx: Context) {
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+
+    await ctx.reply(
+      '📚 <b>Правила цинцкарского языка</b>\n\n' +
+        '<b>Существительные</b>\n' +
+        'Нет рода. Есть единственное и множественное число, а также падежи.\n\n' +
+        '<b>Множественное число существительных</b>\n\n' +
+        '<b>1. После мягких гласных</b>\n' +
+        'Последняя гласная основы: <code>â, e, и, û, ô, ŷ</code>\n' +
+        'Аффикс: <code>-лâр</code>\n' +
+        '<pre>Âв    → Âвлâр\nЕр    → Ерлâр\nÂми   → Âмилâр\nŶрач  → Ŷрачлâр</pre>\n' +
+        'дом — дома; земля — земли; дядя — дяди; сердце — сердца.\n\n' +
+        '<b>2. После твёрдых гласных</b>\n' +
+        'Последняя гласная основы: <code>а, и, о</code>\n' +
+        'Аффикс: <code>-лар</code>\n' +
+        '<pre>Ана   → Аналар\nЧам   → Чамлар\nУшах  → Ушахлар\nТоп   → Топлар</pre>\n' +
+        'мать — матери; дерево — деревья; ребёнок — дети; мяч — мячи.\n\n' +
+        '<b>Другие примеры</b>\n' +
+        '<pre>Гхари  → гхарылар\nДаи    → даûлар\nДжêчи  → джêчылâр</pre>\n' +
+        'женщина — женщины; дядя — дяди; коза — козы.\n\n' +
+        '<b>3. Слова на Л, Н, Т</b>\n' +
+        'Если слово заканчивается на <code>л</code>, <code>н</code> или <code>т</code>, последняя согласная удваивается. Используются окончания <code>-ар</code> и <code>-âр</code>.\n' +
+        '<pre>Нал    → наллар\nАт     → аттар\nТорун  → торуннар\nЧапут  → чапуттар</pre>\n' +
+        'подкова — подковы; лошадь — лошади; внук — внуки; тряпка — тряпки.\n\n' +
+        '<b>Примечания</b>\n' +
+        '• Если слово заканчивается на <code>и</code>, во множественном числе она переходит в <code>û</code> или <code>ы</code>.\n' +
+        '• Если перед существительным стоит числительное, аффиксы <code>-лâр</code> и <code>-лар</code> не ставятся.\n\n' +
+        '<b>Примеры:</b> ичи âв, он адам, беш алма, он алтû кампет.',
+      { parse_mode: 'HTML' },
+    );
   }
 
   @Command('memory')
@@ -1629,6 +1927,183 @@ export class TelegramUpdate implements OnModuleInit {
     await this.pollScheduler.sendBoth();
   }
 
+  @Command('settokenreport')
+  async onSetTokenReport(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+
+    const chatId = ctx.chat!.id;
+    const message = ctx.message as { message_thread_id?: number };
+    const threadId = this.isPrivateChat(ctx)
+      ? null
+      : (message.message_thread_id ?? null);
+    const username = ctx.from?.username || null;
+
+    await this.openaiUsageService.setReportTarget(
+      chatId,
+      threadId,
+      username,
+      username,
+    );
+
+    await ctx.reply(
+      `✅ Ежедневный отчёт по OpenAI токенам будет приходить сюда.\n` +
+        `chat_id: <code>${chatId}</code>\n` +
+        `thread_id: <code>${threadId ?? 'нет'}</code>\n\n` +
+        `Расписание: каждый день в 09:00 (${OPENAI_USAGE_REPORT_TIME_ZONE}), отчёт за предыдущие сутки.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('cleartokenreport')
+  async onClearTokenReport(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+
+    await this.openaiUsageService.clearReportTarget();
+    await ctx.reply(
+      '🛑 Ежедневный отчёт по OpenAI токенам отключён. Используйте /settokenreport чтобы включить снова.',
+    );
+  }
+
+  @Command('tokenreport')
+  async onTokenReport(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+
+    const range = this.openaiUsageService.getCalendarDayRange(
+      new Date(),
+      OPENAI_USAGE_REPORT_TIME_ZONE,
+    );
+    const report = await this.openaiUsageService.buildReport(
+      range.start,
+      range.end,
+      OPENAI_USAGE_REPORT_TIME_ZONE,
+      `Отчёт по OpenAI токенам за сегодня (${range.label})`,
+    );
+
+    for (const chunk of this.chunkString(report, 3900)) {
+      await ctx.reply(chunk);
+    }
+  }
+
+  @Command('setreviewchat')
+  async onSetReviewChat(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      return;
+    }
+
+    const chatId = ctx.chat!.id;
+    const message = ctx.message as { message_thread_id?: number };
+    const threadId = message.message_thread_id ?? null;
+    const username = ctx.from?.username || 'unknown';
+
+    await this.wordReviewService.setTarget(chatId, threadId, username);
+
+    await ctx.reply(
+      `✅ Проверка словаря будет приходить сюда.\n` +
+        `chat_id: <code>${chatId}</code>\n` +
+        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
+        `Расписание: каждый день в 11:00 по Тбилиси.\n` +
+        `В пакете: ${DEFAULT_WORD_REVIEW_LIMIT} слов. Новый пакет приходит сразу после завершения текущего.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  @Command('clearreviewchat')
+  async onClearReviewChat(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+
+    await this.wordReviewService.clearTarget();
+    await ctx.reply(
+      '🛑 Проверка словаря отключена. Используйте /setreviewchat чтобы включить снова.',
+    );
+  }
+
+  @Command('reviewstatus')
+  async onReviewStatus(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+
+    const status = await this.wordReviewService.getStatus();
+    if (!status.target) {
+      await ctx.reply(
+        '⚠️ Проверка словаря не настроена.\nВызови /setreviewchat в нужном топике.',
+      );
+      return;
+    }
+
+    const setAt =
+      status.target.setAt instanceof Date
+        ? status.target.setAt
+        : new Date(status.target.setAt);
+    const lastSent = status.lastSentAt
+      ? (status.lastSentAt instanceof Date
+          ? status.lastSentAt
+          : new Date(status.lastSentAt)
+        ).toISOString()
+      : 'ещё не отправляли';
+
+    await ctx.reply(
+      `📍 Проверка словаря идёт сюда:\n` +
+        `chat_id: <code>${status.target.chatId}</code>\n` +
+        `thread_id: <code>${status.target.threadId ?? 'нет (общий чат)'}</code>\n` +
+        `настроил: @${status.target.setBy}\n` +
+        `когда: ${setAt.toISOString()}\n\n` +
+        `Слов из чата всего: ${status.totalChatWords}\n` +
+        `Уже отправлялись на проверку: ${status.sentWordCount}\n` +
+        `Осталось неотправленных: ${status.remainingWordCount}\n` +
+        `Последняя отправка: ${lastSent}`,
+      { parse_mode: 'HTML' },
+    );
+
+    if (status.activeBatch) {
+      await ctx.reply(
+        `Активный пакет №${status.activeBatch.id}: ` +
+          `${status.activeBatch.confirmed}/${status.activeBatch.total} подтверждено, ` +
+          `${status.activeBatch.awaitingCorrection} ожидают исправления.`,
+      );
+    }
+  }
+
+  @Command('reviewnow')
+  async onReviewNow(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Этот бот работает только в групповых чатах.');
+      return;
+    }
+
+    try {
+      const result = await this.wordReviewService.sendReviewBatch();
+      if (result.status === 'no_target') {
+        await ctx.reply('⚠️ Сначала настрой через /setreviewchat.');
+        return;
+      }
+      if (result.status === 'no_words') {
+        await ctx.reply('Все chat-слова уже отправлялись на проверку.');
+        return;
+      }
+      if (result.status === 'active_batch') {
+        await ctx.reply(
+          'Сначала нужно завершить текущий пакет. Исправляемые слова задерживают весь пакет.',
+        );
+        return;
+      }
+
+      await ctx.reply(`✅ Отправил ${result.count} слов на проверку.`);
+    } catch (err) {
+      this.logger.error('Manual word review failed', err);
+      await ctx.reply('Ошибка при отправке слов на проверку.');
+    }
+  }
+
   @Command('startfactday')
   async onStartFactDay(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
@@ -1787,10 +2262,9 @@ export class TelegramUpdate implements OnModuleInit {
     };
 
     try {
-      const [words, discussionResult] = await Promise.all([
-        this.openaiService.analyzeMessages(messagesText),
-        this.openaiService.processDiscussion(messages),
-      ]);
+      const analysis = await this.openaiService.analyzeDiscussion(messages);
+      const words = analysis.words;
+      const discussionResult = analysis.discussionResult;
 
       let report = await this.formatReport(words);
       const summary = this.shortenDiscussionSummary(
@@ -1824,9 +2298,13 @@ export class TelegramUpdate implements OnModuleInit {
         storedMessages.map((m) => m.id),
         savedReport.id,
       );
+      this.reportOpenAiUnavailableNotifiedChats.delete(chatId);
     } catch (error) {
       this.logger.error('Report error:', error);
-      await ctx.reply('❌ Ошибка при формировании отчёта. Попробуйте ещё раз.');
+      if (!this.reportOpenAiUnavailableNotifiedChats.has(chatId)) {
+        this.reportOpenAiUnavailableNotifiedChats.add(chatId);
+        await ctx.reply('OpenAI API недоступен.');
+      }
     }
   }
 
@@ -1911,7 +2389,7 @@ export class TelegramUpdate implements OnModuleInit {
   ): Promise<void> {
     try {
       await ctx.deleteMessage(messageId);
-    } catch (error) {
+    } catch {
       this.logger.warn(`Could not delete status message ${messageId}`);
     }
   }

@@ -39,9 +39,40 @@ describe('TelegramUpdate bot mentions', () => {
       getBotMemory: jest.fn(async () => []),
       ensureDefaultGlobalMemory: jest.fn(),
     };
+    const wordReviewService = {
+      setTarget: jest.fn(async () => ({})),
+      clearTarget: jest.fn(async () => undefined),
+      getStatus: jest.fn(async () => ({
+        target: null,
+        totalChatWords: 0,
+        sentWordCount: 0,
+        remainingWordCount: 0,
+        lastSentAt: null,
+        activeBatch: null,
+      })),
+      sendReviewBatch: jest.fn(async () => ({ status: 'sent', count: 10 })),
+      handleAction: jest.fn(async () => ({
+        status: 'handled',
+        message: 'Голос учтён.',
+      })),
+      handleCorrectionReply: jest.fn(async () => ({
+        status: 'not_correction',
+      })),
+    };
+    const openaiUsageService = {
+      setReportTarget: jest.fn(async () => ({})),
+      clearReportTarget: jest.fn(async () => undefined),
+      getCalendarDayRange: jest.fn(() => ({
+        start: new Date('2026-07-08T00:00:00.000Z'),
+        end: new Date('2026-07-09T00:00:00.000Z'),
+        label: '2026-07-08',
+      })),
+      buildReport: jest.fn(async () => 'usage report'),
+    };
     const ctx = {
       chat: { id: -100, type: 'supergroup' },
       reply: jest.fn(),
+      replyWithPhoto: jest.fn(),
       telegram: { setMessageReaction: jest.fn() },
     };
 
@@ -54,10 +85,19 @@ describe('TelegramUpdate bot mentions', () => {
       {} as any,
       {} as any,
       {} as any,
+      wordReviewService as any,
+      openaiUsageService as any,
       { get: jest.fn(() => 100) } as any,
     );
 
-    return { update, ctx, dictionaryService, openaiService };
+    return {
+      update,
+      ctx,
+      dictionaryService,
+      openaiService,
+      telegramService,
+      wordReviewService,
+    };
   };
 
   it('adds a direct word list before considering leaderboard mentions', async () => {
@@ -297,6 +337,49 @@ describe('TelegramUpdate bot mentions', () => {
     });
   });
 
+  it('sanitizes dictionary command noise before saving words', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      `Бот, добавь слова:
+в словарь аслан - лев
+- бышхи - мелкозубчатая пила
+юва - гнездо (нет в словаре) (сущ.)
+сŷпŷpджâ - веник`,
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(4);
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
+      word: 'аслан',
+      translation: 'лев',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
+      word: 'бышхи',
+      translation: 'мелкозубчатая пила',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
+      word: 'юва',
+      translation: 'гнездо',
+      partOfSpeech: 'сущ.',
+      addedBy: 'AAlxnv',
+    });
+    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(4, {
+      word: 'сŷпŷрджâ',
+      translation: 'веник',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+  });
+
   it('still replies with the leaderboard for an explicit leaderboard request', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
 
@@ -315,6 +398,51 @@ describe('TelegramUpdate bot mentions', () => {
       '🏆 Топ добавивших слова:\n1. @anonymous — 410 слов',
       { reply_parameters: { message_id: 123 } },
     );
+  });
+
+  it('sends formatted noun plural rules for /rules', async () => {
+    const { update, ctx } = makeUpdate();
+
+    await update.onRules(ctx as any);
+
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('<b>Множественное число существительных</b>'),
+      { parse_mode: 'HTML' },
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('<pre>Âв    → Âвлâр'),
+      { parse_mode: 'HTML' },
+    );
+    expect((ctx.reply as jest.Mock).mock.calls[0][0].length).toBeLessThan(4096);
+    expect(ctx.replyWithPhoto).not.toHaveBeenCalled();
+  });
+
+  it('configures text word review and sends a manual batch', async () => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    (ctx as any).from = { id: 1, username: 'AAlxnv' };
+
+    (ctx as any).message = {
+      text: '/setreviewchat',
+      message_thread_id: 44,
+    };
+    await update.onSetReviewChat(ctx as any);
+
+    expect(wordReviewService.setTarget).toHaveBeenCalledWith(
+      -100,
+      44,
+      'AAlxnv',
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Проверка словаря будет приходить сюда'),
+      { parse_mode: 'HTML' },
+    );
+
+    (ctx.reply as jest.Mock).mockClear();
+    (ctx as any).message = { text: '/reviewnow 10' };
+    await update.onReviewNow(ctx as any);
+
+    expect(wordReviewService.sendReviewBatch).toHaveBeenCalledWith();
+    expect(ctx.reply).toHaveBeenCalledWith('✅ Отправил 10 слов на проверку.');
   });
 
   it('answers a direct dictionary lookup locally without OpenAI', async () => {
@@ -460,5 +588,88 @@ describe('TelegramUpdate bot mentions', () => {
     expect(ctx.reply).toHaveBeenCalledWith('ok', {
       reply_parameters: { message_id: 123 },
     });
+  });
+
+  it('does not load chat history or memory for an ordinary AI question', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, помоги красиво сформулировать объявление',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(telegramService.getRecentMessages).not.toHaveBeenCalled();
+    expect(telegramService.getBotMemory).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, помоги красиво сформулировать объявление',
+      [],
+      [],
+      [],
+    );
+  });
+
+  it('loads recent messages only for a conversation summary request', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    const recentMessages = [
+      {
+        username: 'alice',
+        text: 'Обсуждали встречу.',
+        sentAt: new Date('2026-07-15T08:00:00.000Z'),
+      },
+    ];
+    telegramService.getRecentMessages.mockResolvedValueOnce(recentMessages);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, о чём говорили в последних сообщениях?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(telegramService.getRecentMessages).toHaveBeenCalledWith(
+      -100,
+      null,
+      50,
+    );
+    expect(telegramService.getBotMemory).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, о чём говорили в последних сообщениях?',
+      recentMessages,
+      [],
+      [],
+    );
+  });
+
+  it('loads memory without chat history for a community context question', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    const memory = [
+      {
+        text: 'Встреча Общества проходит летом.',
+        createdBy: 'admin',
+        createdAt: new Date('2026-07-15T08:00:00.000Z'),
+      },
+    ];
+    telegramService.getBotMemory.mockResolvedValueOnce(memory);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, что известно о встрече Общества Цинцкаро?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(telegramService.getRecentMessages).not.toHaveBeenCalled();
+    expect(telegramService.getBotMemory).toHaveBeenCalledWith(-100, 50);
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, что известно о встрече Общества Цинцкаро?',
+      [],
+      memory,
+      [],
+    );
   });
 });

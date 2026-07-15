@@ -5,11 +5,20 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { TelegrafModule } from 'nestjs-telegraf';
 import { TelegramModule } from './telegram/telegram.module';
 import { OpenaiModule } from './openai/openai.module';
+import { OpenaiUsageLog } from './openai/entities/openai-usage-log.entity';
+import { OpenaiUsageReportConfig } from './openai/entities/openai-usage-report-config.entity';
 import { PollModule } from './poll/poll.module';
 import { PollConfig } from './poll/entities/poll-config.entity';
 import { PollHistory } from './poll/entities/poll-history.entity';
 import { FactDayModule } from './fact-day/fact-day.module';
 import { FactDayConfig } from './fact-day/entities/fact-day-config.entity';
+import { WordReviewModule } from './word-review/word-review.module';
+import { WordReviewConfig } from './word-review/entities/word-review-config.entity';
+import { WordReviewHistory } from './word-review/entities/word-review-history.entity';
+import { WordReviewBatch } from './word-review/entities/word-review-batch.entity';
+import { WordReviewItem } from './word-review/entities/word-review-item.entity';
+import { WordReviewVote } from './word-review/entities/word-review-vote.entity';
+import { WordReviewCorrectionRequest } from './word-review/entities/word-review-correction-request.entity';
 import { CollectedMessage } from './telegram/entities/collected-message.entity';
 import { SummaryConfig } from './telegram/entities/summary-config.entity';
 import { SummaryReport } from './telegram/entities/summary-report.entity';
@@ -33,10 +42,18 @@ import configuration from './config/configuration';
           PollConfig,
           PollHistory,
           FactDayConfig,
+          WordReviewConfig,
+          WordReviewHistory,
+          WordReviewBatch,
+          WordReviewItem,
+          WordReviewVote,
+          WordReviewCorrectionRequest,
           CollectedMessage,
           SummaryConfig,
           SummaryReport,
           BotMemory,
+          OpenaiUsageLog,
+          OpenaiUsageReportConfig,
           Word,
         ],
         synchronize: true,
@@ -54,6 +71,7 @@ import configuration from './config/configuration';
     OpenaiModule,
     PollModule,
     FactDayModule,
+    WordReviewModule,
   ],
 })
 export class AppModule {}
