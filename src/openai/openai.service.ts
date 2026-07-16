@@ -101,6 +101,7 @@ const BOT_MENTION_RESPONSE_FORMAT = {
       properties: {
         action: {
           type: 'string',
+          description: 'Ровно одно действие, соответствующее запросу.',
           enum: [
             'add_words',
             'update_words',
@@ -111,6 +112,8 @@ const BOT_MENTION_RESPONSE_FORMAT = {
         },
         entries: {
           type: 'array',
+          description:
+            'Записи только для add_words или update_words; иначе пустой массив.',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -130,14 +133,53 @@ const BOT_MENTION_RESPONSE_FORMAT = {
             ],
           },
         },
-        words: { type: 'array', items: { type: 'string' } },
-        text: { type: ['string', 'null'] },
-        message: { type: ['string', 'null'] },
+        words: {
+          type: 'array',
+          description:
+            'Конкретные слова только для delete_words; иначе пустой массив.',
+          items: { type: 'string' },
+        },
+        text: {
+          type: ['string', 'null'],
+          description:
+            'Факт для сохранения только при action=add_memory; иначе null.',
+        },
+        message: {
+          type: ['string', 'null'],
+          description:
+            'Непустой естественный ответ пользователю при action=reply; иначе null.',
+        },
       },
       required: ['action', 'entries', 'words', 'text', 'message'],
     },
   },
 } as const;
+
+const BOT_REPLY_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'bot_reply',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        message: {
+          type: 'string',
+          description:
+            'Непустой естественный ответ на текущую реплику пользователя.',
+        },
+      },
+      required: ['message'],
+    },
+  },
+} as const;
+
+const BOT_ACTION_REQUEST_REGEX =
+  /(?:^|[\s,.:;!?])(?:добав[а-яё]*|внес[а-яё]*|запиш[а-яё]*|сохран[а-яё]*|запомн[а-яё]*|исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|удал[а-яё]*|убер[а-яё]*|сотр[а-яё]*)(?:$|[\s,.:;!?])/i;
+
+const BOT_ORDINARY_QUESTION_REGEX =
+  /[?？]\s*$|(?:^|[\s,.:;!])(?:кто|что|где|куда|откуда|когда|как|почему|зачем|сколько|како[йеяи]|чей|можно\s+ли|правда\s+ли|умеешь\s+ли)(?:$|[\s,.:;!?])/i;
 
 const DICTIONARY_ENTRIES_RESPONSE_FORMAT = {
   type: 'json_schema',
@@ -268,7 +310,7 @@ export class OpenaiService {
             .join('\n')}\n`
         : '';
 
-    const systemPrompt = `Ты помощник Общества Цинцкаро в Telegram-чате. Отвечай по-русски, дружелюбно и кратко.
+    const actionSystemPrompt = `Ты помощник Общества Цинцкаро в Telegram-чате. Отвечай по-русски, дружелюбно и кратко.
 
 Выбери одно действие:
 - add_words — только когда пользователь явно просит добавить одну или несколько пар «цинцкарское слово — русский перевод»;
@@ -277,11 +319,36 @@ export class OpenaiService {
 - add_memory — только при явной просьбе запомнить конкретный факт;
 - reply — для вопросов, общения и всех остальных случаев.
 
-Для слов используй нижний регистр, не выдумывай переводы и сохраняй все явно указанные значения. Массовое удаление запрещено: ответь, что нужно перечислить до 10 конкретных слов. В неиспользуемых полях структурированного ответа возвращай пустой массив или null.
+Заполняй результат так:
+- reply: обязательно запиши естественный непустой ответ в message;
+- add_memory: запиши сохраняемый факт в text;
+- delete_words: запиши конкретные слова в words;
+- add_words и update_words: запиши данные в entries.
+Во всех остальных полях возвращай пустой массив или null. Если запрос нельзя безопасно выполнить как действие, выбери reply и объясни это в message.
+
+Для слов используй нижний регистр, не выдумывай переводы и сохраняй все явно указанные значения. Массовое удаление запрещено: выбери reply и напиши, что нужно перечислить до 10 конкретных слов.
 
 В reply пиши 3–4 предложения, для пересказа — максимум 6. Для цинцкарских переводов используй только переданный словарь; если слова нет, честно скажи об этом. Для вопросов о памяти и переписке используй только соответствующие разделы контекста. Если фактов недостаточно, попроси уточнение.`;
 
     const userPrompt = `${dictionarySection}${memorySection}${contextSection}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
+    const contextMetadata = {
+      userTextLength: text.length,
+      recentMessages: recentMessages.length,
+      memoryEntries: botMemory.length,
+      dictionaryEntries: dictionaryEntries.length,
+    };
+
+    if (
+      BOT_ORDINARY_QUESTION_REGEX.test(text) ||
+      !BOT_ACTION_REQUEST_REGEX.test(text)
+    ) {
+      return this.createConversationalReply(
+        text,
+        userPrompt,
+        contextMetadata,
+        'conversation',
+      );
+    }
 
     const response = await this.createChatCompletion(
       'bot_mention',
@@ -289,23 +356,36 @@ export class OpenaiService {
       {
         model: this.botModel,
         messages: [
-          { role: 'system', content: systemPrompt },
+          { role: 'system', content: actionSystemPrompt },
           { role: 'user', content: userPrompt },
         ],
         response_format: BOT_MENTION_RESPONSE_FORMAT,
         reasoning_effort: 'none',
         max_completion_tokens: this.botMaxCompletionTokens,
+        prompt_cache_key: 'tsintskaro:bot_action:v3',
       },
       {
-        userTextLength: text.length,
-        recentMessages: recentMessages.length,
-        memoryEntries: botMemory.length,
-        dictionaryEntries: dictionaryEntries.length,
+        ...contextMetadata,
+        responseMode: 'action',
       },
     );
 
-    const content = response.choices[0].message.content || '{}';
-    const parsed = JSON.parse(content);
+    const refusal = response.choices[0].message.refusal?.trim();
+    if (refusal) {
+      return { action: 'reply', message: refusal };
+    }
+
+    const parsed = this.parseJsonObject(
+      response.choices[0].message.content || '',
+    );
+    if (!parsed) {
+      return this.createConversationalReply(
+        text,
+        userPrompt,
+        contextMetadata,
+        'repair',
+      );
+    }
 
     if (parsed.action === 'add_words' && Array.isArray(parsed.entries)) {
       const entries: DictionaryEntryInput[] = [];
@@ -384,14 +464,98 @@ export class OpenaiService {
       }
     }
 
-    if (parsed.action === 'reply' && typeof parsed.message === 'string') {
-      return { action: 'reply', message: parsed.message.trim() };
+    if (parsed.action === 'reply') {
+      const message = this.firstNonEmptyString(parsed.message, parsed.text);
+      if (message) {
+        return { action: 'reply', message };
+      }
     }
 
+    return this.createConversationalReply(
+      text,
+      userPrompt,
+      contextMetadata,
+      'repair',
+    );
+  }
+
+  private async createConversationalReply(
+    text: string,
+    userPrompt: string,
+    contextMetadata: Record<string, unknown>,
+    responseMode: 'conversation' | 'repair',
+  ): Promise<BotMentionResult> {
+    const systemPrompt = `Ты Баласи, живой и внимательный помощник Общества Цинцкаро в Telegram-чате. Ответь непосредственно на текущую реплику по-русски, естественно и доброжелательно.
+
+Отвечай на обычные вопросы на общие темы, объясняй понятия, помогай сформулировать текст и поддерживай разговор. Для простого вопроса или замечания обычно достаточно 1–4 предложений; если пользователь просит подробности, можно ответить развёрнуто. Не отвечай служебной фразой «не понял», если смысл реплики очевиден. Если вопрос требует свежих данных из интернета, которых нет во входе, не выдумывай актуальные факты.
+
+Автоматические лайки и реакции бота отключены: просьбу не ставить лайки можно спокойно подтвердить. Не обещай изменить другие функции или код самостоятельно. Не утверждай, что запомнил факт навсегда, если он не передан в разделе памяти.
+
+Используй историю, память и словарь только когда соответствующие разделы есть во входе. Для перевода цинцкарских слов опирайся только на переданный словарь; если данных нет, честно скажи об этом.`;
+    const response = await this.createChatCompletion(
+      'bot_mention',
+      `${responseMode === 'repair' ? 'Восстановление ответа' : 'Ответ'} бота: ${text}`,
+      {
+        model: this.botModel,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: BOT_REPLY_RESPONSE_FORMAT,
+        reasoning_effort: 'none',
+        max_completion_tokens: this.botMaxCompletionTokens,
+        prompt_cache_key: 'tsintskaro:bot_reply:v3',
+      },
+      { ...contextMetadata, responseMode },
+    );
+
+    const refusal = response.choices[0].message.refusal?.trim();
+    if (refusal) {
+      return { action: 'reply', message: refusal };
+    }
+
+    const parsed = this.parseJsonObject(
+      response.choices[0].message.content || '',
+    );
+    const message = this.firstNonEmptyString(parsed?.message);
+    if (message) {
+      return { action: 'reply', message };
+    }
+
+    if (/(?:ты\s+тут|ты\s+здесь|на\s+связи)/i.test(text)) {
+      return { action: 'reply', message: 'Да, я здесь и читаю сообщения.' };
+    }
+    if (/(?:лайк|реакци)[а-яё]*/i.test(text)) {
+      return {
+        action: 'reply',
+        message: 'Понял, автоматические лайки и реакции отключены.',
+      };
+    }
     return {
       action: 'reply',
-      message: 'Не понял что нужно сделать. Можешь переформулировать?',
+      message:
+        'Я здесь, но сейчас не получилось сформировать ответ. Попробуй написать ещё раз.',
     };
+  }
+
+  private parseJsonObject(content: string): Record<string, unknown> | null {
+    try {
+      const parsed: unknown = JSON.parse(content);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private firstNonEmptyString(...values: unknown[]): string | null {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim();
+      }
+    }
+    return null;
   }
 
   async normalizeDictionaryEntries(

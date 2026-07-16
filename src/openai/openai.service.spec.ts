@@ -1,6 +1,18 @@
 import { OpenaiService } from './openai.service';
 
 describe('OpenaiService token-efficient requests', () => {
+  const completion = (content: string) => ({
+    model: 'gpt-5.4-mini-2026-03-17',
+    choices: [{ message: { content, refusal: null } }],
+    usage: {
+      prompt_tokens: 900,
+      completion_tokens: 150,
+      total_tokens: 1050,
+      prompt_tokens_details: { cached_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: 0 },
+    },
+  });
+
   const makeService = () => {
     const configValues: Record<string, unknown> = {
       openaiKey: 'test-key',
@@ -25,41 +37,27 @@ describe('OpenaiService token-efficient requests', () => {
     );
     const create = jest.fn(async (params: unknown) => {
       void params;
-      return {
-        model: 'gpt-5.4-mini-2026-03-17',
-        choices: [
-          {
-            message: {
-              content: JSON.stringify({
-                discussionSummary: 'Обсудили значение слова [m1].',
-                words: [
-                  {
-                    word: 'ширин',
-                    possibleTranslation: 'сладкий',
-                    context: 'Ширин чай',
-                    partOfSpeech: 'прил.',
-                    username: 'alice',
-                  },
-                  {
-                    word: 'ширин',
-                    possibleTranslation: 'милый',
-                    context: 'Ширин человек',
-                    partOfSpeech: 'прил.',
-                    username: 'bob',
-                  },
-                ],
-              }),
+      return completion(
+        JSON.stringify({
+          discussionSummary: 'Обсудили значение слова [m1].',
+          words: [
+            {
+              word: 'ширин',
+              possibleTranslation: 'сладкий',
+              context: 'Ширин чай',
+              partOfSpeech: 'прил.',
+              username: 'alice',
             },
-          },
-        ],
-        usage: {
-          prompt_tokens: 900,
-          completion_tokens: 150,
-          total_tokens: 1050,
-          prompt_tokens_details: { cached_tokens: 0 },
-          completion_tokens_details: { reasoning_tokens: 0 },
-        },
-      };
+            {
+              word: 'ширин',
+              possibleTranslation: 'милый',
+              context: 'Ширин человек',
+              partOfSpeech: 'прил.',
+              username: 'bob',
+            },
+          ],
+        }),
+      );
     });
     (service as any).openai = {
       chat: { completions: { create } },
@@ -110,5 +108,102 @@ describe('OpenaiService token-efficient requests', () => {
         }),
       }),
     );
+  });
+
+  it('uses a simple reply schema for ordinary conversation', async () => {
+    const { service, create, usageService } = makeService();
+    create.mockResolvedValueOnce(
+      completion(
+        JSON.stringify({
+          message: 'Понял, автоматические лайки и реакции отключены.',
+        }),
+      ),
+    );
+
+    const result = await service.processBotMention(
+      'Баласи, не надо ставить лайки.',
+    );
+
+    expect(result).toEqual({
+      action: 'reply',
+      message: 'Понял, автоматические лайки и реакции отключены.',
+    });
+    expect(create).toHaveBeenCalledTimes(1);
+    const request = create.mock.calls[0][0] as any;
+    expect(request.response_format.json_schema.name).toBe('bot_reply');
+    expect(request.prompt_cache_key).toBe('tsintskaro:bot_reply:v3');
+    expect(request.messages[0].content).not.toContain('add_words');
+    expect(usageService.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ responseMode: 'conversation' }),
+      }),
+    );
+  });
+
+  it('keeps an ordinary question out of the action router', async () => {
+    const { service, create } = makeService();
+    create.mockResolvedValueOnce(
+      completion(
+        JSON.stringify({
+          message:
+            'Смочи пятно холодной водой и используй подходящее средство для ткани.',
+        }),
+      ),
+    );
+
+    const result = await service.processBotMention(
+      'Баласи, как удалить пятно с рубашки?',
+    );
+
+    expect(result).toEqual({
+      action: 'reply',
+      message:
+        'Смочи пятно холодной водой и используй подходящее средство для ткани.',
+    });
+    expect(create).toHaveBeenCalledTimes(1);
+    const request = create.mock.calls[0][0] as any;
+    expect(request.response_format.json_schema.name).toBe('bot_reply');
+    expect(request.messages[0].content).toContain(
+      'Отвечай на обычные вопросы на общие темы',
+    );
+  });
+
+  it('repairs an action response that has no user-facing message', async () => {
+    const { service, create } = makeService();
+    create
+      .mockResolvedValueOnce(
+        completion(
+          JSON.stringify({
+            action: 'reply',
+            entries: [],
+            words: [],
+            text: null,
+            message: null,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        completion(
+          JSON.stringify({
+            message: 'Конечно, помогу сделать текст живее.',
+          }),
+        ),
+      );
+
+    const result = await service.processBotMention(
+      'Баласи, добавь немного юмора в объявление.',
+    );
+
+    expect(result).toEqual({
+      action: 'reply',
+      message: 'Конечно, помогу сделать текст живее.',
+    });
+    expect(create).toHaveBeenCalledTimes(2);
+    const actionRequest = create.mock.calls[0][0] as any;
+    const repairRequest = create.mock.calls[1][0] as any;
+    expect(actionRequest.response_format.json_schema.name).toBe(
+      'bot_mention_action',
+    );
+    expect(repairRequest.response_format.json_schema.name).toBe('bot_reply');
   });
 });

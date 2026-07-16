@@ -551,16 +551,6 @@ export class TelegramUpdate implements OnModuleInit {
           await ctx.reply(lines.join('\n'), {
             reply_parameters: { message_id: messageId },
           });
-
-          if (deleted.length > 0) {
-            try {
-              await ctx.telegram.setMessageReaction(chatId, messageId, [
-                { type: 'emoji', emoji: '👍' },
-              ]);
-            } catch (err) {
-              this.logger.warn(`Failed to set reaction: ${err}`);
-            }
-          }
         }
       } catch (err) {
         this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
@@ -1152,16 +1142,6 @@ export class TelegramUpdate implements OnModuleInit {
       await ctx.reply(lines.join('\n'), {
         reply_parameters: { message_id: messageId },
       });
-
-      if (created.length + expanded.length > 0) {
-        try {
-          await ctx.telegram.setMessageReaction(chatId, messageId, [
-            { type: 'emoji', emoji: '👍' },
-          ]);
-        } catch (err) {
-          this.logger.warn(`Failed to set reaction: ${err}`);
-        }
-      }
     }
   }
 
@@ -1387,16 +1367,6 @@ export class TelegramUpdate implements OnModuleInit {
     await ctx.reply(lines.join('\n'), {
       reply_parameters: { message_id: messageId },
     });
-
-    if (updated.length > 0) {
-      try {
-        await ctx.telegram.setMessageReaction(chatId, messageId, [
-          { type: 'emoji', emoji: '👍' },
-        ]);
-      } catch (err) {
-        this.logger.warn(`Failed to set reaction: ${err}`);
-      }
-    }
   }
 
   private extractBotMemoryText(text: string): string | null {

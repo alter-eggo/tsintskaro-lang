@@ -168,6 +168,7 @@ describe('TelegramUpdate bot mentions', () => {
       expect.stringContaining('✅ записал (34):'),
       { reply_parameters: { message_id: 123 } },
     );
+    expect(ctx.telegram.setMessageReaction).not.toHaveBeenCalled();
   });
 
   it('adds a direct word list when the dash touches the word', async () => {
