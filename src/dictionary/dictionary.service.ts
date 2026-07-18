@@ -1,13 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
-import { Word } from './entities/word.entity';
+import { Word, type WordSource } from './entities/word.entity';
 import { compareTsintskaroWords } from './sheets-parser';
 
 export interface DictionaryEntry {
   word: string;
   translation: string;
   partOfSpeech?: string;
+  comments?: string;
+  source?: WordSource;
 }
 
 export interface UpsertWordInput {
@@ -155,6 +157,8 @@ export class DictionaryService {
       word: r.word,
       translation: r.translation,
       partOfSpeech: r.partOfSpeech ?? undefined,
+      comments: r.comments ?? undefined,
+      source: r.source,
     }));
     entries.sort((a, b) => compareTsintskaroWords(a.word, b.word));
     this.cache = entries;

@@ -703,14 +703,20 @@ export class TelegramUpdate implements OnModuleInit {
       return false;
     }
 
+    const isExistenceRequest = this.isDictionaryExistenceRequest(text);
     const entries = await this.findDictionaryLookupEntries(
       candidates,
       this.isRussianToTsintskaroLookupRequest(text),
+      isExistenceRequest,
     );
     const message =
       entries.length > 0
-        ? this.formatDictionaryLookupReply(entries)
-        : `Такого слова в нашем словаре нет: ${candidates.join(', ')}.`;
+        ? this.formatDictionaryLookupReply(
+            entries,
+            candidates,
+            isExistenceRequest,
+          )
+        : this.formatMissingDictionaryLookupReply(candidates);
 
     if (messageId != null) {
       await ctx.reply(message, {
@@ -746,16 +752,23 @@ export class TelegramUpdate implements OnModuleInit {
   private async findDictionaryLookupEntries(
     candidates: string[],
     reverseLookup: boolean,
+    searchBothDirections = false,
   ): Promise<DictionaryEntry[]> {
     const entries: DictionaryEntry[] = [];
     const seen = new Set<string>();
 
     for (const candidate of candidates.slice(0, 8)) {
-      const found = reverseLookup
-        ? await this.dictionaryService.findByTranslation(candidate)
-        : [await this.dictionaryService.findWord(candidate)].filter(
-            (entry): entry is DictionaryEntry => Boolean(entry),
-          );
+      const found: DictionaryEntry[] = [];
+
+      if (!reverseLookup || searchBothDirections) {
+        const directMatch = await this.dictionaryService.findWord(candidate);
+        if (directMatch) found.push(directMatch);
+      }
+      if (reverseLookup || searchBothDirections) {
+        found.push(
+          ...(await this.dictionaryService.findByTranslation(candidate)),
+        );
+      }
 
       for (const entry of found) {
         const key = entry.word.toLowerCase();
@@ -771,24 +784,63 @@ export class TelegramUpdate implements OnModuleInit {
     return entries;
   }
 
-  private formatDictionaryLookupReply(entries: DictionaryEntry[]): string {
-    if (entries.length === 1) {
-      const entry = entries[0];
-      const pos = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
-      return `${entry.word} — ${entry.translation}${pos}`;
-    }
+  private formatDictionaryLookupReply(
+    entries: DictionaryEntry[],
+    candidates: string[],
+    isExistenceRequest: boolean,
+  ): string {
+    const heading = isExistenceRequest
+      ? entries.length === 1
+        ? `Да, нашёл в словаре запись для «${candidates.join(', ')}»:`
+        : `Да, нашёл в словаре ${entries.length} подходящих записей для «${candidates.join(', ')}»:`
+      : entries.length === 1
+        ? 'Нашёл в словаре:'
+        : `Нашёл в словаре ${entries.length} подходящих записей:`;
 
-    return [
-      'Нашёл в словаре:',
-      ...entries.map((entry) => {
-        const pos = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
-        return `• ${entry.word} — ${entry.translation}${pos}`;
-      }),
-    ].join('\n');
+    const details = entries.map((entry, index) => {
+      const lines = [
+        `Слово: ${entry.word}`,
+        `Перевод: ${entry.translation}`,
+        `Часть речи: ${entry.partOfSpeech || 'не указана'}`,
+      ];
+
+      const source = this.formatDictionarySource(entry.source);
+      if (source) lines.push(`Источник: ${source}`);
+      if (entry.comments?.trim()) {
+        lines.push(`Примечание: ${entry.comments.trim()}`);
+      }
+
+      if (entries.length === 1) return lines.join('\n');
+      return `${index + 1}. ${lines.join('\n   ')}`;
+    });
+
+    return [heading, ...details].join('\n\n');
+  }
+
+  private formatMissingDictionaryLookupReply(candidates: string[]): string {
+    const label = candidates.map((candidate) => `«${candidate}»`).join(', ');
+    return `Проверил ${label}: в нашем словаре точного совпадения пока нет. Проверь написание слова или уточни, нужен поиск по цинцкарскому слову или по русскому переводу.`;
+  }
+
+  private formatDictionarySource(
+    source: DictionaryEntry['source'],
+  ): string | null {
+    if (source === 'etalon') return 'эталонный словарь';
+    if (source === 'rabochy') return 'рабочий словарь';
+    if (source === 'chat') return 'добавлено участниками чата';
+    return null;
   }
 
   private isDictionaryLookupRequest(text: string): boolean {
-    return /(?:как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русский|на\s+цинцкарск|по-цинцкарск)/i.test(
+    return (
+      /(?:как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русский|на\s+цинцкарск|по-цинцкарск)/i.test(
+        text,
+      ) || this.isDictionaryExistenceRequest(text)
+    );
+  }
+
+  private isDictionaryExistenceRequest(text: string): boolean {
+    return /(?:есть\s+ли[^?.!]*словар|в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)|(?:есть|имеется)[^?.!]*в\s+(?:нашем\s+)?словаре|(?:проверь|посмотри|найди|поищи)[^?.!]*\bсловар)/i.test(
       text,
     );
   }
@@ -812,6 +864,13 @@ export class TelegramUpdate implements OnModuleInit {
     const patterns = [
       /(?:как\s+перевести(?:\s+на\s+(?:русский|цинцкарский))?|переведи(?:\s+на\s+(?:русский|цинцкарский))?)\s+(.+?)(?:[?.!]|$)/i,
       /(?:что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова)\s+(.+?)(?:[?.!]|$)/i,
+      /в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)\s+(?:ли\s+)?(?:слово|выражение|фраза)?\s*(.+?)(?:[?.!]|$)/i,
+      /в\s+(?:нашем\s+)?словаре\s+(?:слово|выражение|фраза)?\s*(.+?)\s+(?:есть|имеется)(?:[?.!]|$)/i,
+      /(?:есть|имеется)\s+в\s+(?:нашем\s+)?словаре\s+(?:слово|выражение|фраза)?\s*(.+?)(?:[?.!]|$)/i,
+      /(?:есть|имеется)\s+ли\s+(?:в\s+(?:нашем\s+)?словаре\s+)?(?:слово|выражение|фраза)?\s*(.+?)(?:\s+в\s+(?:нашем\s+)?словаре)?(?:[?.!]|$)/i,
+      /(?:есть|имеется)\s+(?:слово|выражение|фраза)?\s*(.+?)\s+в\s+(?:нашем\s+)?словаре(?:[?.!]|$)/i,
+      /(?:слово|выражение|фраза)\s+(.+?)\s+(?:есть|имеется)\s+в\s+(?:нашем\s+)?словаре(?:[?.!]|$)/i,
+      /(?:проверь|посмотри|найди|поищи)\s+(?:в\s+(?:нашем\s+)?словаре\s+)?(?:слово|выражение|фраза)?\s*(.+?)(?:\s+в\s+(?:нашем\s+)?словаре)?(?:[?.!]|$)/i,
     ];
 
     for (const pattern of patterns) {

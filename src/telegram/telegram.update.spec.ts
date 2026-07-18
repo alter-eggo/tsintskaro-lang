@@ -464,9 +464,41 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('сахгкал оти');
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith('сахгкал оти — укроп (сущ.)', {
-      reply_parameters: { message_id: 123 },
-    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Нашёл в словаре:\n\nСлово: сахгкал оти\nПеревод: укроп\nЧасть речи: сущ.',
+      {
+        reply_parameters: { message_id: 123 },
+      },
+    );
+  });
+
+  it('answers an explicit dictionary existence question in detail', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findByTranslation.mockResolvedValueOnce([
+      {
+        word: 'махсыл',
+        translation: 'урожай',
+        partOfSpeech: 'существительное',
+        source: 'etalon',
+        comments: 'Общее название собранного урожая.',
+      },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, в словаре есть слово урожай?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('урожай');
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('урожай');
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Да, нашёл в словаре запись для «урожай»:\n\nСлово: махсыл\nПеревод: урожай\nЧасть речи: существительное\nИсточник: эталонный словарь\nПримечание: Общее название собранного урожая.',
+      { reply_parameters: { message_id: 123 } },
+    );
   });
 
   it('passes only matching dictionary entries into general AI context', async () => {
