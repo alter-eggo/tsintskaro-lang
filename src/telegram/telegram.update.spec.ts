@@ -235,6 +235,50 @@ describe('TelegramUpdate bot mentions', () => {
     );
   });
 
+  it('keeps a comma-separated expression as one entry after "добавь:"', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь: Артын, âйсилмâин, дашын ,тôчŷлмâин!- Плодитесь, размножайтесь и наполняйте Землю!',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(1);
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
+      word: 'артын, âйсилмâин, дашын, тôчŷлмâин',
+      translation: 'Плодитесь, размножайтесь и наполняйте Землю',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '✅ записал:\n• артын, âйсилмâин, дашын, тôчŷлмâин — Плодитесь, размножайтесь и наполняйте Землю',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('does not save an AI placeholder as a dictionary translation', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate();
+
+    await (update as any).handleDictionaryAdditions(ctx, -100, 'AAlxnv', 123, [
+      {
+        word: 'артын',
+        translation: '(не найдено цинцкарское слово с явным переводом)',
+        partOfSpeech: null,
+      },
+    ]);
+
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '⚠️ не получилось сохранить: артын',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
   it('uses AI normalization when a direct word list is not fully parseable', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
     openaiService.normalizeDictionaryEntries.mockResolvedValueOnce([

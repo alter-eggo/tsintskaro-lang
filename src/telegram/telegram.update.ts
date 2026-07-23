@@ -1082,7 +1082,7 @@ export class TelegramUpdate implements OnModuleInit {
 
   private stripDictionaryPairIntent(line: string): string {
     return line.replace(
-      /^(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить)\s+(?:(?:это|слово|перевод|запись)\s+)?/i,
+      /^(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить)(?:\s*[,.:;!?]\s*|\s+)(?:(?:это|слово|перевод|запись)(?:\s*[,.:;!?]\s*|\s+))?/i,
       '',
     );
   }
@@ -1262,6 +1262,7 @@ export class TelegramUpdate implements OnModuleInit {
       .trim()
       .replace(/^[\s"'«»“”„`.,;:!?()[\]{}\-—]+/g, '')
       .replace(/[\s"'«»“”„`.,;:!?()[\]{}\-—]+$/g, '')
+      .replace(/\s*,\s*/g, ', ')
       .replace(/\s+/g, ' ');
 
     return this.normalizeCyrillicLookalikes(
@@ -1303,6 +1304,12 @@ export class TelegramUpdate implements OnModuleInit {
     );
   }
 
+  private isPlaceholderDictionaryTranslation(translation: string): boolean {
+    return /^\(?\s*(?:не\s+найден[оа]?|перевод\s+не\s+найден|нет\s+(?:явного\s+)?перевода|не\s+удалось\s+(?:найти|определить)).*перевод/i.test(
+      translation,
+    );
+  }
+
   private sanitizeDictionaryEntryForSave(
     entry: DictionaryEntryInput,
   ): DictionaryEntryInput | null {
@@ -1319,6 +1326,7 @@ export class TelegramUpdate implements OnModuleInit {
     if (
       !word ||
       !translation ||
+      this.isPlaceholderDictionaryTranslation(translation) ||
       !this.isLikelyDictionaryWord(word) ||
       this.isLikelyLeaderboardLine(word, translation)
     ) {
