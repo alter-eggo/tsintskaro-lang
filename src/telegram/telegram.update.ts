@@ -42,6 +42,14 @@ interface SpellingCorrectionByTranslation {
   translation: string;
 }
 
+interface DictionaryUpdateHandlingResult {
+  needsAiFallback: boolean;
+}
+
+interface DictionaryUpdateHandlingOptions {
+  deferUnresolvedReply?: boolean;
+}
+
 @Update()
 export class TelegramUpdate implements OnModuleInit {
   private readonly threshold: number;
@@ -372,48 +380,69 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     const directDictionaryUpdate = this.extractDirectDictionaryUpdate(text);
+    let useAiDictionaryCorrectionFallback = false;
     if (directDictionaryUpdate) {
-      await this.handleDictionaryUpdates(ctx, chatId, username, messageId, [
-        directDictionaryUpdate,
-      ]);
-      return;
-    }
-
-    const directDictionaryEntries = await this.extractDirectDictionaryEntries(
-      text,
-      chatId,
-    );
-    if (directDictionaryEntries.length > 0) {
-      await this.handleDictionaryAdditions(
+      const localUpdate = await this.handleDictionaryUpdates(
         ctx,
         chatId,
         username,
         messageId,
-        directDictionaryEntries,
+        [directDictionaryUpdate],
+        { deferUnresolvedReply: true },
       );
-      return;
+      if (!localUpdate.needsAiFallback) {
+        return;
+      }
+      useAiDictionaryCorrectionFallback = true;
+    } else {
+      useAiDictionaryCorrectionFallback =
+        this.shouldUseAiDictionaryCorrectionFallback(text);
     }
 
-    if (this.isLeaderboardRequest(text)) {
-      await this.replyWithLeaderboard(ctx, messageId);
-      return;
-    }
-
-    if (await this.replyToDictionaryLookup(ctx, text, messageId)) {
-      return;
-    }
-
-    if (this.isWorkingLinksRequest(text)) {
-      const botMemory = await this.telegramService.getBotMemory(
+    if (useAiDictionaryCorrectionFallback) {
+      this.logger.log(
+        `[Chat ${chatId}] Local dictionary correction parser was not confident; routing to AI action fallback`,
+      );
+    } else {
+      const directDictionaryEntries = await this.extractDirectDictionaryEntries(
+        text,
         chatId,
-        TelegramUpdate.BOT_MEMORY_LIMIT,
       );
-      await this.replyWithWorkingLinks(ctx, messageId, botMemory);
-      return;
+      if (directDictionaryEntries.length > 0) {
+        await this.handleDictionaryAdditions(
+          ctx,
+          chatId,
+          username,
+          messageId,
+          directDictionaryEntries,
+        );
+        return;
+      }
+
+      if (this.isLeaderboardRequest(text)) {
+        await this.replyWithLeaderboard(ctx, messageId);
+        return;
+      }
+
+      if (await this.replyToDictionaryLookup(ctx, text, messageId)) {
+        return;
+      }
+
+      if (this.isWorkingLinksRequest(text)) {
+        const botMemory = await this.telegramService.getBotMemory(
+          chatId,
+          TelegramUpdate.BOT_MEMORY_LIMIT,
+        );
+        await this.replyWithWorkingLinks(ctx, messageId, botMemory);
+        return;
+      }
     }
 
-    const needsRecentMessages = this.needsRecentMessagesContext(text);
-    const needsBotMemory = this.needsBotMemoryContext(text);
+    const needsRecentMessages =
+      !useAiDictionaryCorrectionFallback &&
+      this.needsRecentMessagesContext(text);
+    const needsBotMemory =
+      !useAiDictionaryCorrectionFallback && this.needsBotMemoryContext(text);
     const [loadedRecentMessages, botMemory, dictionaryEntries] =
       await Promise.all([
         needsRecentMessages
@@ -429,7 +458,10 @@ export class TelegramUpdate implements OnModuleInit {
               TelegramUpdate.BOT_MEMORY_LIMIT,
             )
           : Promise.resolve([]),
-        this.getDictionaryContextEntries(text),
+        this.getDictionaryContextEntries(
+          text,
+          useAiDictionaryCorrectionFallback,
+        ),
       ]);
     const recentMessages = this.limitRecentMessagesByChars(
       loadedRecentMessages,
@@ -441,12 +473,20 @@ export class TelegramUpdate implements OnModuleInit {
 
     let result;
     try {
-      result = await this.openaiService.processBotMention(
-        text,
-        recentMessages,
-        botMemory,
-        dictionaryEntries,
-      );
+      result = useAiDictionaryCorrectionFallback
+        ? await this.openaiService.processBotMention(
+            text,
+            recentMessages,
+            botMemory,
+            dictionaryEntries,
+            { forceAction: true },
+          )
+        : await this.openaiService.processBotMention(
+            text,
+            recentMessages,
+            botMemory,
+            dictionaryEntries,
+          );
     } catch (err) {
       this.logger.error(`[Chat ${chatId}] AI processBotMention failed:`, err);
       if (messageId != null) {
@@ -628,13 +668,11 @@ export class TelegramUpdate implements OnModuleInit {
   private async extractSpellingCorrectionByTranslation(
     text: string,
   ): Promise<SpellingCorrectionByTranslation | null> {
-    const body = text
-      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
-      .trim()
-      .replace(/\s+/g, ' ');
+    const instruction = this.extractDictionaryCorrectionInstruction(text);
+    if (!instruction) return null;
 
-    const match = body.match(
-      /^(?:измени|исправь|поправь|обнови)\s+(?:правописани[ея]|написани[ея]|орфографи[юя])\s+(?:слова?\s+)?(.+?)\s*(?:=|—|-|:)\s*(.+?)[.!?]*$/i,
+    const match = instruction.match(
+      /^(?:правописани[ея]|написани[ея]|орфографи[юя])\s+(?:(?:слова?|словосочетани[ея]|фраз[ыа]|выражени[ея])\s+)?(.+?)\s*(?:=|—|-|:)\s*(.+?)[.!?]*$/i,
     );
     if (!match) return null;
 
@@ -731,16 +769,33 @@ export class TelegramUpdate implements OnModuleInit {
 
   private async getDictionaryContextEntries(
     text: string,
+    includeAllMentionedEntries = false,
   ): Promise<BotDictionaryContextEntry[]> {
     const candidates = this.extractDictionaryLookupCandidates(text);
-    if (candidates.length === 0) {
-      return [];
-    }
+    const entries =
+      candidates.length > 0
+        ? await this.findDictionaryLookupEntries(
+            candidates,
+            this.isRussianToTsintskaroLookupRequest(text),
+          )
+        : [];
 
-    const entries = await this.findDictionaryLookupEntries(
-      candidates,
-      this.isRussianToTsintskaroLookupRequest(text),
-    );
+    if (includeAllMentionedEntries) {
+      const mentionedEntries =
+        await this.dictionaryService.findRelevantForPrompt(
+          [text],
+          TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT,
+        );
+      const seen = new Set(entries.map((entry) => entry.word.toLowerCase()));
+      for (const entry of mentionedEntries) {
+        if (seen.has(entry.word.toLowerCase())) continue;
+        seen.add(entry.word.toLowerCase());
+        entries.push(entry);
+        if (entries.length >= TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT) {
+          break;
+        }
+      }
+    }
 
     return entries.map((entry) => ({
       word: entry.word,
@@ -1211,49 +1266,159 @@ export class TelegramUpdate implements OnModuleInit {
   private extractDirectDictionaryUpdate(
     text: string,
   ): DictionaryUpdateInput | null {
-    const body = text
-      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
-      .trim()
-      .replace(/\s+/g, ' ');
+    const instruction = this.extractDictionaryCorrectionInstruction(text);
+    if (!instruction) return null;
 
-    const correction = body.match(
-      /^(?:измени|исправь|поправь|обнови)\s+(.+?)\s+(?:это|будет|=|—|-)\s+(.+?)\s*,?\s+а\s+не\s+(.+?)[.!?]*$/i,
+    const correction = instruction.match(
+      /^(.+?)\s+(?:это|будет|=|—|-)\s+(.+?)\s*,?\s+а\s+не\s+(.+?)[.!?]*$/i,
     );
     if (correction) {
       const translation = this.cleanDictionaryTranslation(correction[1]);
-      const newWord = this.cleanDictionaryWord(correction[2]);
-      const oldWord = this.cleanDictionaryWord(correction[3]);
+      const newWord = this.cleanDictionaryUpdateWord(correction[2]);
+      const oldWord = this.cleanDictionaryUpdateWord(correction[3]);
       if (oldWord && newWord && translation) {
         return { oldWord, newWord, translation };
       }
     }
 
-    const rename = body.match(
-      /^(?:измени|исправь|поправь|обнови)\s+(.+?)\s+(?:на|в)\s+(.+?)(?:[\s,]+(?:перевод|значит)\s+(.+))?[.!?]*$/i,
-    );
-    if (rename) {
-      const oldWord = this.cleanDictionaryWord(rename[1]);
-      const newWord = this.cleanDictionaryWord(rename[2]);
-      const translation = rename[3]
-        ? this.cleanDictionaryTranslation(rename[3])
-        : null;
-      if (oldWord && newWord) {
-        return { oldWord, newWord, translation };
-      }
-    }
-
-    const translationOnly = body.match(
-      /^(?:измени|исправь|поправь|обнови)\s+(?:перевод\s+)?(.+?)\s+(?:перевод|значит)\s+(.+?)[.!?]*$/i,
+    const translationOnly = instruction.match(
+      /^перевод\s+(?:(?:у|для|в)\s+)?(?:(?:словосочетани[еяи]|выражени[еяи]|слова?|фраз[ыае]|запис[ьи])\s+)?(.+?)\s+(?:на|в|будет|=|—|-)\s+(.+?)[.!?]*$/i,
     );
     if (translationOnly) {
-      const oldWord = this.cleanDictionaryWord(translationOnly[1]);
+      const oldWord = this.cleanDictionaryUpdateWord(translationOnly[1]);
       const translation = this.cleanDictionaryTranslation(translationOnly[2]);
       if (oldWord && translation) {
         return { oldWord, newWord: null, translation };
       }
     }
 
+    const renameInstruction =
+      this.stripLeadingDictionaryUpdateLabel(instruction);
+    const rename =
+      renameInstruction.match(
+        /^не\s+(.+?)\s*,?\s+а\s+(?:(?:правильно|нужно|надо)\s+)?(.+?)[.!?]*$/i,
+      ) ??
+      renameInstruction.match(
+        /^(?:вместо\s+)?(.+?)\s+(?:(?:нужно|надо)\s+)?(?:заменить|поменять|исправить|написать)\s+(?:на\s+)?(.+?)[.!?]*$/i,
+      ) ??
+      renameInstruction.match(
+        /^вместо\s+(.+?)\s+(?:напиши(?:те)?|поставь(?:те)?|должно\s+быть|нужно|надо)\s+(.+?)[.!?]*$/i,
+      ) ??
+      renameInstruction.match(
+        /^(.+?)\s+(?:(?:замени(?:ть)?|поменя(?:ть)?)\s+)?(?:на|в)\s+(.+?)[.!?]*$/i,
+      ) ??
+      renameInstruction.match(/^(.+?)\s*(?:→|->|=>)\s*(.+?)[.!?]*$/i) ??
+      renameInstruction.match(
+        /^(.+?)\s*[,;:]\s*(?:а\s+)?(?:правильно|должно\s+быть|нужно|надо)\s+(.+?)[.!?]*$/i,
+      );
+    if (rename) {
+      const oldWord = this.cleanDictionaryUpdateWord(rename[1]);
+      const target = this.splitDictionaryRenameTarget(rename[2]);
+      const newWord = this.cleanDictionaryUpdateWord(target.newWord);
+      const translation = target.translation
+        ? this.cleanDictionaryTranslation(target.translation)
+        : null;
+      if (oldWord && newWord) {
+        return { oldWord, newWord, translation };
+      }
+    }
+
+    const legacyTranslationOnly = instruction.match(
+      /^(?:перевод\s+)?(.+?)\s+(?:перевод|значит|означает)\s+(.+?)[.!?]*$/i,
+    );
+    if (legacyTranslationOnly) {
+      const oldWord = this.cleanDictionaryUpdateWord(legacyTranslationOnly[1]);
+      const translation = this.cleanDictionaryTranslation(
+        legacyTranslationOnly[2],
+      );
+      if (oldWord && translation) {
+        return { oldWord, newWord: null, translation };
+      }
+    }
+
     return null;
+  }
+
+  private shouldUseAiDictionaryCorrectionFallback(text: string): boolean {
+    const body = text
+      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    const hasCorrectionVerb =
+      /(?:^|[\s,.:;!?])(?:исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|измен[а-яё]*|поменя[а-яё]*|скорректир[а-яё]*)(?:$|[\s,.:;!?])/i.test(
+        body,
+      );
+    if (!hasCorrectionVerb) {
+      return false;
+    }
+
+    return /(?:словар|словосочет|выражени|фраз|запис|слов[оае](?:$|[\s,.:;!?])|перевод|правопис|написани|орфограф|ошибк|опечатк|неправильн|вместо|а\s+не|правильн|должн[а-яё]*\s+быть|раньше\s+был|теперь\s+(?:будет|должн)|заменить\s+на|поменять\s+на|→|->|=>)/i.test(
+      body,
+    );
+  }
+
+  private extractDictionaryCorrectionInstruction(text: string): string | null {
+    const body = text
+      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/^пожалуйста\s*[,;:]?\s*/i, '');
+    const command = body.match(
+      /^(?:измени|измените|изменить|исправь|исправьте|исправить|поправь|поправьте|поправить|обнови|обновите|обновить|замени|замените|заменить|поменяй|поменяйте|поменять|скорректируй|скорректируйте|скорректировать)(?:\s*,?\s*пожалуйста\s*,?\s*|\s*[:,]\s*|\s+)(.+)$/i,
+    );
+    return command?.[1]?.trim() || null;
+  }
+
+  private stripLeadingDictionaryUpdateLabel(value: string): string {
+    let result = value.trim();
+    let previous = '';
+
+    while (result !== previous) {
+      previous = result;
+      result = result
+        .replace(
+          /^(?:ошибк[уа]\s+)?в\s+(?:словосочетании|выражении|слове|фразе|записи)(?:\s*[:,]\s*|\s+)/i,
+          '',
+        )
+        .replace(
+          /^(?:(?:это|эту|само|саму)\s+)?(?:(?:правописание|написание|орфографию)\s+)?(?:словосочетани[еяи]|выражени[еяи]|слов[оае]|фраз[уаые]|запис[ьи])(?:\s*[:,]\s*|\s+)/i,
+          '',
+        )
+        .trim();
+    }
+
+    return result;
+  }
+
+  private cleanDictionaryUpdateWord(value: string): string {
+    return this.cleanDictionaryWord(
+      this.stripLeadingDictionaryUpdateLabel(value),
+    );
+  }
+
+  private splitDictionaryRenameTarget(value: string): {
+    newWord: string;
+    translation: string | null;
+  } {
+    const explicitTranslation = value.match(
+      /^(.+?)(?:\s*[,;]\s*|\s+)(?:перевод(?:ится)?|значит|означает)\s*[:=—-]?\s+(.+?)$/i,
+    );
+    if (explicitTranslation) {
+      return {
+        newWord: explicitTranslation[1],
+        translation: explicitTranslation[2],
+      };
+    }
+
+    const dashTranslation = value.match(/^(.+?)\s+(?:—|-|=)\s+(.+?)$/);
+    if (dashTranslation) {
+      return {
+        newWord: dashTranslation[1],
+        translation: dashTranslation[2],
+      };
+    }
+
+    return { newWord: value, translation: null };
   }
 
   private cleanDictionaryWord(value: string): string {
@@ -1342,7 +1507,8 @@ export class TelegramUpdate implements OnModuleInit {
     username: string,
     messageId: number | undefined,
     entries: DictionaryUpdateInput[],
-  ): Promise<void> {
+    options: DictionaryUpdateHandlingOptions = {},
+  ): Promise<DictionaryUpdateHandlingResult> {
     if (entries.length > TelegramUpdate.MAX_UPDATE_BATCH) {
       if (messageId != null) {
         await ctx.reply(
@@ -1350,7 +1516,7 @@ export class TelegramUpdate implements OnModuleInit {
           { reply_parameters: { message_id: messageId } },
         );
       }
-      return;
+      return { needsAiFallback: false };
     }
 
     const updated: string[] = [];
@@ -1407,18 +1573,22 @@ export class TelegramUpdate implements OnModuleInit {
       }
     }
 
-    if (messageId == null) return;
+    const needsAiFallback =
+      updated.length === 0 && (notFound.length > 0 || ambiguous.length > 0);
+    const result = { needsAiFallback };
+
+    if (messageId == null) return result;
 
     const lines: string[] = [];
     if (updated.length > 0) {
       lines.push('✅ поправил:');
       for (const line of updated) lines.push(`• ${line}`);
     }
-    if (notFound.length > 0) {
+    if (!options.deferUnresolvedReply && notFound.length > 0) {
       if (lines.length > 0) lines.push('');
       lines.push(`⚠️ не нашёл в словаре: ${notFound.join(', ')}`);
     }
-    if (ambiguous.length > 0) {
+    if (!options.deferUnresolvedReply && ambiguous.length > 0) {
       if (lines.length > 0) lines.push('');
       lines.push('⚠️ нашёл несколько похожих, уточни:');
       for (const line of ambiguous) lines.push(`• ${line}`);
@@ -1429,15 +1599,19 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     if (lines.length === 0) {
+      if (options.deferUnresolvedReply && needsAiFallback) {
+        return result;
+      }
       await ctx.reply('Не понял, что именно нужно поправить.', {
         reply_parameters: { message_id: messageId },
       });
-      return;
+      return result;
     }
 
     await ctx.reply(lines.join('\n'), {
       reply_parameters: { message_id: messageId },
     });
+    return result;
   }
 
   private extractBotMemoryText(text: string): string | null {

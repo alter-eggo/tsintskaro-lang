@@ -82,6 +82,10 @@ export interface BotDictionaryContextEntry {
   partOfSpeech?: string | null;
 }
 
+export interface BotMentionOptions {
+  forceAction?: boolean;
+}
+
 /** Result of processing a "Бот, ..." or "Баласи, ..." message */
 export type BotMentionResult =
   | { action: 'add_words'; entries: DictionaryEntryInput[] }
@@ -176,7 +180,7 @@ const BOT_REPLY_RESPONSE_FORMAT = {
 } as const;
 
 const BOT_ACTION_REQUEST_REGEX =
-  /(?:^|[\s,.:;!?])(?:добав[а-яё]*|внес[а-яё]*|запиш[а-яё]*|сохран[а-яё]*|запомн[а-яё]*|исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|удал[а-яё]*|убер[а-яё]*|сотр[а-яё]*)(?:$|[\s,.:;!?])/i;
+  /(?:^|[\s,.:;!?])(?:добав[а-яё]*|внес[а-яё]*|запиш[а-яё]*|сохран[а-яё]*|запомн[а-яё]*|исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|измен[а-яё]*|поменя[а-яё]*|скорректир[а-яё]*|удал[а-яё]*|убер[а-яё]*|сотр[а-яё]*)(?:$|[\s,.:;!?])/i;
 
 const BOT_ORDINARY_QUESTION_REGEX =
   /[?？]\s*$|(?:^|[\s,.:;!])(?:кто|что|где|куда|откуда|когда|как|почему|зачем|сколько|како[йеяи]|чей|можно\s+ли|правда\s+ли|умеешь\s+ли)(?:$|[\s,.:;!?])/i;
@@ -283,9 +287,10 @@ export class OpenaiService {
     recentMessages: { username: string; text: string; sentAt: Date }[] = [],
     botMemory: BotMemoryInput[] = [],
     dictionaryEntries: BotDictionaryContextEntry[] = [],
+    options: BotMentionOptions = {},
   ): Promise<BotMentionResult> {
     const dictionarySection = dictionaryEntries.length
-      ? `\nНАЙДЕННЫЕ СЛОВА В СЛОВАРЕ (используй для ответов на вопросы о значениях слов):\n${dictionaryEntries
+      ? `\nНАЙДЕННЫЕ СЛОВА В СЛОВАРЕ (используй для ответов и для выбора существующей записи при исправлении):\n${dictionaryEntries
           .map((e) => {
             const pos = e.partOfSpeech ? ` (${e.partOfSpeech})` : '';
             return `${e.word} = ${e.translation}${pos}`;
@@ -310,6 +315,10 @@ export class OpenaiService {
             .join('\n')}\n`
         : '';
 
+    const forcedActionInstruction = options.forceAction
+      ? `\nЛокальный обработчик определил, что пользователь просит изменить словарную запись, но не смог надёжно разобрать свободную формулировку. Внимательно извлеки старое слово, новое написание и/или новый перевод. Если данных достаточно, выбери update_words. Если не хватает конкретного старого или нового значения, выбери reply и задай один короткий уточняющий вопрос. Не выбирай add_words для такого запроса.\n`
+      : '';
+
     const actionSystemPrompt = `Ты помощник Общества Цинцкаро в Telegram-чате. Отвечай по-русски, дружелюбно и кратко.
 
 Выбери одно действие:
@@ -327,6 +336,7 @@ export class OpenaiService {
 Во всех остальных полях возвращай пустой массив или null. Если запрос нельзя безопасно выполнить как действие, выбери reply и объясни это в message.
 
 Для слов используй нижний регистр, не выдумывай переводы и сохраняй все явно указанные значения. Массовое удаление запрещено: выбери reply и напиши, что нужно перечислить до 10 конкретных слов.
+${forcedActionInstruction}
 
 В reply пиши 3–4 предложения, для пересказа — максимум 6. Для цинцкарских переводов используй только переданный словарь; если слова нет, честно скажи об этом. Для вопросов о памяти и переписке используй только соответствующие разделы контекста. Если фактов недостаточно, попроси уточнение.`;
 
@@ -336,11 +346,13 @@ export class OpenaiService {
       recentMessages: recentMessages.length,
       memoryEntries: botMemory.length,
       dictionaryEntries: dictionaryEntries.length,
+      forceAction: options.forceAction === true,
     };
 
     if (
-      BOT_ORDINARY_QUESTION_REGEX.test(text) ||
-      !BOT_ACTION_REQUEST_REGEX.test(text)
+      !options.forceAction &&
+      (BOT_ORDINARY_QUESTION_REGEX.test(text) ||
+        !BOT_ACTION_REQUEST_REGEX.test(text))
     ) {
       return this.createConversationalReply(
         text,

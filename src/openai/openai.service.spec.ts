@@ -211,6 +211,65 @@ describe('OpenaiService requests', () => {
     );
   });
 
+  it('forces the action agent for a dictionary correction fallback', async () => {
+    const { service, create, usageService } = makeService();
+    create.mockResolvedValueOnce(
+      completion(
+        JSON.stringify({
+          action: 'update_words',
+          entries: [
+            {
+              word: null,
+              translation: null,
+              partOfSpeech: null,
+              oldWord: 'яначчынын дâ шââтӱ',
+              newWord: 'яланчынын дâ шââтӱ',
+            },
+          ],
+          words: [],
+          text: null,
+          message: null,
+        }),
+      ),
+    );
+
+    const result = await service.processBotMention(
+      'Баласи, можешь исправить ошибку в словарной записи?',
+      [],
+      [],
+      [
+        {
+          word: 'яначчынын дâ шââтӱ',
+          translation: 'подтверждение правильности слов',
+        },
+      ],
+      { forceAction: true },
+    );
+
+    expect(result).toEqual({
+      action: 'update_words',
+      entries: [
+        {
+          oldWord: 'яначчынын дâ шââтӱ',
+          newWord: 'яланчынын дâ шââтӱ',
+          translation: null,
+          partOfSpeech: undefined,
+        },
+      ],
+    });
+    expect(create).toHaveBeenCalledTimes(1);
+    const request = create.mock.calls[0][0] as any;
+    expect(request.response_format.json_schema.name).toBe('bot_mention_action');
+    expect(request.messages[0].content).toContain(
+      'Локальный обработчик определил',
+    );
+    expect(usageService.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ forceAction: true }),
+      }),
+    );
+  });
+
   it('repairs an action response that has no user-facing message', async () => {
     const { service, create } = makeService();
     create

@@ -24,6 +24,7 @@ describe('TelegramUpdate bot mentions', () => {
       })),
       findWord: jest.fn(async () => undefined),
       findByTranslation: jest.fn(async () => []),
+      findRelevantForPrompt: jest.fn(async () => []),
       getLeaderboard: jest.fn(async () => [
         { username: 'anonymous', wordsCount: 410 },
       ]),
@@ -646,6 +647,220 @@ describe('TelegramUpdate bot mentions', () => {
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
     expect(ctx.reply).toHaveBeenCalledWith(
       '⚠️ не нашёл в словаре слово с переводом «укроп». Не стал создавать новую запись.',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it.each([
+    [
+      'Баласи, исправь словосочетание яначчынын дâ шââтӱ на яланчынын дâ шââтӱ - говорилось после чихания собеседника, как подтверждение правильности слов',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      'говорилось после чихания собеседника, как подтверждение правильности слов',
+    ],
+    [
+      'Баласи, пожалуйста, замените фразу яначчынын дâ шââтӱ на яланчынын дâ шââтӱ, перевод: подтверждение правильности слов',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      'подтверждение правильности слов',
+    ],
+    [
+      'Бот, поправьте, пожалуйста, в словосочетании яначчынын дâ шââтӱ: должно быть яланчынын дâ шââтӱ — подтверждение правильности слов',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      'подтверждение правильности слов',
+    ],
+    [
+      'Баласи, поменяй: не яначчынын дâ шââтӱ, а правильно яланчынын дâ шââтӱ',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      null,
+    ],
+    [
+      'Баласи, исправьте пожалуйста написание словосочетания яначчынын дâ шââтӱ на яланчынын дâ шââтӱ',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      null,
+    ],
+    [
+      'Бот, скорректируйте выражение яначчынын дâ шââтӱ нужно заменить на яланчынын дâ шââтӱ - подтверждение правильности слов',
+      'яначчынын дâ шââтӱ',
+      'яланчынын дâ шââтӱ',
+      'подтверждение правильности слов',
+    ],
+  ])(
+    'understands conversational dictionary corrections: %s',
+    async (text, oldWord, newWord, translation) => {
+      const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+      await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
+
+      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(dictionaryService.updateWord).toHaveBeenCalledWith({
+        oldWord,
+        newWord,
+        translation,
+        partOfSpeech: undefined,
+        updatedBy: 'AAlxnv',
+      });
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('✅ поправил:'),
+        { reply_parameters: { message_id: 123 } },
+      );
+    },
+  );
+
+  it('understands a natural command that only changes a translation', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправьте перевод словосочетания яланчынын дâ шââтӱ на подтверждение правильности слов',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
+      oldWord: 'яланчынын дâ шââтӱ',
+      newWord: null,
+      translation: 'подтверждение правильности слов',
+      partOfSpeech: undefined,
+      updatedBy: 'AAlxnv',
+    });
+  });
+
+  it('falls back to the AI action agent for an unparsed dictionary correction', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const text =
+      'Баласи, можно, пожалуйста, поправить ошибку в записи: раньше было яначчынын дâ шââтӱ, а теперь здесь должно стоять яланчынын дâ шââтӱ';
+    const dictionaryEntry = {
+      word: 'яначчынын дâ шââтӱ',
+      translation: 'подтверждение правильности слов',
+      partOfSpeech: 'словосочетание',
+    };
+    dictionaryService.findRelevantForPrompt.mockResolvedValueOnce([
+      dictionaryEntry,
+    ]);
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'update_words',
+      entries: [
+        {
+          oldWord: 'яначчынын дâ шââтӱ',
+          newWord: 'яланчынын дâ шââтӱ',
+          translation: null,
+        },
+      ],
+    } as any);
+
+    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
+
+    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.findRelevantForPrompt).toHaveBeenCalledWith(
+      [text],
+      5,
+    );
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      text,
+      [],
+      [],
+      [dictionaryEntry],
+      { forceAction: true },
+    );
+    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
+      oldWord: 'яначчынын дâ шââтӱ',
+      newWord: 'яланчынын дâ шââтӱ',
+      translation: null,
+      partOfSpeech: undefined,
+      updatedBy: 'AAlxnv',
+    });
+  });
+
+  it('falls back to AI when a locally parsed old word is not found', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const text =
+      'Баласи, исправь термин яначчынын дâ шââтӱ на яланчынын дâ шââтӱ';
+    const dictionaryEntry = {
+      word: 'яначчынын дâ шââтӱ',
+      translation: 'подтверждение правильности слов',
+      partOfSpeech: 'словосочетание',
+    };
+    dictionaryService.updateWord.mockResolvedValueOnce({
+      status: 'not_found',
+      requestedOldWord: 'термин яначчынын дâ шââтӱ',
+    } as any);
+    dictionaryService.findRelevantForPrompt.mockResolvedValueOnce([
+      dictionaryEntry,
+    ]);
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'update_words',
+      entries: [
+        {
+          oldWord: 'яначчынын дâ шââтӱ',
+          newWord: 'яланчынын дâ шââтӱ',
+          translation: null,
+        },
+      ],
+    } as any);
+
+    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
+
+    expect(dictionaryService.updateWord).toHaveBeenNthCalledWith(1, {
+      oldWord: 'термин яначчынын дâ шââтӱ',
+      newWord: 'яланчынын дâ шââтӱ',
+      translation: null,
+      partOfSpeech: undefined,
+      updatedBy: 'AAlxnv',
+    });
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      text,
+      [],
+      [],
+      [dictionaryEntry],
+      { forceAction: true },
+    );
+    expect(dictionaryService.updateWord).toHaveBeenNthCalledWith(2, {
+      oldWord: 'яначчынын дâ шââтӱ',
+      newWord: 'яланчынын дâ шââтӱ',
+      translation: null,
+      partOfSpeech: undefined,
+      updatedBy: 'AAlxnv',
+    });
+    expect(ctx.reply).not.toHaveBeenCalledWith(
+      expect.stringContaining('не нашёл в словаре'),
+      expect.anything(),
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('✅ поправил:'),
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('lets the AI fallback ask for clarification instead of guessing', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const text =
+      'Баласи, можешь исправить ошибку в словарной записи, пожалуйста?';
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'reply',
+      message: 'Напишите, пожалуйста, старое и правильное новое значение.',
+    });
+
+    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
+
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      text,
+      [],
+      [],
+      [],
+      { forceAction: true },
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Напишите, пожалуйста, старое и правильное новое значение.',
       { reply_parameters: { message_id: 123 } },
     );
   });
