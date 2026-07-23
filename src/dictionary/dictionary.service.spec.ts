@@ -63,3 +63,87 @@ describe('DictionaryService relevant prompt entries', () => {
     ).resolves.toEqual([]);
   });
 });
+
+describe('DictionaryService word upserts', () => {
+  const makeService = (rows: any[]) => {
+    const repo = {
+      findOne: jest.fn(async ({ where: { word } }) =>
+        rows.find((row) => row.word === word),
+      ),
+      find: jest.fn(async () => rows),
+      save: jest.fn(async (row) => row),
+      create: jest.fn((row) => ({ id: rows.length + 1, ...row })),
+    };
+
+    return { service: new DictionaryService(repo as any), repo };
+  };
+
+  it('recognizes an existing word with mixed Latin and Cyrillic letters', async () => {
+    const existing = {
+      id: 1,
+      word: 'сŷпŷрджâ',
+      translation: 'веник',
+      partOfSpeech: null,
+      source: 'etalon',
+      addedBy: null,
+    };
+    const { service, repo } = makeService([existing]);
+
+    const result = await service.upsertWord({
+      word: 'сŷпŷpджâ',
+      translation: 'веник',
+    });
+
+    expect(result).toEqual({
+      created: false,
+      word: existing,
+      translationAdded: false,
+    });
+    expect(repo.create).not.toHaveBeenCalled();
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  it('adds only translation variants that are not already present', async () => {
+    const existing = {
+      id: 1,
+      word: 'ширин',
+      translation: 'сладкий, сахарный',
+      partOfSpeech: null,
+      source: 'etalon',
+      addedBy: null,
+    };
+    const { service, repo } = makeService([existing]);
+
+    const result = await service.upsertWord({
+      word: 'Ширин',
+      translation: 'сахарный; приятный; приятный',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.translationAdded).toBe(true);
+    expect(result.addedTranslation).toBe('приятный');
+    expect(result.word.translation).toBe('приятный; сладкий, сахарный');
+    expect(repo.save).toHaveBeenCalledWith(existing);
+  });
+
+  it('does not write when every incoming translation variant already exists', async () => {
+    const existing = {
+      id: 1,
+      word: 'âйсûч',
+      translation: 'меньше; нехватка',
+      partOfSpeech: null,
+      source: 'chat',
+      addedBy: 'user',
+    };
+    const { service, repo } = makeService([existing]);
+
+    const result = await service.upsertWord({
+      word: 'âйсûч',
+      translation: 'меньше, нехватка',
+    });
+
+    expect(result.translationAdded).toBe(false);
+    expect(result.word.translation).toBe('меньше; нехватка');
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+});

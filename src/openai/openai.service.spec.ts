@@ -1,8 +1,8 @@
 import { OpenaiService } from './openai.service';
 
-describe('OpenaiService token-efficient requests', () => {
+describe('OpenaiService requests', () => {
   const completion = (content: string) => ({
-    model: 'gpt-5.4-mini-2026-03-17',
+    model: 'gpt-5.5',
     choices: [{ message: { content, refusal: null } }],
     usage: {
       prompt_tokens: 900,
@@ -16,9 +16,9 @@ describe('OpenaiService token-efficient requests', () => {
   const makeService = () => {
     const configValues: Record<string, unknown> = {
       openaiKey: 'test-key',
-      openaiBotModel: 'gpt-5.4-mini',
-      openaiExtractionModel: 'gpt-5.4-nano',
-      openaiReportModel: 'gpt-5.4-mini',
+      openaiBotModel: 'gpt-5.5',
+      openaiExtractionModel: 'gpt-5.5',
+      openaiReportModel: 'gpt-5.5',
       openaiBotMaxCompletionTokens: 800,
       openaiExtractionMaxCompletionTokens: 3000,
       openaiReportMaxCompletionTokens: 4000,
@@ -80,7 +80,7 @@ describe('OpenaiService token-efficient requests', () => {
       100,
     );
     const request = create.mock.calls[0][0] as any;
-    expect(request.model).toBe('gpt-5.4-mini');
+    expect(request.model).toBe('gpt-5.5');
     expect(request.reasoning_effort).toBe('none');
     expect(request.max_completion_tokens).toBe(4000);
     expect(request.prompt_cache_key).toBe('tsintskaro:discussion_report:v2');
@@ -108,6 +108,49 @@ describe('OpenaiService token-efficient requests', () => {
         }),
       }),
     );
+  });
+
+  it('uses GPT-5.5 to preserve complete dictionary phrases', async () => {
+    const { service, create } = makeService();
+    create.mockResolvedValueOnce(
+      completion(
+        JSON.stringify({
+          entries: [
+            {
+              word: 'аралыхги бозмах',
+              translation: 'испортить отношения',
+              partOfSpeech: null,
+            },
+            {
+              word: 'суда бохгулмах',
+              translation: 'утонуть в воде',
+              partOfSpeech: null,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const result = await service.normalizeDictionaryEntries(
+      'Баласи, добавь:\nАралыхги бозмах-испортить отношения,\nСуда бохгулмах- утонуть в воде',
+    );
+
+    expect(result).toEqual([
+      {
+        word: 'аралыхги бозмах',
+        translation: 'испортить отношения',
+        partOfSpeech: null,
+      },
+      {
+        word: 'суда бохгулмах',
+        translation: 'утонуть в воде',
+        partOfSpeech: null,
+      },
+    ]);
+    const request = create.mock.calls[0][0] as any;
+    expect(request.model).toBe('gpt-5.5');
+    expect(request.reasoning_effort).toBe('none');
+    expect(request.response_format.json_schema.name).toBe('dictionary_entries');
   });
 
   it('uses a simple reply schema for ordinary conversation', async () => {

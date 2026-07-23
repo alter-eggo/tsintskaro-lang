@@ -265,11 +265,11 @@ export class OpenaiService {
     this.openai = new OpenAI({
       apiKey: this.config.get('openaiKey'),
     });
-    this.botModel = this.config.get<string>('openaiBotModel') || 'gpt-5.4-mini';
+    this.botModel = this.config.get<string>('openaiBotModel') || 'gpt-5.5';
     this.extractionModel =
-      this.config.get<string>('openaiExtractionModel') || 'gpt-5.4-nano';
+      this.config.get<string>('openaiExtractionModel') || 'gpt-5.5';
     this.reportModel =
-      this.config.get<string>('openaiReportModel') || 'gpt-5.4-mini';
+      this.config.get<string>('openaiReportModel') || 'gpt-5.5';
     this.botMaxCompletionTokens =
       this.config.get<number>('openaiBotMaxCompletionTokens') || 800;
     this.extractionMaxCompletionTokens =

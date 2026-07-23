@@ -1136,7 +1136,11 @@ export class TelegramUpdate implements OnModuleInit {
           addedBy: username,
         });
         const posTag = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
-        const line = `${upserted.word.word} — ${entry.translation}${posTag}`;
+        const displayedTranslation =
+          !upserted.created && upserted.translationAdded
+            ? upserted.addedTranslation || entry.translation
+            : entry.translation;
+        const line = `${upserted.word.word} — ${displayedTranslation}${posTag}`;
         if (upserted.created) {
           created.push(line);
         } else if (upserted.translationAdded) {

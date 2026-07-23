@@ -33,10 +33,9 @@ export default () => {
       ? process.env.TELEGRAM_BOT_TOKEN_DEV
       : process.env.TELEGRAM_BOT_TOKEN,
     openaiKey: process.env.OPENAI_API_KEY,
-    openaiBotModel: process.env.OPENAI_MODEL_BOT || 'gpt-5.4-mini',
-    openaiExtractionModel:
-      process.env.OPENAI_MODEL_EXTRACTION || 'gpt-5.4-nano',
-    openaiReportModel: process.env.OPENAI_MODEL_REPORT || 'gpt-5.4-mini',
+    openaiBotModel: process.env.OPENAI_MODEL_BOT || 'gpt-5.5',
+    openaiExtractionModel: process.env.OPENAI_MODEL_EXTRACTION || 'gpt-5.5',
+    openaiReportModel: process.env.OPENAI_MODEL_REPORT || 'gpt-5.5',
     openaiBotMaxCompletionTokens: positiveInt(
       process.env.OPENAI_MAX_COMPLETION_TOKENS_BOT,
       800,

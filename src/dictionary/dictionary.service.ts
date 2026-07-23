@@ -19,6 +19,13 @@ export interface UpsertWordInput {
   addedBy?: string | null;
 }
 
+export interface UpsertWordResult {
+  created: boolean;
+  word: Word;
+  translationAdded: boolean;
+  addedTranslation?: string;
+}
+
 export interface UpdateWordInput {
   oldWord: string;
   newWord?: string | null;
@@ -93,27 +100,54 @@ export class DictionaryService {
       .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '');
   }
 
-  private mergeTranslations(existing: string, incoming: string): string {
+  private mergeTranslations(
+    existing: string,
+    incoming: string,
+  ): { merged: string; added?: string } {
     const current = existing.trim();
     const next = incoming.trim();
-    if (!current) return next;
-    if (!next) return current;
+    if (!current) return next ? { merged: next, added: next } : { merged: '' };
+    if (!next) return { merged: current };
 
     const currentNormalized = this.normalizeTranslationForCompare(current);
     const nextNormalized = this.normalizeTranslationForCompare(next);
-    const existingParts = current
-      .split(/\s*(?:;|\n|\/)\s*/g)
-      .map((part) => this.normalizeTranslationForCompare(part))
-      .filter((part) => part.length > 0);
-
-    if (
-      currentNormalized === nextNormalized ||
-      existingParts.includes(nextNormalized)
-    ) {
-      return current;
+    if (currentNormalized === nextNormalized) {
+      return { merged: current };
     }
 
-    return `${next}; ${current}`;
+    const existingParts = new Set(
+      this.splitTranslationParts(current).map(({ normalized }) => normalized),
+    );
+    const missingParts: string[] = [];
+    const incomingParts = new Set<string>();
+
+    for (const part of this.splitTranslationParts(next)) {
+      if (existingParts.has(part.normalized)) continue;
+      if (incomingParts.has(part.normalized)) continue;
+      incomingParts.add(part.normalized);
+      missingParts.push(part.value);
+    }
+
+    if (missingParts.length === 0) {
+      return { merged: current };
+    }
+
+    const added = missingParts.join('; ');
+    return { merged: `${added}; ${current}`, added };
+  }
+
+  private splitTranslationParts(
+    translation: string,
+  ): Array<{ value: string; normalized: string }> {
+    return translation
+      .split(/\s*(?:;|,|\n|\/)\s*/g)
+      .map((value) => ({
+        value: value.trim(),
+        normalized: this.normalizeTranslationForCompare(value),
+      }))
+      .filter(
+        ({ value, normalized }) => value.length > 0 && normalized.length > 0,
+      );
   }
 
   private async resolveWordEntity(
@@ -403,29 +437,37 @@ export class DictionaryService {
     };
   }
 
-  async upsertWord(
-    input: UpsertWordInput,
-  ): Promise<{ created: boolean; word: Word; translationAdded: boolean }> {
-    const normalizedWord = input.word.toLowerCase().trim();
-    const existing = await this.wordRepo.findOne({
-      where: { word: normalizedWord },
-    });
+  async upsertWord(input: UpsertWordInput): Promise<UpsertWordResult> {
+    const normalizedWord = this.normalizeWordInput(input.word);
+    const resolved = await this.resolveWordEntity(normalizedWord);
+    const existing = resolved.entity;
 
     if (existing) {
-      const previousTranslation = existing.translation;
-      existing.translation = this.mergeTranslations(
+      const translationMerge = this.mergeTranslations(
         existing.translation,
         input.translation,
       );
-      if (input.partOfSpeech !== undefined && !existing.partOfSpeech) {
-        existing.partOfSpeech = input.partOfSpeech;
+      existing.translation = translationMerge.merged;
+      const translationAdded = translationMerge.added !== undefined;
+      const partOfSpeech = input.partOfSpeech?.trim();
+      const partOfSpeechAdded = Boolean(partOfSpeech && !existing.partOfSpeech);
+
+      if (partOfSpeechAdded) {
+        existing.partOfSpeech = partOfSpeech!;
       }
+      if (!translationAdded && !partOfSpeechAdded) {
+        return { created: false, word: existing, translationAdded: false };
+      }
+
       const saved = await this.wordRepo.save(existing);
       this.invalidateCache();
       return {
         created: false,
         word: saved,
-        translationAdded: saved.translation !== previousTranslation,
+        translationAdded,
+        ...(translationMerge.added
+          ? { addedTranslation: translationMerge.added }
+          : {}),
       };
     }
 

@@ -6,6 +6,7 @@ describe('TelegramUpdate bot mentions', () => {
       upsertWord: jest.fn(async (input) => ({
         created: true,
         translationAdded: true,
+        addedTranslation: input.translation,
         word: {
           word: input.word,
           translation: input.translation,
@@ -307,6 +308,33 @@ describe('TelegramUpdate bot mentions', () => {
       partOfSpeech: null,
       addedBy: 'AAlxnv',
     });
+  });
+
+  it('reports only the translation variant that was actually added', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate();
+    dictionaryService.upsertWord.mockResolvedValueOnce({
+      created: false,
+      translationAdded: true,
+      addedTranslation: 'приятный',
+      word: {
+        word: 'ширин',
+        translation: 'приятный; сладкий, сахарный',
+        partOfSpeech: null,
+      },
+    });
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Бот, добавь Ширин - сахарный; приятный',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '➕ добавил перевод к слову:\n• ширин — приятный',
+      { reply_parameters: { message_id: 123 } },
+    );
   });
 
   it('adds direct word pairs written with colons', async () => {
