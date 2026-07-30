@@ -103,6 +103,35 @@ describe('DictionaryService word upserts', () => {
     expect(repo.save).not.toHaveBeenCalled();
   });
 
+  it('does not merge a new visible spelling through broad lookup folding', async () => {
+    const existing = {
+      id: 1,
+      word: 'сŷртмах',
+      translation: 'намазать',
+      partOfSpeech: null,
+      source: 'etalon',
+      addedBy: null,
+    };
+    const { service, repo } = makeService([existing]);
+
+    const result = await service.upsertWord({
+      word: 'суртмах',
+      translation: 'другое значение',
+      addedBy: 'user',
+    });
+
+    expect(result.created).toBe(true);
+    expect(result.word.word).toBe('суртмах');
+    expect(existing.translation).toBe('намазать');
+    expect(repo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        word: 'суртмах',
+        translation: 'другое значение',
+      }),
+    );
+    expect(repo.save).not.toHaveBeenCalledWith(existing);
+  });
+
   it('adds only translation variants that are not already present', async () => {
     const existing = {
       id: 1,
