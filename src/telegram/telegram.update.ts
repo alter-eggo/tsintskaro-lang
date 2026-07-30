@@ -604,12 +604,28 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     // action === 'add_words'
+    const groundedEntries = this.filterGroundedDictionaryEntries(
+      text,
+      result.entries,
+      chatId,
+      'AI action',
+    );
+    if (groundedEntries.length === 0) {
+      if (messageId != null) {
+        await ctx.reply(
+          '⚠️ Не стал сохранять запись: распознанные слово и перевод не совпали с текстом сообщения. Напиши в формате «слово — перевод».',
+          { reply_parameters: { message_id: messageId } },
+        );
+      }
+      return;
+    }
+
     await this.handleDictionaryAdditions(
       ctx,
       chatId,
       username,
       messageId,
-      result.entries,
+      groundedEntries,
     );
   }
 
@@ -627,11 +643,17 @@ export class TelegramUpdate implements OnModuleInit {
     try {
       const aiEntries =
         await this.openaiService.normalizeDictionaryEntries(body);
-      if (aiEntries.length > localEntries.length) {
+      const groundedAiEntries = this.filterGroundedDictionaryEntries(
+        body,
+        aiEntries,
+        chatId,
+        'AI normalizer',
+      );
+      if (groundedAiEntries.length > localEntries.length) {
         this.logger.log(
-          `[Chat ${chatId}] AI dictionary parser extracted ${aiEntries.length} entries instead of ${localEntries.length}`,
+          `[Chat ${chatId}] AI dictionary parser extracted ${groundedAiEntries.length} grounded entries instead of ${localEntries.length}`,
         );
-        return this.deduplicateDictionaryEntries(aiEntries);
+        return this.deduplicateDictionaryEntries(groundedAiEntries);
       }
     } catch (err) {
       this.logger.warn(
@@ -1071,6 +1093,53 @@ export class TelegramUpdate implements OnModuleInit {
     return deduplicated;
   }
 
+  private filterGroundedDictionaryEntries(
+    sourceText: string,
+    entries: DictionaryEntryInput[],
+    chatId: number,
+    source: string,
+  ): DictionaryEntryInput[] {
+    const grounded = entries.filter((entry) =>
+      this.isDictionaryEntryGroundedInText(sourceText, entry),
+    );
+    if (grounded.length !== entries.length) {
+      const rejected = entries
+        .filter((entry) => !grounded.includes(entry))
+        .map((entry) => `${entry.word} = ${entry.translation}`)
+        .join('; ');
+      this.logger.warn(
+        `[Chat ${chatId}] Rejected ungrounded ${source} dictionary entries: ${rejected}`,
+      );
+    }
+    return grounded;
+  }
+
+  private isDictionaryEntryGroundedInText(
+    sourceText: string,
+    entry: DictionaryEntryInput,
+  ): boolean {
+    const source = this.normalizeDictionaryGroundingText(sourceText);
+    const word = this.normalizeDictionaryGroundingText(entry.word);
+    const translation = this.normalizeDictionaryGroundingText(
+      entry.translation,
+    );
+    return (
+      word.length > 0 &&
+      translation.length > 0 &&
+      source.includes(word) &&
+      source.includes(translation)
+    );
+  }
+
+  private normalizeDictionaryGroundingText(value: string): string {
+    return this.normalizeCyrillicLookalikes(
+      value.normalize('NFC').toLowerCase(),
+    )
+      .replace(/[\p{P}\p{S}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   private normalizeCyrillicLookalikes(value: string): string {
     return value
       .replace(/a/g, 'а')
@@ -1107,7 +1176,9 @@ export class TelegramUpdate implements OnModuleInit {
     line: string,
   ): DictionaryEntryInput | null {
     const trimmed = this.stripDictionaryPairIntent(
-      line.trim().replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ''),
+      this.normalizeDictionarySeparatorCharacters(line)
+        .trim()
+        .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ''),
     );
     const match =
       trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
@@ -1127,6 +1198,10 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     return { word, translation, partOfSpeech: null };
+  }
+
+  private normalizeDictionarySeparatorCharacters(value: string): string {
+    return value.replace(/[\u2010-\u2015\u2212]/g, '-');
   }
 
   private hasDictionaryAddIntent(text: string): boolean {
