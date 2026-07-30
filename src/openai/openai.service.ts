@@ -4,6 +4,9 @@ import OpenAI from 'openai';
 import type {
   ChatCompletion,
   ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionMessageFunctionToolCall,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
 } from 'openai/resources/chat/completions';
 import { DictionaryService } from '../dictionary/dictionary.service';
 import { OpenaiUsagePurpose, OpenaiUsageService } from './openai-usage.service';
@@ -178,6 +181,41 @@ const BOT_REPLY_RESPONSE_FORMAT = {
     },
   },
 } as const;
+
+const BOT_DICTIONARY_SEARCH_TOOL_NAME = 'search_dictionary';
+
+const BOT_DICTIONARY_SEARCH_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: BOT_DICTIONARY_SEARCH_TOOL_NAME,
+    description:
+      'Ищет слово или фразу в реальном словаре цинцкарского языка. Обязательно используй этот инструмент перед любым утверждением о наличии, отсутствии, значении или переводе слова, даже если вопрос сформулирован косвенно или разговорно.',
+    strict: true,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'Только искомое слово или фраза без обращения к боту и без служебных слов вопроса.',
+        },
+        direction: {
+          type: 'string',
+          enum: ['both', 'tsintskaro_to_russian', 'russian_to_tsintskaro'],
+          description:
+            'both, если направление неясно; tsintskaro_to_russian для поиска цинцкарского слова; russian_to_tsintskaro для поиска по русскому переводу.',
+        },
+      },
+      required: ['query', 'direction'],
+    },
+  },
+};
+
+type DictionarySearchDirection =
+  | 'both'
+  | 'tsintskaro_to_russian'
+  | 'russian_to_tsintskaro';
 
 const BOT_ACTION_REQUEST_REGEX =
   /(?:^|[\s,.:;!?])(?:добав[а-яё]*|внес[а-яё]*|запиш[а-яё]*|сохран[а-яё]*|запомн[а-яё]*|исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|измен[а-яё]*|поменя[а-яё]*|скорректир[а-яё]*|удал[а-яё]*|убер[а-яё]*|сотр[а-яё]*)(?:$|[\s,.:;!?])/i;
@@ -503,35 +541,89 @@ ${forcedActionInstruction}
 
 Автоматические лайки и реакции бота отключены: просьбу не ставить лайки можно спокойно подтвердить. Не обещай изменить другие функции или код самостоятельно. Не утверждай, что запомнил факт навсегда, если он не передан в разделе памяти.
 
-Используй историю, память и словарь только когда соответствующие разделы есть во входе. Для перевода цинцкарских слов опирайся только на переданный словарь; если данных нет, честно скажи об этом.`;
+Используй историю и память только когда соответствующие разделы есть во входе.
+
+Для любого вопроса, просьбы, сомнения или замечания о цинцкарском слове, русском переводе, значении, написании или наличии слова в словаре:
+- если нужная запись уже дана в разделе НАЙДЕННЫЕ СЛОВА В СЛОВАРЕ, используй её;
+- иначе обязательно вызови search_dictionary, даже если запрос разговорный, косвенный, с ошибками или без слов «перевод» и «словарь»;
+- не утверждай, что слово есть или отсутствует, и не предлагай перевод по памяти модели без записи из раздела словаря или результата инструмента;
+- если направление перевода неясно, ищи в обе стороны;
+- если пользователь спрашивает несколько слов, вызови инструмент для каждого из них.
+
+После результата инструмента ответь непосредственно на исходную просьбу. Пустой список matches означает, что точного совпадения по выполненному запросу нет; не выдумывай его.`;
+    const messages: ChatCompletionMessageParam[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ];
+    const detail = `${responseMode === 'repair' ? 'Восстановление ответа' : 'Ответ'} бота: ${text}`;
     const response = await this.createChatCompletion(
       'bot_mention',
-      `${responseMode === 'repair' ? 'Восстановление ответа' : 'Ответ'} бота: ${text}`,
+      detail,
       {
         model: this.botModel,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+        messages,
         response_format: BOT_REPLY_RESPONSE_FORMAT,
+        tools: [BOT_DICTIONARY_SEARCH_TOOL],
+        tool_choice: 'auto',
         reasoning_effort: 'none',
         max_completion_tokens: this.botMaxCompletionTokens,
-        prompt_cache_key: 'tsintskaro:bot_reply:v3',
+        prompt_cache_key: 'tsintskaro:bot_reply:v4',
       },
-      { ...contextMetadata, responseMode },
+      {
+        ...contextMetadata,
+        responseMode,
+        dictionaryToolStage: 'decision',
+      },
     );
 
-    const refusal = response.choices[0].message.refusal?.trim();
-    if (refusal) {
-      return { action: 'reply', message: refusal };
-    }
+    const responseMessage = response.choices[0].message;
+    const toolCalls = this.getDictionarySearchToolCalls(response).slice(0, 8);
+    if (toolCalls.length > 0) {
+      messages.push({
+        role: 'assistant',
+        content: responseMessage.content,
+        refusal: responseMessage.refusal,
+        tool_calls: toolCalls,
+      });
 
-    const parsed = this.parseJsonObject(
-      response.choices[0].message.content || '',
-    );
-    const message = this.firstNonEmptyString(parsed?.message);
-    if (message) {
-      return { action: 'reply', message };
+      for (const toolCall of toolCalls) {
+        const toolResult = await this.executeDictionarySearchTool(toolCall);
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(toolResult),
+        });
+      }
+
+      const finalResponse = await this.createChatCompletion(
+        'bot_mention',
+        detail,
+        {
+          model: this.botModel,
+          messages,
+          response_format: BOT_REPLY_RESPONSE_FORMAT,
+          tools: [BOT_DICTIONARY_SEARCH_TOOL],
+          tool_choice: 'none',
+          reasoning_effort: 'none',
+          max_completion_tokens: this.botMaxCompletionTokens,
+          prompt_cache_key: 'tsintskaro:bot_reply:v4',
+        },
+        {
+          ...contextMetadata,
+          responseMode,
+          dictionaryToolStage: 'answer',
+          dictionaryToolCalls: toolCalls.length,
+        },
+      );
+      const finalMessage = this.extractConversationalReply(finalResponse);
+      if (finalMessage) {
+        return { action: 'reply', message: finalMessage };
+      }
+    } else {
+      const message = this.extractConversationalReply(response);
+      if (message) {
+        return { action: 'reply', message };
+      }
     }
 
     if (/(?:ты\s+тут|ты\s+здесь|на\s+связи)/i.test(text)) {
@@ -547,6 +639,80 @@ ${forcedActionInstruction}
       action: 'reply',
       message:
         'Я здесь, но сейчас не получилось сформировать ответ. Попробуй написать ещё раз.',
+    };
+  }
+
+  private extractConversationalReply(response: ChatCompletion): string | null {
+    const refusal = response.choices[0].message.refusal?.trim();
+    if (refusal) return refusal;
+
+    const parsed = this.parseJsonObject(
+      response.choices[0].message.content || '',
+    );
+    return this.firstNonEmptyString(parsed?.message);
+  }
+
+  private getDictionarySearchToolCalls(
+    response: ChatCompletion,
+  ): ChatCompletionMessageFunctionToolCall[] {
+    return (response.choices[0].message.tool_calls ?? []).filter(
+      (toolCall): toolCall is ChatCompletionMessageFunctionToolCall =>
+        toolCall.type === 'function' &&
+        toolCall.function.name === BOT_DICTIONARY_SEARCH_TOOL_NAME,
+    );
+  }
+
+  private async executeDictionarySearchTool(
+    toolCall: ChatCompletionMessageFunctionToolCall,
+  ): Promise<Record<string, unknown>> {
+    const parsed = this.parseJsonObject(toolCall.function.arguments);
+    const query = this.firstNonEmptyString(parsed?.query)?.slice(0, 120);
+    const rawDirection = parsed?.direction;
+    const direction: DictionarySearchDirection =
+      rawDirection === 'tsintskaro_to_russian' ||
+      rawDirection === 'russian_to_tsintskaro'
+        ? rawDirection
+        : 'both';
+
+    if (!query) {
+      return {
+        searched: false,
+        query: null,
+        direction,
+        matchCount: 0,
+        matches: [],
+        error: 'Не указано слово или фраза для поиска.',
+      };
+    }
+
+    const matches: BotDictionaryContextEntry[] = [];
+    if (direction !== 'russian_to_tsintskaro') {
+      const directMatch = await this.dictionaryService.findWord(query);
+      if (directMatch) matches.push(directMatch);
+    }
+    if (direction !== 'tsintskaro_to_russian') {
+      matches.push(...(await this.dictionaryService.findByTranslation(query)));
+    }
+
+    const uniqueMatches = [
+      ...new Map(
+        matches.map((entry) => [
+          `${entry.word.toLowerCase()}\u0000${entry.translation.toLowerCase()}`,
+          {
+            word: entry.word,
+            translation: entry.translation,
+            partOfSpeech: entry.partOfSpeech ?? null,
+          },
+        ]),
+      ).values(),
+    ].slice(0, 10);
+
+    return {
+      searched: true,
+      query,
+      direction,
+      matchCount: uniqueMatches.length,
+      matches: uniqueMatches,
     };
   }
 

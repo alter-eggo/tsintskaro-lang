@@ -348,18 +348,71 @@ export class DictionaryService {
     const normalized = this.normalizeTranslationForCompare(translation);
     if (!normalized) return [];
 
-    return this.cache!.filter((entry) => {
+    const exactMatches: DictionaryEntry[] = [];
+    const phraseMatches: DictionaryEntry[] = [];
+    const queryTokens = this.tokenizeTranslationForLookup(normalized);
+    const canUsePhraseMatch =
+      normalized.length >= 3 && queryTokens.some((token) => token.length >= 3);
+
+    for (const entry of this.cache!) {
       const entryTranslation = this.normalizeTranslationForCompare(
         entry.translation,
       );
-      if (entryTranslation === normalized) return true;
 
       const parts = entry.translation
         .split(/\s*(?:;|,|\/|\n)\s*/g)
         .map((part) => this.normalizeTranslationForCompare(part))
         .filter((part) => part.length > 0);
-      return parts.includes(normalized);
-    });
+      if (entryTranslation === normalized || parts.includes(normalized)) {
+        exactMatches.push(entry);
+        continue;
+      }
+
+      if (
+        canUsePhraseMatch &&
+        parts.some((part) =>
+          this.containsTokenSequence(
+            this.tokenizeTranslationForLookup(part),
+            queryTokens,
+          ),
+        )
+      ) {
+        phraseMatches.push(entry);
+      }
+    }
+
+    return [...exactMatches, ...phraseMatches];
+  }
+
+  private tokenizeTranslationForLookup(value: string): string[] {
+    return (
+      this.normalizeTranslationForCompare(value).match(/[\p{L}\p{N}]+/gu) ?? []
+    );
+  }
+
+  private containsTokenSequence(
+    tokens: string[],
+    queryTokens: string[],
+  ): boolean {
+    if (queryTokens.length === 0 || queryTokens.length > tokens.length) {
+      return false;
+    }
+
+    for (
+      let start = 0;
+      start <= tokens.length - queryTokens.length;
+      start += 1
+    ) {
+      if (
+        queryTokens.every(
+          (queryToken, index) => tokens[start + index] === queryToken,
+        )
+      ) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   async deleteWords(

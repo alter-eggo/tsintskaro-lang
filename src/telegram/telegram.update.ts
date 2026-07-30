@@ -50,11 +50,36 @@ interface DictionaryUpdateHandlingOptions {
   deferUnresolvedReply?: boolean;
 }
 
+type ReportGenerationStage =
+  | 'load_messages'
+  | 'load_target'
+  | 'openai_analysis'
+  | 'format_report'
+  | 'save_report'
+  | 'send_report'
+  | 'mark_messages';
+
+interface ErrorDetails {
+  name: string | null;
+  message: string | null;
+  status: number | null;
+  code: string | null;
+  type: string | null;
+  requestId: string | null;
+  telegramCode: number | null;
+  telegramDescription: string | null;
+}
+
+interface ReportFailure {
+  fingerprint: string;
+  message: string;
+}
+
 @Update()
 export class TelegramUpdate implements OnModuleInit {
   private readonly threshold: number;
   private readonly logger = new Logger(TelegramUpdate.name);
-  private readonly reportOpenAiUnavailableNotifiedChats = new Set<number>();
+  private readonly reportFailureNotifications = new Map<number, string>();
 
   constructor(
     @InjectBot() private bot: Telegraf<Context>,
@@ -488,10 +513,15 @@ export class TelegramUpdate implements OnModuleInit {
             dictionaryEntries,
           );
     } catch (err) {
-      this.logger.error(`[Chat ${chatId}] AI processBotMention failed:`, err);
+      this.logDetailedError(
+        `[Chat ${chatId}] AI processBotMention failed`,
+        err,
+      );
       if (messageId != null) {
         await ctx.reply(
-          'Не получилось обработать сообщение, попробуй ещё раз.',
+          `❌ Не удалось получить ответ от OpenAI.\n` +
+            `Причина: ${this.describeOpenAiFailureForUser(err)}.\n` +
+            `Повтори запрос после устранения причины.`,
           {
             reply_parameters: { message_id: messageId },
           },
@@ -764,10 +794,14 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     const isExistenceRequest = this.isDictionaryExistenceRequest(text);
+    const reverseLookup = this.isRussianToTsintskaroLookupRequest(text);
+    const hasExplicitDirection =
+      reverseLookup || this.isTsintskaroToRussianLookupRequest(text);
+    const searchBothDirections = isExistenceRequest || !hasExplicitDirection;
     const entries = await this.findDictionaryLookupEntries(
       candidates,
-      this.isRussianToTsintskaroLookupRequest(text),
-      isExistenceRequest,
+      reverseLookup,
+      searchBothDirections,
     );
     const message =
       entries.length > 0
@@ -776,7 +810,14 @@ export class TelegramUpdate implements OnModuleInit {
             candidates,
             isExistenceRequest,
           )
-        : this.formatMissingDictionaryLookupReply(candidates);
+        : this.formatMissingDictionaryLookupReply(
+            candidates,
+            searchBothDirections
+              ? 'both'
+              : reverseLookup
+                ? 'russian_translation'
+                : 'tsintskaro_word',
+          );
 
     if (messageId != null) {
       await ctx.reply(message, {
@@ -794,11 +835,15 @@ export class TelegramUpdate implements OnModuleInit {
     includeAllMentionedEntries = false,
   ): Promise<BotDictionaryContextEntry[]> {
     const candidates = this.extractDictionaryLookupCandidates(text);
+    const hasExplicitDirection =
+      this.isRussianToTsintskaroLookupRequest(text) ||
+      this.isTsintskaroToRussianLookupRequest(text);
     const entries =
       candidates.length > 0
         ? await this.findDictionaryLookupEntries(
             candidates,
             this.isRussianToTsintskaroLookupRequest(text),
+            !hasExplicitDirection,
           )
         : [];
 
@@ -894,9 +939,18 @@ export class TelegramUpdate implements OnModuleInit {
     return [heading, ...details].join('\n\n');
   }
 
-  private formatMissingDictionaryLookupReply(candidates: string[]): string {
+  private formatMissingDictionaryLookupReply(
+    candidates: string[],
+    mode: 'both' | 'russian_translation' | 'tsintskaro_word',
+  ): string {
     const label = candidates.map((candidate) => `«${candidate}»`).join(', ');
-    return `Проверил ${label}: в нашем словаре точного совпадения пока нет. Проверь написание слова или уточни, нужен поиск по цинцкарскому слову или по русскому переводу.`;
+    const checked =
+      mode === 'both'
+        ? 'среди цинцкарских слов и русских переводов'
+        : mode === 'russian_translation'
+          ? 'среди русских переводов'
+          : 'среди цинцкарских слов';
+    return `Проверил ${label} ${checked}: в нашем словаре точного совпадения пока нет. Проверь написание или добавь это значение в словарь.`;
   }
 
   private formatDictionarySource(
@@ -910,20 +964,24 @@ export class TelegramUpdate implements OnModuleInit {
 
   private isDictionaryLookupRequest(text: string): boolean {
     return (
-      /(?:как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русский|на\s+цинцкарск|по-цинцкарск)/i.test(
+      /(?:как\s+(?:(?:на\s+(?:русском|цинцкарском)|по[-\s]+(?:русски|цинцкарски))\s+)?(?:будет|сказать)|как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русск|на\s+цинцкарск|по[-\s]+русски|по[-\s]+цинцкарски)/i.test(
         text,
       ) || this.isDictionaryExistenceRequest(text)
     );
   }
 
   private isDictionaryExistenceRequest(text: string): boolean {
-    return /(?:есть\s+ли[^?.!]*словар|в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)|(?:есть|имеется)[^?.!]*в\s+(?:нашем\s+)?словаре|(?:проверь|посмотри|найди|поищи)[^?.!]*\bсловар)/i.test(
+    return /(?:(?:есть|имеется)\s+(?:ли\s+)?(?:такое\s+)?(?:слово|выражение|фраза)(?=$|[\s,.:;!?—-])|есть\s+ли[^?.!]*словар|в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)|(?:есть|имеется)[^?.!]*в\s+(?:нашем\s+)?словаре|(?:проверь|посмотри|найди|поищи)[^?.!]*словар)/i.test(
       text,
     );
   }
 
   private isRussianToTsintskaroLookupRequest(text: string): boolean {
-    return /(?:на\s+цинцкарск|по-цинцкарск)/i.test(text);
+    return /(?:на\s+цинцкарск(?:ий|ом|ого)?|по[-\s]+цинцкарски)/i.test(text);
+  }
+
+  private isTsintskaroToRussianLookupRequest(text: string): boolean {
+    return /(?:на\s+русск(?:ий|ом|ого)?|по[-\s]+русски)/i.test(text);
   }
 
   private extractDictionaryLookupCandidates(text: string): string[] {
@@ -939,8 +997,11 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     const patterns = [
+      /как\s+(?:(?:на\s+(?:русском|цинцкарском)|по[-\s]+(?:русски|цинцкарски))\s+)?(?:будет|сказать)\s+(?:(?:на\s+(?:русском|цинцкарском)|по[-\s]+(?:русски|цинцкарски))\s+)?(.+?)(?:\s+(?:на\s+(?:русском|цинцкарском)|по[-\s]+(?:русски|цинцкарски)))?(?:[?.!]|$)/i,
       /(?:как\s+перевести(?:\s+на\s+(?:русский|цинцкарский))?|переведи(?:\s+на\s+(?:русский|цинцкарский))?)\s+(.+?)(?:[?.!]|$)/i,
       /(?:что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова)\s+(.+?)(?:[?.!]|$)/i,
+      /(?:есть|имеется)\s+(?:ли\s+)?(?:такое\s+)?(?:слово|выражение|фраза)\s*[-—:=,]?\s*(.+?)(?:[?.!]|$)/i,
+      /(?:есть|имеется)\s+в\s+(?:нашем\s+)?словаре\s*[:,—-]?\s*(?:слово|слова|выражение|фраза)?\s*(.+?)(?:[?.!]|$)/i,
       /в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)\s+(?:ли\s+)?(?:слово|выражение|фраза)?\s*(.+?)(?:[?.!]|$)/i,
       /в\s+(?:нашем\s+)?словаре\s+(?:слово|выражение|фраза)?\s*(.+?)\s+(?:есть|имеется)(?:[?.!]|$)/i,
       /(?:есть|имеется)\s+в\s+(?:нашем\s+)?словаре\s+(?:слово|выражение|фраза)?\s*(.+?)(?:[?.!]|$)/i,
@@ -979,8 +1040,14 @@ export class TelegramUpdate implements OnModuleInit {
   private cleanDictionaryLookupCandidate(value: string): string {
     return this.cleanDictionaryWord(value)
       .replace(/^(?:слово|слова|фраза|фразу)\s+/i, '')
-      .replace(/^(?:на|по)\s+(?:русский|цинцкарский)\s+/i, '')
-      .replace(/\s+(?:на|по)\s+(?:русский|цинцкарский)$/i, '')
+      .replace(
+        /^(?:на\s+(?:русский|цинцкарский)|по[-\s]+(?:русски|цинцкарски))\s+/i,
+        '',
+      )
+      .replace(
+        /\s+(?:на\s+(?:русский|цинцкарский)|по[-\s]+(?:русски|цинцкарски))$/i,
+        '',
+      )
       .trim();
   }
 
@@ -1891,7 +1958,7 @@ export class TelegramUpdate implements OnModuleInit {
     }
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] Received /report command`);
-    await this.generateReport(ctx);
+    await this.generateReport(ctx, true);
   }
 
   @Command('clear')
@@ -2513,49 +2580,62 @@ export class TelegramUpdate implements OnModuleInit {
     );
   }
 
-  private async generateReport(ctx: Context) {
+  private async generateReport(
+    ctx: Context,
+    notifyRepeatedFailure = false,
+  ): Promise<void> {
     const chatId = ctx.chat!.id;
     const sourceMessage = ctx.message as { message_thread_id?: number };
     const sourceThreadId = sourceMessage?.message_thread_id ?? null;
-    const storedMessages = await this.telegramService.getActiveMessages(chatId);
-    const messagesText = storedMessages.map((m) => m.text);
-    const summaryLinks = new Map<
-      string,
-      { url: string; username: string; number: number }
-    >();
-    const messages = storedMessages.map((m, index) => {
-      const ref = `m${index + 1}`;
-      const link = this.buildTelegramMessageLink(m.chatId, m.telegramMessageId);
-      if (link) {
-        summaryLinks.set(ref, {
-          url: link,
-          username: m.username,
-          number: index + 1,
-        });
-      }
-      return {
-        text: m.text,
-        username: m.username,
-        ref: link ? ref : undefined,
-      };
-    });
-
-    if (messagesText.length === 0) {
-      await ctx.reply('Сообщений пока нет.');
-      return;
-    }
-
-    const summaryTarget = await this.telegramService.getSummaryTarget();
-    const target = summaryTarget ?? {
-      chatId,
-      threadId: sourceThreadId,
-    };
+    let stage: ReportGenerationStage = 'load_messages';
 
     try {
+      const storedMessages =
+        await this.telegramService.getActiveMessages(chatId);
+      const messagesText = storedMessages.map((m) => m.text);
+      const summaryLinks = new Map<
+        string,
+        { url: string; username: string; number: number }
+      >();
+      const messages = storedMessages.map((m, index) => {
+        const ref = `m${index + 1}`;
+        const link = this.buildTelegramMessageLink(
+          m.chatId,
+          m.telegramMessageId,
+        );
+        if (link) {
+          summaryLinks.set(ref, {
+            url: link,
+            username: m.username,
+            number: index + 1,
+          });
+        }
+        return {
+          text: m.text,
+          username: m.username,
+          ref: link ? ref : undefined,
+        };
+      });
+
+      if (messagesText.length === 0) {
+        this.reportFailureNotifications.delete(chatId);
+        await ctx.reply('Сообщений пока нет.');
+        return;
+      }
+
+      stage = 'load_target';
+      const summaryTarget = await this.telegramService.getSummaryTarget();
+      const target = summaryTarget ?? {
+        chatId,
+        threadId: sourceThreadId,
+      };
+
+      stage = 'openai_analysis';
       const analysis = await this.openaiService.analyzeDiscussion(messages);
       const words = analysis.words;
       const discussionResult = analysis.discussionResult;
 
+      stage = 'format_report';
       let report = await this.formatReport(words);
       const summary = this.shortenDiscussionSummary(
         discussionResult.discussionSummary || '',
@@ -2566,6 +2646,7 @@ export class TelegramUpdate implements OnModuleInit {
           this.formatDiscussionSummary(summary, summaryLinks);
       }
 
+      stage = 'save_report';
       const savedReport = await this.telegramService.createSummaryReport({
         sourceChatId: chatId,
         sourceThreadId,
@@ -2582,20 +2663,276 @@ export class TelegramUpdate implements OnModuleInit {
         createdBy: ctx.from?.username || null,
       });
 
+      stage = 'send_report';
       await this.sendReportToTarget(target.chatId, target.threadId, report);
 
+      stage = 'mark_messages';
       await this.telegramService.markMessagesReported(
         storedMessages.map((m) => m.id),
         savedReport.id,
       );
-      this.reportOpenAiUnavailableNotifiedChats.delete(chatId);
+      this.reportFailureNotifications.delete(chatId);
     } catch (error) {
-      this.logger.error('Report error:', error);
-      if (!this.reportOpenAiUnavailableNotifiedChats.has(chatId)) {
-        this.reportOpenAiUnavailableNotifiedChats.add(chatId);
-        await ctx.reply('OpenAI API недоступен.');
+      this.logDetailedError(
+        `[Chat ${chatId}] Report failed at stage ${stage}`,
+        error,
+      );
+      const failure = this.buildReportFailure(stage, error);
+      const previousFingerprint = this.reportFailureNotifications.get(chatId);
+      this.reportFailureNotifications.set(chatId, failure.fingerprint);
+      if (
+        notifyRepeatedFailure ||
+        previousFingerprint !== failure.fingerprint
+      ) {
+        await ctx.reply(failure.message);
       }
     }
+  }
+
+  private buildReportFailure(
+    stage: ReportGenerationStage,
+    error: unknown,
+  ): ReportFailure {
+    const details = this.getErrorDetails(error);
+    const stageLabels: Record<ReportGenerationStage, string> = {
+      load_messages: 'загрузка сообщений из базы данных',
+      load_target: 'загрузка настроек отчёта из базы данных',
+      openai_analysis: 'анализ сообщений через OpenAI',
+      format_report: 'сверка слов со словарём и формирование отчёта',
+      save_report: 'сохранение отчёта в базе данных',
+      send_report: 'отправка отчёта в Telegram',
+      mark_messages: 'отметка сообщений как обработанных в базе данных',
+    };
+
+    let reason: string;
+    if (stage === 'openai_analysis') {
+      reason = this.describeOpenAiFailureForUser(error);
+    } else if (stage === 'send_report') {
+      reason = this.describeTelegramFailureForUser(details);
+    } else if (
+      stage === 'load_messages' ||
+      stage === 'load_target' ||
+      stage === 'save_report' ||
+      stage === 'mark_messages'
+    ) {
+      reason = details.code
+        ? `ошибка базы данных (код: ${this.safeDiagnosticValue(details.code)})`
+        : 'ошибка доступа к базе данных';
+    } else {
+      reason = details.code
+        ? `внутренняя ошибка (код: ${this.safeDiagnosticValue(details.code)})`
+        : 'внутренняя ошибка формирования отчёта';
+    }
+
+    const recovery =
+      stage === 'mark_messages'
+        ? 'Отчёт мог быть отправлен, но сообщения не отмечены обработанными; перед повтором проверьте чат отчётов.'
+        : 'Исходные сообщения сохранены. После устранения причины повторите /report.';
+    const fingerprint = [
+      stage,
+      details.status ?? '',
+      details.code ?? '',
+      details.type ?? '',
+      details.telegramCode ?? '',
+    ].join(':');
+
+    return {
+      fingerprint,
+      message:
+        `❌ Не удалось создать отчёт.\n` +
+        `Этап: ${stageLabels[stage]}.\n` +
+        `Причина: ${reason}.\n` +
+        `${recovery}\n` +
+        `Подробности записаны в логах бота.`,
+    };
+  }
+
+  private describeOpenAiFailureForUser(error: unknown): string {
+    const details = this.getErrorDetails(error);
+    const message = details.message?.toLowerCase() ?? '';
+    const code = details.code?.toLowerCase() ?? '';
+    let reason: string;
+
+    if (
+      details.status === 429 &&
+      (code.includes('quota') || message.includes('quota'))
+    ) {
+      reason = 'исчерпана квота OpenAI';
+    } else if (details.status === 429) {
+      reason = 'OpenAI ограничил частоту запросов';
+    } else if (details.status === 401) {
+      reason = 'ключ OpenAI отсутствует или недействителен';
+    } else if (details.status === 403) {
+      reason = 'у проекта нет доступа к запрошенной модели OpenAI';
+    } else if (details.status === 404) {
+      reason = 'модель или endpoint OpenAI не найдены';
+    } else if (
+      details.status === 408 ||
+      code.includes('timeout') ||
+      /timed?\s*out|etimedout/.test(message)
+    ) {
+      reason = 'истекло время ожидания ответа OpenAI';
+    } else if (details.status != null && details.status >= 500) {
+      reason = 'временный сбой на стороне OpenAI';
+    } else if (/connection|econn|fetch failed|socket|network/.test(message)) {
+      reason = 'не удалось подключиться к OpenAI';
+    } else {
+      reason = 'запрос к OpenAI завершился ошибкой';
+    }
+
+    const diagnostics: string[] = [];
+    if (details.status != null) {
+      diagnostics.push(`HTTP ${details.status}`);
+    }
+    if (details.code) {
+      diagnostics.push(`код: ${this.safeDiagnosticValue(details.code)}`);
+    } else if (details.type) {
+      diagnostics.push(`тип: ${this.safeDiagnosticValue(details.type)}`);
+    }
+    if (details.requestId) {
+      diagnostics.push(
+        `request_id: ${this.safeDiagnosticValue(details.requestId)}`,
+      );
+    }
+
+    return diagnostics.length > 0
+      ? `${reason} (${diagnostics.join(', ')})`
+      : reason;
+  }
+
+  private describeTelegramFailureForUser(details: ErrorDetails): string {
+    const diagnostics: string[] = [];
+    if (details.telegramCode != null) {
+      diagnostics.push(`код Telegram: ${details.telegramCode}`);
+    } else if (details.status != null) {
+      diagnostics.push(`HTTP ${details.status}`);
+    }
+    if (details.telegramDescription) {
+      diagnostics.push(
+        this.safeDiagnosticValue(details.telegramDescription, 180),
+      );
+    }
+    return diagnostics.length > 0
+      ? `Telegram отклонил сообщение (${diagnostics.join(', ')})`
+      : 'не удалось отправить сообщение через Telegram';
+  }
+
+  private getErrorDetails(error: unknown): ErrorDetails {
+    const record =
+      typeof error === 'object' && error !== null
+        ? (error as Record<string, unknown>)
+        : null;
+    const cause =
+      record && typeof record.cause === 'object' && record.cause !== null
+        ? (record.cause as Record<string, unknown>)
+        : null;
+    const driverError =
+      record &&
+      typeof record.driverError === 'object' &&
+      record.driverError !== null
+        ? (record.driverError as Record<string, unknown>)
+        : null;
+    const apiError =
+      record && typeof record.error === 'object' && record.error !== null
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const response =
+      record && typeof record.response === 'object' && record.response !== null
+        ? (record.response as Record<string, unknown>)
+        : null;
+    const readString = (...values: unknown[]): string | null => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+      return null;
+    };
+    const readNumber = (...values: unknown[]): number | null => {
+      for (const value of values) {
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+      }
+      return null;
+    };
+
+    return {
+      name: readString(
+        record?.name,
+        error instanceof Error ? error.name : null,
+      ),
+      message: readString(
+        record?.message,
+        apiError?.message,
+        driverError?.message,
+        cause?.message,
+        error instanceof Error ? error.message : null,
+        typeof error === 'string' ? error : null,
+      ),
+      status: readNumber(record?.status, apiError?.status, response?.status),
+      code: readString(
+        record?.code,
+        apiError?.code,
+        driverError?.code,
+        cause?.code,
+      ),
+      type: readString(record?.type, apiError?.type),
+      requestId: readString(
+        record?.request_id,
+        record?.requestId,
+        record?.requestID,
+        apiError?.request_id,
+      ),
+      telegramCode: readNumber(response?.error_code, record?.error_code),
+      telegramDescription: readString(
+        response?.description,
+        record?.description,
+      ),
+    };
+  }
+
+  private logDetailedError(context: string, error: unknown): void {
+    const details = this.getErrorDetails(error);
+    const fields = [
+      details.name ? `name=${this.safeDiagnosticValue(details.name)}` : null,
+      details.status != null ? `status=${details.status}` : null,
+      details.code ? `code=${this.safeDiagnosticValue(details.code)}` : null,
+      details.type ? `type=${this.safeDiagnosticValue(details.type)}` : null,
+      details.requestId
+        ? `request_id=${this.safeDiagnosticValue(details.requestId)}`
+        : null,
+      details.telegramCode != null
+        ? `telegram_code=${details.telegramCode}`
+        : null,
+      details.telegramDescription
+        ? `telegram_description=${this.safeDiagnosticValue(
+            details.telegramDescription,
+            300,
+          )}`
+        : null,
+      details.message
+        ? `message=${this.safeDiagnosticValue(details.message, 500)}`
+        : null,
+    ].filter((field): field is string => field != null);
+    const stack =
+      error instanceof Error && error.stack
+        ? this.redactSensitiveErrorText(error.stack)
+        : undefined;
+    this.logger.error(
+      `${context}${fields.length > 0 ? ` | ${fields.join(' | ')}` : ''}`,
+      stack,
+    );
+  }
+
+  private safeDiagnosticValue(value: string, maxLength = 100): string {
+    return this.redactSensitiveErrorText(value)
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, maxLength);
+  }
+
+  private redactSensitiveErrorText(value: string): string {
+    return value
+      .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, '[REDACTED_OPENAI_KEY]')
+      .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
+      .replace(/(postgres(?:ql)?:\/\/[^:\s]+:)[^@\s]+@/gi, '$1[REDACTED]@');
   }
 
   private async sendReportToTarget(

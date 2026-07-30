@@ -62,6 +62,21 @@ describe('DictionaryService relevant prompt entries', () => {
       service.findRelevantForPrompt(['Обычное русское сообщение.']),
     ).resolves.toEqual([]);
   });
+
+  it('finds a Russian word inside a longer dictionary translation', async () => {
+    const service = makeService([
+      { word: 'махсыл', translation: 'хороший урожай' },
+      { word: 'ôйхмâт', translation: 'государство, страна' },
+    ]);
+
+    await expect(service.findByTranslation('урожай')).resolves.toEqual([
+      expect.objectContaining({
+        word: 'махсыл',
+        translation: 'хороший урожай',
+      }),
+    ]);
+    await expect(service.findByTranslation('рана')).resolves.toEqual([]);
+  });
 });
 
 describe('DictionaryService word upserts', () => {

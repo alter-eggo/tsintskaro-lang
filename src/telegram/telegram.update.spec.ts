@@ -35,11 +35,26 @@ describe('TelegramUpdate bot mentions', () => {
         message: 'ok',
       })),
       normalizeDictionaryEntries: jest.fn(async () => []),
+      analyzeDiscussion: jest.fn(async () => ({
+        discussionSummary: '',
+        words: [],
+        discussionResult: {
+          discussionSummary: '',
+          agreedWords: [],
+          disputedWords: [],
+          totalExtracted: 0,
+          duplicatesRemoved: 0,
+        },
+      })),
     };
     const telegramService = {
       getRecentMessages: jest.fn(async () => []),
       getBotMemory: jest.fn(async () => []),
       ensureDefaultGlobalMemory: jest.fn(),
+      getActiveMessages: jest.fn(async () => []),
+      getSummaryTarget: jest.fn(async () => null),
+      createSummaryReport: jest.fn(async () => ({ id: 1 })),
+      markMessagesReported: jest.fn(async () => undefined),
     };
     const wordReviewService = {
       setTarget: jest.fn(async () => ({})),
@@ -73,13 +88,21 @@ describe('TelegramUpdate bot mentions', () => {
     };
     const ctx = {
       chat: { id: -100, type: 'supergroup' },
+      message: {},
+      from: { username: 'AAlxnv' },
       reply: jest.fn(),
       replyWithPhoto: jest.fn(),
       telegram: { setMessageReaction: jest.fn() },
     };
+    const bot = {
+      telegram: {
+        setMyCommands: jest.fn(),
+        sendMessage: jest.fn(async () => undefined),
+      },
+    };
 
     const update = new TelegramUpdate(
-      { telegram: { setMyCommands: jest.fn() } } as any,
+      bot as any,
       telegramService as any,
       openaiService as any,
       dictionaryService as any,
@@ -99,6 +122,7 @@ describe('TelegramUpdate bot mentions', () => {
       openaiService,
       telegramService,
       wordReviewService,
+      bot,
     };
   };
 
@@ -615,12 +639,165 @@ describe('TelegramUpdate bot mentions', () => {
     );
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('сахгкал оти');
+    expect(dictionaryService.findByTranslation).not.toHaveBeenCalled();
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
     expect(ctx.reply).toHaveBeenCalledWith(
       'Нашёл в словаре:\n\nСлово: сахгкал оти\nПеревод: укроп\nЧасть речи: сущ.',
       {
         reply_parameters: { message_id: 123 },
       },
+    );
+  });
+
+  it('searches both dictionary directions when translation direction is omitted', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findByTranslation.mockResolvedValueOnce([
+      {
+        word: 'салам',
+        translation: 'привет',
+        partOfSpeech: 'междометие',
+      },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Бот, как перевести слово привет?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('привет');
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Нашёл в словаре:\n\n' +
+        'Слово: салам\n' +
+        'Перевод: привет\n' +
+        'Часть речи: междометие',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('answers the natural "как будет" translation wording from the dictionary', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findByTranslation.mockResolvedValueOnce([
+      {
+        word: 'чâсич',
+        translation: 'порез',
+        partOfSpeech: null,
+        source: 'chat',
+      },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи , как будет порез?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('порез');
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('порез');
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Нашёл в словаре:\n\n' +
+        'Слово: чâсич\n' +
+        'Перевод: порез\n' +
+        'Часть речи: не указана\n' +
+        'Источник: добавлено участниками чата',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('handles a short existence question without the word "словарь"', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findWord.mockResolvedValueOnce({
+      word: 'есыр',
+      translation: 'трудится не покладая сил',
+      partOfSpeech: null,
+    });
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, есть слово - есыр?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('есыр');
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('есыр');
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+  });
+
+  it('explains that both dictionary directions were checked when no match exists', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Бот, как перевести слово привет?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).toHaveBeenCalledWith('привет');
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'Проверил «привет» среди цинцкарских слов и русских переводов: ' +
+        'в нашем словаре точного совпадения пока нет. ' +
+        'Проверь написание или добавь это значение в словарь.',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('understands an explicit translation direction after the word', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate();
+    dictionaryService.findByTranslation.mockResolvedValueOnce([
+      {
+        word: 'салам',
+        translation: 'привет',
+        partOfSpeech: 'междометие',
+      },
+    ]);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Бот, как перевести слово привет по-цинцкарски?',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.findWord).not.toHaveBeenCalled();
+    expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
+  });
+
+  it('shows OpenAI diagnostics when a bot reply fails', async () => {
+    const { update, ctx, openaiService } = makeUpdate();
+    openaiService.processBotMention.mockRejectedValueOnce(
+      Object.assign(new Error('Rate limit reached'), {
+        status: 429,
+        code: 'rate_limit_exceeded',
+        request_id: 'req_bot_test',
+      }),
+    );
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, расскажи что-нибудь',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'OpenAI ограничил частоту запросов (HTTP 429, код: rate_limit_exceeded, request_id: req_bot_test)',
+      ),
+      { reply_parameters: { message_id: 123 } },
     );
   });
 
@@ -650,6 +827,88 @@ describe('TelegramUpdate bot mentions', () => {
     expect(ctx.reply).toHaveBeenCalledWith(
       'Да, нашёл в словаре запись для «урожай»:\n\nСлово: махсыл\nПеревод: урожай\nЧасть речи: существительное\nИсточник: эталонный словарь\nПримечание: Общее название собранного урожая.',
       { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('reports the exact OpenAI stage and request id when report analysis fails', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    telegramService.getActiveMessages.mockResolvedValueOnce([
+      {
+        id: 1,
+        chatId: -100,
+        telegramMessageId: 10,
+        text: 'Тестовое сообщение',
+        username: 'user',
+      },
+    ]);
+    openaiService.analyzeDiscussion.mockRejectedValueOnce(
+      Object.assign(new Error('Rate limit reached'), {
+        status: 429,
+        code: 'rate_limit_exceeded',
+        requestID: 'req_report_test',
+      }),
+    );
+
+    await (update as any).generateReport(ctx, true);
+
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Этап: анализ сообщений через OpenAI.'),
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'OpenAI ограничил частоту запросов (HTTP 429, код: rate_limit_exceeded, request_id: req_report_test)',
+      ),
+    );
+    expect(ctx.reply).not.toHaveBeenCalledWith('OpenAI API недоступен.');
+  });
+
+  it('identifies a database failure instead of blaming OpenAI', async () => {
+    const { update, ctx, telegramService, openaiService } = makeUpdate();
+    telegramService.getActiveMessages.mockRejectedValueOnce(
+      Object.assign(new Error('connection refused'), {
+        name: 'QueryFailedError',
+        code: 'ECONNREFUSED',
+      }),
+    );
+
+    await (update as any).generateReport(ctx, true);
+
+    expect(openaiService.analyzeDiscussion).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Этап: загрузка сообщений из базы данных.'),
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('ошибка базы данных (код: ECONNREFUSED)'),
+    );
+  });
+
+  it('shows Telegram rejection details when report delivery fails', async () => {
+    const { update, ctx, telegramService, bot } = makeUpdate();
+    telegramService.getActiveMessages.mockResolvedValueOnce([
+      {
+        id: 1,
+        chatId: -100,
+        telegramMessageId: 10,
+        text: 'Тестовое сообщение',
+        username: 'user',
+      },
+    ]);
+    bot.telegram.sendMessage.mockRejectedValueOnce({
+      response: {
+        error_code: 400,
+        description: 'Bad Request: message thread not found',
+      },
+    });
+
+    await (update as any).generateReport(ctx, true);
+
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Этап: отправка отчёта в Telegram.'),
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Telegram отклонил сообщение (код Telegram: 400, Bad Request: message thread not found)',
+      ),
     );
   });
 
