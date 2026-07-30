@@ -90,6 +90,22 @@ export class DictionaryService {
       .replace(/[^0-9а-я]+/gi, '');
   }
 
+  /**
+   * Upserts may tolerate keyboard lookalikes, but must not use the broader
+   * lookup folding above: folding diacritics and removing spaces can collapse
+   * genuinely different dictionary headwords into one record.
+   */
+  private normalizeWordForUpsertMatch(word: string): string {
+    return this.normalizeWordInput(word)
+      .replace(/a/g, 'а')
+      .replace(/c/g, 'с')
+      .replace(/e/g, 'е')
+      .replace(/o/g, 'о')
+      .replace(/p/g, 'р')
+      .replace(/x/g, 'х')
+      .replace(/y/g, 'у');
+  }
+
   private normalizeTranslationForCompare(translation: string): string {
     return translation
       .toLowerCase()
@@ -178,6 +194,21 @@ export class DictionaryService {
     }
 
     return { entity: null, candidates };
+  }
+
+  private async resolveWordEntityForUpsert(word: string): Promise<Word | null> {
+    const normalized = this.normalizeWordInput(word);
+    if (!normalized) return null;
+
+    const exact = await this.wordRepo.findOne({ where: { word: normalized } });
+    if (exact) return exact;
+
+    const safeMatch = this.normalizeWordForUpsertMatch(normalized);
+    const rows = await this.wordRepo.find();
+    const candidates = rows.filter(
+      (row) => this.normalizeWordForUpsertMatch(row.word) === safeMatch,
+    );
+    return candidates.length === 1 ? candidates[0] : null;
   }
 
   reload() {
@@ -439,8 +470,7 @@ export class DictionaryService {
 
   async upsertWord(input: UpsertWordInput): Promise<UpsertWordResult> {
     const normalizedWord = this.normalizeWordInput(input.word);
-    const resolved = await this.resolveWordEntity(normalizedWord);
-    const existing = resolved.entity;
+    const existing = await this.resolveWordEntityForUpsert(normalizedWord);
 
     if (existing) {
       const translationMerge = this.mergeTranslations(
