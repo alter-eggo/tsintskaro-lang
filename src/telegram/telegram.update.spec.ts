@@ -262,6 +262,85 @@ describe('TelegramUpdate bot mentions', () => {
     );
   });
 
+  it('preserves the exact headword from the reported regression', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь сёир ётмах - смотреть, наблюдать.',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
+      word: 'сёир ётмах',
+      translation: 'смотреть, наблюдать',
+      partOfSpeech: null,
+      addedBy: 'AAlxnv',
+    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '✅ записал:\n• сёир ётмах — смотреть, наблюдать',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
+  it('parses common Unicode dash variants without AI', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+
+    for (const separator of ['–', '−', '‑']) {
+      await (update as any).handleBotMention(
+        ctx,
+        `Баласи, добавь сёир ётмах ${separator} смотреть, наблюдать.`,
+        'AAlxnv',
+        123,
+        null,
+      );
+    }
+
+    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(3);
+    for (const call of dictionaryService.upsertWord.mock.calls) {
+      expect(call[0]).toEqual({
+        word: 'сёир ётмах',
+        translation: 'смотреть, наблюдать',
+        partOfSpeech: null,
+        addedBy: 'AAlxnv',
+      });
+    }
+  });
+
+  it('rejects an AI action that substitutes a different headword', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'add_words',
+      entries: [
+        {
+          word: 'сŷртмах',
+          translation: 'смотреть, наблюдать',
+          partOfSpeech: null,
+        },
+      ],
+    } as any);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь запись сёир ётмах / смотреть, наблюдать.',
+      'AAlxnv',
+      123,
+      null,
+    );
+
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '⚠️ Не стал сохранять запись: распознанные слово и перевод не совпали с текстом сообщения. Напиши в формате «слово — перевод».',
+      { reply_parameters: { message_id: 123 } },
+    );
+  });
+
   it('does not save an AI placeholder as a dictionary translation', async () => {
     const { update, ctx, dictionaryService } = makeUpdate();
 
