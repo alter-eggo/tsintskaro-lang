@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { Word, type WordSource } from './entities/word.entity';
-import { compareTsintskaroWords } from './sheets-parser';
+import { compareTsintskaroWords } from './tsintskaro-alphabet';
 
 export interface DictionaryEntry {
   word: string;
@@ -55,6 +55,8 @@ export class DictionaryService {
   private cacheById: Map<string, DictionaryEntry> | null = null;
   private cacheByFolded: Map<string, DictionaryEntry[]> | null = null;
   private maxDictionaryPhraseWords = 1;
+  private cacheLoadedAt = 0;
+  private static readonly CACHE_TTL_MS = 60_000;
 
   constructor(
     @InjectRepository(Word)
@@ -216,7 +218,13 @@ export class DictionaryService {
   }
 
   private async ensureCache(): Promise<void> {
-    if (this.cache && this.cacheById && this.cacheByFolded) return;
+    if (
+      this.cache &&
+      this.cacheById &&
+      this.cacheByFolded &&
+      Date.now() - this.cacheLoadedAt < DictionaryService.CACHE_TTL_MS
+    )
+      return;
     const rows = await this.wordRepo.find();
     const entries: DictionaryEntry[] = rows.map((r) => ({
       word: r.word,
@@ -229,6 +237,7 @@ export class DictionaryService {
     this.cache = entries;
     this.cacheById = new Map(entries.map((e) => [e.word, e]));
     this.cacheByFolded = new Map();
+    this.maxDictionaryPhraseWords = 1;
     for (const entry of entries) {
       const folded = this.foldWordForLookup(entry.word);
       if (folded) {
@@ -243,6 +252,7 @@ export class DictionaryService {
       );
     }
     this.maxDictionaryPhraseWords = Math.min(this.maxDictionaryPhraseWords, 8);
+    this.cacheLoadedAt = Date.now();
     this.logger.log(`Loaded ${entries.length} dictionary entries from DB`);
   }
 

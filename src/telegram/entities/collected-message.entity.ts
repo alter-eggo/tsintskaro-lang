@@ -7,6 +7,7 @@ const bigintTransformer = {
 
 @Entity('collected_message')
 @Index(['chatId', 'reportId', 'clearedAt'])
+@Index(['chatId', 'threadId', 'sentAt'])
 export class CollectedMessage {
   @PrimaryGeneratedColumn()
   id: number;
@@ -25,6 +26,13 @@ export class CollectedMessage {
 
   @Column({ type: 'varchar', length: 128 })
   username: string;
+
+  // Bot conversations belong in context, but not in dictionary extraction reports.
+  @Column({ type: 'boolean', default: false })
+  contextOnly: boolean;
+
+  @Column({ type: 'boolean', default: false })
+  isBot: boolean;
 
   @Column({ type: 'timestamptz' })
   sentAt: Date;

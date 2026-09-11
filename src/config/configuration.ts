@@ -38,15 +38,15 @@ export default () => {
     openaiReportModel: process.env.OPENAI_MODEL_REPORT || 'gpt-5.5',
     openaiBotMaxCompletionTokens: positiveInt(
       process.env.OPENAI_MAX_COMPLETION_TOKENS_BOT,
-      800,
+      8000,
     ),
     openaiExtractionMaxCompletionTokens: positiveInt(
       process.env.OPENAI_MAX_COMPLETION_TOKENS_EXTRACTION,
-      3000,
+      12000,
     ),
     openaiReportMaxCompletionTokens: positiveInt(
       process.env.OPENAI_MAX_COMPLETION_TOKENS_REPORT,
-      4000,
+      16000,
     ),
     messageThreshold: parseInt(process.env.MESSAGE_THRESHOLD, 10) || 100,
     databaseUrl: process.env.DATABASE_URL,

@@ -8,7 +8,7 @@ import {
   InjectBot,
 } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
-import { BotMemoryEntry, TelegramService } from './telegram.service';
+import { ConversationMessage, TelegramService } from './telegram.service';
 import {
   DictionaryEntry,
   DictionaryService,
@@ -173,11 +173,15 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     this.logger.log('Received /start command');
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       'გამარჯობა! Я бот-словарь Цинцкаро.\n\n' +
         'Я собираю сообщения и нахожу нерусские слова для словаря.\n\n' +
         'Команды:\n' +
@@ -226,7 +230,10 @@ export class TelegramUpdate implements OnModuleInit {
   private async requireAdmin(ctx: Context): Promise<boolean> {
     const admin = await this.isAdmin(ctx, ctx.from?.username);
     if (!admin) {
-      await ctx.reply('Команды боту доступны только администраторам');
+      await this.replyAndRemember(
+        ctx,
+        'Команды боту доступны только администраторам',
+      );
     }
     return admin;
   }
@@ -248,7 +255,7 @@ export class TelegramUpdate implements OnModuleInit {
       };
       message_thread_id?: number;
       date?: number;
-      reply_to_message?: { message_id?: number };
+      reply_to_message?: { message_id?: number; from?: { id?: number } };
     };
     const text = message.text;
     const threadId = message.message_thread_id;
@@ -266,7 +273,7 @@ export class TelegramUpdate implements OnModuleInit {
       });
       if (correction.status !== 'not_correction') {
         if (correction.message) {
-          await ctx.reply(correction.message, {
+          await this.replyAndRemember(ctx, correction.message, {
             reply_parameters: { message_id: message.message_id! },
           });
         }
@@ -274,7 +281,26 @@ export class TelegramUpdate implements OnModuleInit {
       }
     }
 
-    if (TelegramUpdate.BOT_MENTION_REGEX.test(text)) {
+    const isReplyToBot =
+      ctx.botInfo?.id != null &&
+      message.reply_to_message?.from?.id === ctx.botInfo.id;
+    const isUsernameMention =
+      ctx.botInfo?.username &&
+      text.toLowerCase().includes(`@${ctx.botInfo.username.toLowerCase()}`);
+    if (
+      TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
+      isReplyToBot ||
+      isUsernameMention
+    ) {
+      await this.rememberContextMessage({
+        chatId,
+        threadId: threadId ?? null,
+        telegramMessageId: message.message_id ?? null,
+        text,
+        username,
+        isBot: false,
+        sentAt: message.date ? new Date(message.date * 1000) : new Date(),
+      });
       await this.handleBotMention(
         ctx,
         text,
@@ -345,28 +371,13 @@ export class TelegramUpdate implements OnModuleInit {
   private static readonly MAX_DELETE_BATCH = 10;
   private static readonly MAX_UPDATE_BATCH = 5;
 
-  private static readonly BOT_CONTEXT_SUMMARY_MESSAGE_LIMIT = 50;
+  private static readonly BOT_CONTEXT_MESSAGE_LIMIT = 50;
 
-  private static readonly BOT_CONTEXT_MAX_CHARS = 12000;
+  private static readonly BOT_CONTEXT_MAX_CHARS = 40000;
 
   private static readonly BOT_MEMORY_LIMIT = 50;
 
-  private static readonly BOT_DICTIONARY_CONTEXT_LIMIT = 5;
-
-  private static readonly WORKING_LINKS_REQUEST_REGEX =
-    /(?:рабоч\w*\s+ссыл|ссылк\w*[\s\S]{0,40}рабоч|скин\w*[\s\S]{0,40}ссыл|пришл\w*[\s\S]{0,40}ссыл|дай[\s\S]{0,40}ссыл)/i;
-
-  private static readonly RECENT_MESSAGES_CONTEXT_REGEX =
-    /(?:о\s+ч[её]м[\s\S]{0,30}(?:говор|пис|общал)|что[\s\S]{0,30}(?:обсужда|писал)|перескаж|переписк|недавн\w*\s+сообщ|последн\w*\s+сообщ|кто[\s\S]{0,30}писал|выше\s+(?:писал|говорил)|истори\w*\s+чат)/i;
-
-  private static readonly BOT_MEMORY_CONTEXT_REGEX =
-    /(?:памят|запомн|общество|цинцкар|наслед|истори\w*\s+сел|сайт|ссыл|встреч|мероприят|проект|организац|правил\w*\s+(?:язык|диалект|слов))/i;
-
-  private static readonly LEADERBOARD_REQUEST_REGEX =
-    /(?:(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь|хочу|нужен|нужна)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:лидер|топ|рейтинг|таблиц\w*\s+лидер)|(?:^|[\s,.:;!?])(?:лидер|топ|рейтинг)(?:$|[\s,.:;!?])[\s\S]{0,40}(?:^|[\s,.:;!?])(?:покажи|показать|пришли|прислать|дай|выведи|вывести|скинь|отправь)(?:$|[\s,.:;!?])|кто\s+(?:больше|больше\s+всех|больше\s+всего|много)[\s\S]{0,40}(?:слов|слова|добав)|кто[\s\S]{0,40}(?:добавил|добавляет)[\s\S]{0,40}(?:слов|слова))/i;
-
-  private static readonly URL_REGEX =
-    /https?:\/\/[^\s<>()"']*[A-Za-z0-9-]+\.[A-Za-z]{2,}[^\s<>()"']*/i;
+  private static readonly BOT_DICTIONARY_CONTEXT_LIMIT = 30;
 
   private async handleBotMention(
     ctx: Context,
@@ -377,6 +388,7 @@ export class TelegramUpdate implements OnModuleInit {
   ): Promise<void> {
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] @${username} addressed bot: "${text}"`);
+    const replyToMessage = this.getReplyContext(ctx);
 
     const directMemoryText = this.extractBotMemoryText(text);
     if (directMemoryText != null) {
@@ -443,82 +455,73 @@ export class TelegramUpdate implements OnModuleInit {
         );
         return;
       }
-
-      if (this.isLeaderboardRequest(text)) {
-        await this.replyWithLeaderboard(ctx, messageId);
-        return;
-      }
-
-      if (await this.replyToDictionaryLookup(ctx, text, messageId)) {
-        return;
-      }
-
-      if (this.isWorkingLinksRequest(text)) {
-        const botMemory = await this.telegramService.getBotMemory(
-          chatId,
-          TelegramUpdate.BOT_MEMORY_LIMIT,
-        );
-        await this.replyWithWorkingLinks(ctx, messageId, botMemory);
-        return;
-      }
     }
 
-    const needsRecentMessages =
-      !useAiDictionaryCorrectionFallback &&
-      this.needsRecentMessagesContext(text);
-    const needsBotMemory =
-      !useAiDictionaryCorrectionFallback && this.needsBotMemoryContext(text);
-    const [loadedRecentMessages, botMemory, dictionaryEntries] =
-      await Promise.all([
-        needsRecentMessages
-          ? this.telegramService.getRecentMessages(
-              chatId,
-              threadId,
-              TelegramUpdate.BOT_CONTEXT_SUMMARY_MESSAGE_LIMIT,
-            )
-          : Promise.resolve([]),
-        needsBotMemory
-          ? this.telegramService.getBotMemory(
-              chatId,
-              TelegramUpdate.BOT_MEMORY_LIMIT,
-            )
-          : Promise.resolve([]),
-        this.getDictionaryContextEntries(
-          text,
-          useAiDictionaryCorrectionFallback,
-        ),
-      ]);
+    const [loadedRecentMessages, botMemory] = await Promise.all([
+      this.telegramService.getRecentMessages(
+        chatId,
+        threadId,
+        TelegramUpdate.BOT_CONTEXT_MESSAGE_LIMIT,
+      ),
+      this.telegramService.getBotMemory(
+        chatId,
+        TelegramUpdate.BOT_MEMORY_LIMIT,
+      ),
+    ]);
     const recentMessages = this.limitRecentMessagesByChars(
-      loadedRecentMessages,
+      loadedRecentMessages.filter(
+        (message) =>
+          messageId == null || message.telegramMessageId !== messageId,
+      ),
       TelegramUpdate.BOT_CONTEXT_MAX_CHARS,
+    );
+    const dictionaryEntries = await this.getDictionaryContextEntries(
+      text,
+      [
+        replyToMessage?.text,
+        ...recentMessages.map((message) => message.text),
+      ].filter(Boolean),
     );
     this.logger.log(
       `[Chat ${chatId}] Loaded ${recentMessages.length} recent messages, ${botMemory.length} memory entries and ${dictionaryEntries.length} dictionary entries for AI context`,
     );
 
+    const showTyping = () =>
+      ctx.sendChatAction('typing').catch(() => undefined);
+    await showTyping();
+    const typingTimer = setInterval(() => {
+      void showTyping();
+    }, 4000);
     let result;
     try {
-      result = useAiDictionaryCorrectionFallback
-        ? await this.openaiService.processBotMention(
-            text,
-            recentMessages,
-            botMemory,
-            dictionaryEntries,
-            { forceAction: true },
-          )
-        : await this.openaiService.processBotMention(
-            text,
-            recentMessages,
-            botMemory,
-            dictionaryEntries,
-          );
+      result =
+        useAiDictionaryCorrectionFallback || replyToMessage
+          ? await this.openaiService.processBotMention(
+              text,
+              recentMessages,
+              botMemory,
+              dictionaryEntries,
+              {
+                ...(useAiDictionaryCorrectionFallback
+                  ? { forceAction: true }
+                  : {}),
+                ...(replyToMessage ? { replyToMessage } : {}),
+              },
+            )
+          : await this.openaiService.processBotMention(
+              text,
+              recentMessages,
+              botMemory,
+              dictionaryEntries,
+            );
     } catch (err) {
       this.logDetailedError(
         `[Chat ${chatId}] AI processBotMention failed`,
         err,
       );
       if (messageId != null) {
-        await ctx.reply(
+        await this.replyAndRemember(
+          ctx,
           `❌ Не удалось получить ответ от OpenAI.\n` +
             `Причина: ${this.describeOpenAiFailureForUser(err)}.\n` +
             `Повтори запрос после устранения причины.`,
@@ -528,14 +531,18 @@ export class TelegramUpdate implements OnModuleInit {
         );
       }
       return;
+    } finally {
+      clearInterval(typingTimer);
     }
 
     if (result.action === 'reply') {
       this.logger.log(`[Chat ${chatId}] AI reply: ${result.message}`);
       if (messageId != null) {
-        await ctx.reply(result.message, {
-          reply_parameters: { message_id: messageId },
-        });
+        for (const chunk of this.chunkBotAnswer(result.message)) {
+          await this.replyAndRemember(ctx, chunk, {
+            reply_parameters: { message_id: messageId },
+          });
+        }
       }
       return;
     }
@@ -569,7 +576,8 @@ export class TelegramUpdate implements OnModuleInit {
           `[Chat ${chatId}] Non-admin @${username} tried to delete: ${result.words.join(', ')}`,
         );
         if (messageId != null) {
-          await ctx.reply(
+          await this.replyAndRemember(
+            ctx,
             '🚫 Удалять слова из словаря могут только администраторы.',
             {
               reply_parameters: { message_id: messageId },
@@ -584,7 +592,8 @@ export class TelegramUpdate implements OnModuleInit {
           `[Chat ${chatId}] @${username} delete batch too big: ${result.words.length} words — refused`,
         );
         if (messageId != null) {
-          await ctx.reply(
+          await this.replyAndRemember(
+            ctx,
             `🚫 Нельзя удалить больше ${TelegramUpdate.MAX_DELETE_BATCH} слов за один раз. Перечисли меньше слов или удаляй по частям.`,
             { reply_parameters: { message_id: messageId } },
           );
@@ -618,16 +627,20 @@ export class TelegramUpdate implements OnModuleInit {
             lines.push('Нечего удалять.');
           }
 
-          await ctx.reply(lines.join('\n'), {
+          await this.replyAndRemember(ctx, lines.join('\n'), {
             reply_parameters: { message_id: messageId },
           });
         }
       } catch (err) {
         this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
         if (messageId != null) {
-          await ctx.reply('Ошибка при удалении слов из словаря.', {
-            reply_parameters: { message_id: messageId },
-          });
+          await this.replyAndRemember(
+            ctx,
+            'Ошибка при удалении слов из словаря.',
+            {
+              reply_parameters: { message_id: messageId },
+            },
+          );
         }
       }
       return;
@@ -642,7 +655,8 @@ export class TelegramUpdate implements OnModuleInit {
     );
     if (groundedEntries.length === 0) {
       if (messageId != null) {
-        await ctx.reply(
+        await this.replyAndRemember(
+          ctx,
           '⚠️ Не стал сохранять запись: распознанные слово и перевод не совпали с текстом сообщения. Напиши в формате «слово — перевод».',
           { reply_parameters: { message_id: messageId } },
         );
@@ -762,7 +776,8 @@ export class TelegramUpdate implements OnModuleInit {
     if (messageId == null) return;
 
     if (matches.length === 0) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         `⚠️ не нашёл в словаре слово с переводом «${correction.translation}». Не стал создавать новую запись.`,
         { reply_parameters: { message_id: messageId } },
       );
@@ -773,66 +788,16 @@ export class TelegramUpdate implements OnModuleInit {
       .slice(0, 5)
       .map((entry) => entry.word)
       .join(', ');
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `⚠️ нашёл несколько слов с переводом «${correction.translation}»: ${candidates}. Напиши старое слово явно: «Баласи, исправь старое_слово на ${correction.newWord}».`,
       { reply_parameters: { message_id: messageId } },
     );
   }
 
-  private async replyToDictionaryLookup(
-    ctx: Context,
-    text: string,
-    messageId: number | undefined,
-  ): Promise<boolean> {
-    if (!this.isDictionaryLookupRequest(text)) {
-      return false;
-    }
-
-    const candidates = this.extractDictionaryLookupCandidates(text);
-    if (candidates.length === 0) {
-      return false;
-    }
-
-    const isExistenceRequest = this.isDictionaryExistenceRequest(text);
-    const reverseLookup = this.isRussianToTsintskaroLookupRequest(text);
-    const hasExplicitDirection =
-      reverseLookup || this.isTsintskaroToRussianLookupRequest(text);
-    const searchBothDirections = isExistenceRequest || !hasExplicitDirection;
-    const entries = await this.findDictionaryLookupEntries(
-      candidates,
-      reverseLookup,
-      searchBothDirections,
-    );
-    const message =
-      entries.length > 0
-        ? this.formatDictionaryLookupReply(
-            entries,
-            candidates,
-            isExistenceRequest,
-          )
-        : this.formatMissingDictionaryLookupReply(
-            candidates,
-            searchBothDirections
-              ? 'both'
-              : reverseLookup
-                ? 'russian_translation'
-                : 'tsintskaro_word',
-          );
-
-    if (messageId != null) {
-      await ctx.reply(message, {
-        reply_parameters: { message_id: messageId },
-      });
-      return true;
-    }
-
-    await ctx.reply(message);
-    return true;
-  }
-
   private async getDictionaryContextEntries(
     text: string,
-    includeAllMentionedEntries = false,
+    contextTexts: string[] = [],
   ): Promise<BotDictionaryContextEntry[]> {
     const candidates = this.extractDictionaryLookupCandidates(text);
     const hasExplicitDirection =
@@ -847,27 +812,24 @@ export class TelegramUpdate implements OnModuleInit {
           )
         : [];
 
-    if (includeAllMentionedEntries) {
-      const mentionedEntries =
-        await this.dictionaryService.findRelevantForPrompt(
-          [text],
-          TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT,
-        );
-      const seen = new Set(entries.map((entry) => entry.word.toLowerCase()));
-      for (const entry of mentionedEntries) {
-        if (seen.has(entry.word.toLowerCase())) continue;
-        seen.add(entry.word.toLowerCase());
-        entries.push(entry);
-        if (entries.length >= TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT) {
-          break;
-        }
-      }
+    const mentionedEntries = await this.dictionaryService.findRelevantForPrompt(
+      [text, ...contextTexts],
+      TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT,
+    );
+    const seen = new Set(entries.map((entry) => entry.word.toLowerCase()));
+    for (const entry of mentionedEntries) {
+      if (entries.length >= TelegramUpdate.BOT_DICTIONARY_CONTEXT_LIMIT) break;
+      if (seen.has(entry.word.toLowerCase())) continue;
+      seen.add(entry.word.toLowerCase());
+      entries.push(entry);
     }
 
     return entries.map((entry) => ({
       word: entry.word,
       translation: entry.translation,
       partOfSpeech: entry.partOfSpeech,
+      ...(entry.comments ? { comments: entry.comments } : {}),
+      ...(entry.source ? { source: entry.source } : {}),
     }));
   }
 
@@ -906,76 +868,6 @@ export class TelegramUpdate implements OnModuleInit {
     return entries;
   }
 
-  private formatDictionaryLookupReply(
-    entries: DictionaryEntry[],
-    candidates: string[],
-    isExistenceRequest: boolean,
-  ): string {
-    const heading = isExistenceRequest
-      ? entries.length === 1
-        ? `Да, нашёл в словаре запись для «${candidates.join(', ')}»:`
-        : `Да, нашёл в словаре ${entries.length} подходящих записей для «${candidates.join(', ')}»:`
-      : entries.length === 1
-        ? 'Нашёл в словаре:'
-        : `Нашёл в словаре ${entries.length} подходящих записей:`;
-
-    const details = entries.map((entry, index) => {
-      const lines = [
-        `Слово: ${entry.word}`,
-        `Перевод: ${entry.translation}`,
-        `Часть речи: ${entry.partOfSpeech || 'не указана'}`,
-      ];
-
-      const source = this.formatDictionarySource(entry.source);
-      if (source) lines.push(`Источник: ${source}`);
-      if (entry.comments?.trim()) {
-        lines.push(`Примечание: ${entry.comments.trim()}`);
-      }
-
-      if (entries.length === 1) return lines.join('\n');
-      return `${index + 1}. ${lines.join('\n   ')}`;
-    });
-
-    return [heading, ...details].join('\n\n');
-  }
-
-  private formatMissingDictionaryLookupReply(
-    candidates: string[],
-    mode: 'both' | 'russian_translation' | 'tsintskaro_word',
-  ): string {
-    const label = candidates.map((candidate) => `«${candidate}»`).join(', ');
-    const checked =
-      mode === 'both'
-        ? 'среди цинцкарских слов и русских переводов'
-        : mode === 'russian_translation'
-          ? 'среди русских переводов'
-          : 'среди цинцкарских слов';
-    return `Проверил ${label} ${checked}: в нашем словаре точного совпадения пока нет. Проверь написание или добавь это значение в словарь.`;
-  }
-
-  private formatDictionarySource(
-    source: DictionaryEntry['source'],
-  ): string | null {
-    if (source === 'etalon') return 'эталонный словарь';
-    if (source === 'rabochy') return 'рабочий словарь';
-    if (source === 'chat') return 'добавлено участниками чата';
-    return null;
-  }
-
-  private isDictionaryLookupRequest(text: string): boolean {
-    return (
-      /(?:как\s+(?:(?:на\s+(?:русском|цинцкарском)|по[-\s]+(?:русски|цинцкарски))\s+)?(?:будет|сказать)|как\s+перевести|переведи|что\s+(?:значит|означает)|значение\s+слова|перевод\s+слова|на\s+русск|на\s+цинцкарск|по[-\s]+русски|по[-\s]+цинцкарски)/i.test(
-        text,
-      ) || this.isDictionaryExistenceRequest(text)
-    );
-  }
-
-  private isDictionaryExistenceRequest(text: string): boolean {
-    return /(?:(?:есть|имеется)\s+(?:ли\s+)?(?:такое\s+)?(?:слово|выражение|фраза)(?=$|[\s,.:;!?—-])|есть\s+ли[^?.!]*словар|в\s+(?:нашем\s+)?словаре\s+(?:есть|имеется)|(?:есть|имеется)[^?.!]*в\s+(?:нашем\s+)?словаре|(?:проверь|посмотри|найди|поищи)[^?.!]*словар)/i.test(
-      text,
-    );
-  }
-
   private isRussianToTsintskaroLookupRequest(text: string): boolean {
     return /(?:на\s+цинцкарск(?:ий|ом|ого)?|по[-\s]+цинцкарски)/i.test(text);
   }
@@ -993,7 +885,7 @@ export class TelegramUpdate implements OnModuleInit {
 
     const quoted = /[«"“„](.+?)[»"”]/g;
     for (const match of body.matchAll(quoted)) {
-      this.addDictionaryLookupCandidate(candidates, match[1]);
+      this.addDictionaryLookupCandidate(candidates, match[1], true);
     }
 
     const patterns = [
@@ -1024,8 +916,17 @@ export class TelegramUpdate implements OnModuleInit {
   private addDictionaryLookupCandidate(
     candidates: string[],
     rawValue: string,
+    explicitlyQuoted = false,
   ): void {
     const candidate = this.cleanDictionaryLookupCandidate(rawValue);
+    if (
+      !explicitlyQuoted &&
+      /^(?:его|е[её]|их|он[аои]?|этот|эту|эти|такое)(?:\s+(?:слово|слова|фразу|выражение))?$/i.test(
+        candidate,
+      )
+    ) {
+      return;
+    }
     if (
       !candidate ||
       candidates.includes(candidate) ||
@@ -1393,13 +1294,13 @@ export class TelegramUpdate implements OnModuleInit {
       }
 
       if (lines.length === 0) {
-        await ctx.reply('Не получилось ничего сохранить.', {
+        await this.replyAndRemember(ctx, 'Не получилось ничего сохранить.', {
           reply_parameters: { message_id: messageId },
         });
         return;
       }
 
-      await ctx.reply(lines.join('\n'), {
+      await this.replyAndRemember(ctx, lines.join('\n'), {
         reply_parameters: { message_id: messageId },
       });
     }
@@ -1653,7 +1554,8 @@ export class TelegramUpdate implements OnModuleInit {
   ): Promise<DictionaryUpdateHandlingResult> {
     if (entries.length > TelegramUpdate.MAX_UPDATE_BATCH) {
       if (messageId != null) {
-        await ctx.reply(
+        await this.replyAndRemember(
+          ctx,
           `За один раз можно поправить до ${TelegramUpdate.MAX_UPDATE_BATCH} слов. Пришли остальные отдельно.`,
           { reply_parameters: { message_id: messageId } },
         );
@@ -1744,13 +1646,17 @@ export class TelegramUpdate implements OnModuleInit {
       if (options.deferUnresolvedReply && needsAiFallback) {
         return result;
       }
-      await ctx.reply('Не понял, что именно нужно поправить.', {
-        reply_parameters: { message_id: messageId },
-      });
+      await this.replyAndRemember(
+        ctx,
+        'Не понял, что именно нужно поправить.',
+        {
+          reply_parameters: { message_id: messageId },
+        },
+      );
       return result;
     }
 
-    await ctx.reply(lines.join('\n'), {
+    await this.replyAndRemember(ctx, lines.join('\n'), {
       reply_parameters: { message_id: messageId },
     });
     return result;
@@ -1774,9 +1680,13 @@ export class TelegramUpdate implements OnModuleInit {
   ): Promise<void> {
     if (!(await this.isAdmin(ctx, username))) {
       if (messageId != null) {
-        await ctx.reply('Память бота могут менять только администраторы.', {
-          reply_parameters: { message_id: messageId },
-        });
+        await this.replyAndRemember(
+          ctx,
+          'Память бота могут менять только администраторы.',
+          {
+            reply_parameters: { message_id: messageId },
+          },
+        );
       }
       return;
     }
@@ -1784,7 +1694,7 @@ export class TelegramUpdate implements OnModuleInit {
     const trimmed = memoryText.trim();
     if (!trimmed) {
       if (messageId != null) {
-        await ctx.reply('Что именно добавить в память?', {
+        await this.replyAndRemember(ctx, 'Что именно добавить в память?', {
           reply_parameters: { message_id: messageId },
         });
       }
@@ -1802,43 +1712,121 @@ export class TelegramUpdate implements OnModuleInit {
         `[Chat ${chatId}] @${username} added bot memory: "${trimmed}"`,
       );
       if (messageId != null) {
-        await ctx.reply('🧠 Запомнил.', {
+        await this.replyAndRemember(ctx, '🧠 Запомнил.', {
           reply_parameters: { message_id: messageId },
         });
       }
     } catch (err) {
       this.logger.error(`[Chat ${chatId}] addBotMemory failed:`, err);
       if (messageId != null) {
-        await ctx.reply('Не получилось сохранить в память, попробуй ещё раз.', {
-          reply_parameters: { message_id: messageId },
-        });
+        await this.replyAndRemember(
+          ctx,
+          'Не получилось сохранить в память, попробуй ещё раз.',
+          {
+            reply_parameters: { message_id: messageId },
+          },
+        );
       }
     }
   }
 
-  private isWorkingLinksRequest(text: string): boolean {
-    return TelegramUpdate.WORKING_LINKS_REQUEST_REGEX.test(text);
+  private getReplyContext(ctx: Context): ConversationMessage | undefined {
+    const message = ctx.message;
+    if (!message || !('reply_to_message' in message)) return undefined;
+    const reply = message.reply_to_message;
+    if (!reply) return undefined;
+    const text =
+      'text' in reply
+        ? reply.text
+        : 'caption' in reply
+          ? reply.caption
+          : undefined;
+    if (!text) return undefined;
+    return {
+      text,
+      username: reply.from?.username || reply.from?.first_name || 'anonymous',
+      sentAt: new Date(reply.date * 1000),
+      telegramMessageId: reply.message_id,
+      isBot: reply.from?.id === ctx.botInfo?.id,
+    };
   }
 
-  private needsRecentMessagesContext(text: string): boolean {
-    return TelegramUpdate.RECENT_MESSAGES_CONTEXT_REGEX.test(text);
+  private async rememberContextMessage(
+    message: ConversationMessage & { chatId: number; threadId: number | null },
+  ): Promise<void> {
+    try {
+      await this.telegramService.saveContextMessage(message);
+    } catch (error) {
+      this.logger.error(
+        `Could not save conversation context in chat ${message.chatId}`,
+        error,
+      );
+    }
   }
 
-  private needsBotMemoryContext(text: string): boolean {
-    return TelegramUpdate.BOT_MEMORY_CONTEXT_REGEX.test(text);
+  private chunkBotAnswer(text: string): string[] {
+    const chunks: string[] = [];
+    let offset = 0;
+    while (offset < text.length) {
+      let end = Math.min(offset + 4000, text.length);
+      if (end < text.length) {
+        const newline = text.lastIndexOf('\n', end - 1);
+        const space = text.lastIndexOf(' ', end - 1);
+        const boundary = newline > offset + 2000 ? newline : space;
+        if (boundary > offset + 2000) end = boundary + 1;
+        if (/[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+      }
+      chunks.push(text.slice(offset, end));
+      offset = end;
+    }
+    return chunks;
+  }
+
+  private async replyAndRemember(
+    ctx: Context,
+    ...args: Parameters<Context['reply']>
+  ) {
+    const sent = await ctx.reply(...args);
+    if (sent && ctx.chat && !this.isPrivateChat(ctx)) {
+      await this.rememberContextMessage({
+        chatId: ctx.chat.id,
+        threadId:
+          sent.message_thread_id ??
+          (ctx.message && 'message_thread_id' in ctx.message
+            ? ctx.message.message_thread_id
+            : null) ??
+          null,
+        telegramMessageId: sent.message_id,
+        text: sent.text,
+        username: sent.from?.username || 'Баласи',
+        sentAt: new Date(sent.date * 1000),
+        isBot: true,
+      });
+    }
+    return sent;
   }
 
   private limitRecentMessagesByChars(
-    messages: { username: string; text: string; sentAt: Date }[],
+    messages: ConversationMessage[],
     maxChars: number,
-  ): { username: string; text: string; sentAt: Date }[] {
-    const selected: { username: string; text: string; sentAt: Date }[] = [];
+  ): ConversationMessage[] {
+    const selected: ConversationMessage[] = [];
     let totalChars = 0;
 
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       const estimatedChars = message.text.length + message.username.length + 24;
-      if (selected.length > 0 && totalChars + estimatedChars > maxChars) {
+      if (totalChars + estimatedChars > maxChars) {
+        if (selected.length === 0) {
+          selected.unshift({
+            ...message,
+            text:
+              message.text.slice(
+                0,
+                Math.max(0, maxChars - message.username.length - 25),
+              ) + '…',
+          });
+        }
         break;
       }
       selected.unshift(message);
@@ -1846,10 +1834,6 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     return selected;
-  }
-
-  private isLeaderboardRequest(text: string): boolean {
-    return TelegramUpdate.LEADERBOARD_REQUEST_REGEX.test(text);
   }
 
   private async replyWithLeaderboard(
@@ -1860,13 +1844,13 @@ export class TelegramUpdate implements OnModuleInit {
     const message = this.formatLeaderboardMessage(leaders);
 
     if (messageId != null) {
-      await ctx.reply(message, {
+      await this.replyAndRemember(ctx, message, {
         reply_parameters: { message_id: messageId },
       });
       return;
     }
 
-    await ctx.reply(message);
+    await this.replyAndRemember(ctx, message);
   }
 
   private formatLeaderboardMessage(
@@ -1889,59 +1873,23 @@ export class TelegramUpdate implements OnModuleInit {
     return '🏆 Топ добавивших слова:\n' + lines.join('\n');
   }
 
-  private async replyWithWorkingLinks(
-    ctx: Context,
-    messageId: number | undefined,
-    botMemory: BotMemoryEntry[],
-  ): Promise<void> {
-    const siteUrl = this.findSiteUrlInMemory(botMemory);
-
-    const message = siteUrl
-      ? `Рабочая ссылка: ${siteUrl}`
-      : 'Ссылка на сайт пока не сохранена. Добавь её в память командой /memoryadd Сайт: и вставь полный URL.';
-
-    if (messageId != null) {
-      await ctx.reply(message, {
-        reply_parameters: { message_id: messageId },
-      });
-      return;
-    }
-
-    await ctx.reply(message);
-  }
-
-  private findSiteUrlInMemory(botMemory: BotMemoryEntry[]): string | null {
-    const siteEntries = botMemory.filter((entry) =>
-      /(?:сайт|site|url|ссылка)/i.test(entry.text),
-    );
-    const preferred = this.findFirstUrl(siteEntries);
-    if (preferred) return preferred;
-    return this.findFirstUrl(botMemory);
-  }
-
-  private findFirstUrl(botMemory: BotMemoryEntry[]): string | null {
-    for (const entry of botMemory) {
-      const match = entry.text.match(TelegramUpdate.URL_REGEX);
-      if (match) {
-        return match[0].replace(/[),.;!?]+$/, '');
-      }
-    }
-    return null;
-  }
-
   @Command('status')
   async onStatus(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) {
       return;
     }
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] Received /status command`);
     const count = await this.telegramService.getCount(chatId);
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `📊 Собрано сообщений: ${count}/${this.threshold}\n` +
         `Используйте /report для создания отчёта.`,
     );
@@ -1953,7 +1901,10 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
@@ -1967,18 +1918,24 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
     await this.telegramService.clearBuffer(chatId);
-    await ctx.reply('🗑 Буфер очищен.');
+    await this.replyAndRemember(ctx, '🗑 Буфер очищен.');
   }
 
   @Command('leaderboard')
   async onLeaderboard(@Ctx() ctx: Context) {
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
@@ -1988,11 +1945,15 @@ export class TelegramUpdate implements OnModuleInit {
   @Command('rules')
   async onRules(@Ctx() ctx: Context) {
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '📚 <b>Правила цинцкарского языка</b>\n\n' +
         '<b>Существительные</b>\n' +
         'Нет рода. Есть единственное и множественное число, а также падежи.\n\n' +
@@ -2026,14 +1987,17 @@ export class TelegramUpdate implements OnModuleInit {
   async onMemory(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     const chatId = ctx.chat!.id;
     const entries = await this.telegramService.listBotMemory(chatId, 50);
     if (entries.length === 0) {
-      await ctx.reply('Память бота пока пустая.');
+      await this.replyAndRemember(ctx, 'Память бота пока пустая.');
       return;
     }
 
@@ -2047,7 +2011,7 @@ export class TelegramUpdate implements OnModuleInit {
       '\n\n/memoryadd текст\n/memoryedit id новый текст\n/memorydel id';
 
     for (const chunk of this.chunkString(message, 3900)) {
-      await ctx.reply(chunk);
+      await this.replyAndRemember(ctx, chunk);
     }
   }
 
@@ -2055,13 +2019,16 @@ export class TelegramUpdate implements OnModuleInit {
   async onMemoryAdd(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     const payload = this.getCommandPayload(ctx, ['memoryadd']);
     if (!payload) {
-      await ctx.reply('Напиши так: /memoryadd что запомнить');
+      await this.replyAndRemember(ctx, 'Напиши так: /memoryadd что запомнить');
       return;
     }
 
@@ -2076,21 +2043,27 @@ export class TelegramUpdate implements OnModuleInit {
       username,
     );
 
-    await ctx.reply(`🧠 Добавил в память #${saved.id}.`);
+    await this.replyAndRemember(ctx, `🧠 Добавил в память #${saved.id}.`);
   }
 
   @Command('memoryedit')
   async onMemoryEdit(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     const payload = this.getCommandPayload(ctx, ['memoryedit']);
     const parsed = payload.match(/^#?(\d+)\s+([\s\S]+)$/);
     if (!parsed || !parsed[2].trim()) {
-      await ctx.reply('Напиши так: /memoryedit id новый текст');
+      await this.replyAndRemember(
+        ctx,
+        'Напиши так: /memoryedit id новый текст',
+      );
       return;
     }
 
@@ -2104,11 +2077,14 @@ export class TelegramUpdate implements OnModuleInit {
     );
 
     if (!updated) {
-      await ctx.reply('Не нашёл такую запись памяти для этого чата.');
+      await this.replyAndRemember(
+        ctx,
+        'Не нашёл такую запись памяти для этого чата.',
+      );
       return;
     }
 
-    await ctx.reply(`🧠 Обновил память #${updated.id}.`);
+    await this.replyAndRemember(ctx, `🧠 Обновил память #${updated.id}.`);
   }
 
   @Command('memorydel')
@@ -2116,14 +2092,17 @@ export class TelegramUpdate implements OnModuleInit {
   async onMemoryDelete(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     const payload = this.getCommandPayload(ctx, ['memorydel', 'memorydelete']);
     const parsed = payload.match(/^#?(\d+)$/);
     if (!parsed) {
-      await ctx.reply('Напиши так: /memorydel id');
+      await this.replyAndRemember(ctx, 'Напиши так: /memorydel id');
       return;
     }
 
@@ -2136,11 +2115,14 @@ export class TelegramUpdate implements OnModuleInit {
     );
 
     if (!deleted) {
-      await ctx.reply('Не нашёл такую запись памяти для этого чата.');
+      await this.replyAndRemember(
+        ctx,
+        'Не нашёл такую запись памяти для этого чата.',
+      );
       return;
     }
 
-    await ctx.reply(`🧠 Удалил память #${parsed[1]}.`);
+    await this.replyAndRemember(ctx, `🧠 Удалил память #${parsed[1]}.`);
   }
 
   @Command('setsummarythread')
@@ -2148,7 +2130,10 @@ export class TelegramUpdate implements OnModuleInit {
   async onSetSummaryThread(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      await this.replyAndRemember(
+        ctx,
+        'Команду нужно вызывать в группе (и нужном топике).',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
@@ -2158,7 +2143,8 @@ export class TelegramUpdate implements OnModuleInit {
 
     await this.telegramService.setSummaryTarget(chatId, threadId, username);
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `✅ Отчёты и подробные описания обсуждений будут приходить сюда.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>`,
@@ -2170,11 +2156,15 @@ export class TelegramUpdate implements OnModuleInit {
   async onClearSummaryThread(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     await this.telegramService.clearSummaryTarget();
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '🛑 Отдельный топик отчётов отключён. Используйте /setsummarythread чтобы включить снова.',
     );
   }
@@ -2183,19 +2173,24 @@ export class TelegramUpdate implements OnModuleInit {
   async onSummaryThreadStatus(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const target = await this.telegramService.getSummaryTarget();
     if (!target) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Топик отчётов не настроен.\nВызови /setsummarythread в нужном топике.',
       );
       return;
     }
     const setAt =
       target.setAt instanceof Date ? target.setAt : new Date(target.setAt);
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `📍 Отчёты идут сюда:\n` +
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
@@ -2209,7 +2204,10 @@ export class TelegramUpdate implements OnModuleInit {
   async onSetPollChat(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      await this.replyAndRemember(
+        ctx,
+        'Команду нужно вызывать в группе (и нужном топике).',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
@@ -2219,7 +2217,8 @@ export class TelegramUpdate implements OnModuleInit {
 
     await this.pollConfigService.set(chatId, threadId, username);
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `✅ Опросы будут приходить сюда.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
@@ -2232,11 +2231,15 @@ export class TelegramUpdate implements OnModuleInit {
   async onClearPollChat(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     await this.pollConfigService.clear();
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '🛑 Опросы отключены. Используйте /setpollchat чтобы включить снова.',
     );
   }
@@ -2245,19 +2248,24 @@ export class TelegramUpdate implements OnModuleInit {
   async onPollStatus(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const target = await this.pollConfigService.get();
     if (!target) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Опросы не настроены.\nВызови /setpollchat в нужном топике.',
       );
       return;
     }
     const setAt =
       target.setAt instanceof Date ? target.setAt : new Date(target.setAt);
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `📍 Опросы идут сюда:\n` +
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
@@ -2272,15 +2280,21 @@ export class TelegramUpdate implements OnModuleInit {
   async onPollNow(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const target = await this.pollConfigService.get();
     if (!target) {
-      await ctx.reply('⚠️ Сначала настрой через /setpollchat.');
+      await this.replyAndRemember(
+        ctx,
+        '⚠️ Сначала настрой через /setpollchat.',
+      );
       return;
     }
-    await ctx.reply('🚀 Отправляю пару опросов...');
+    await this.replyAndRemember(ctx, '🚀 Отправляю пару опросов...');
     await this.pollScheduler.sendBoth();
   }
 
@@ -2302,7 +2316,8 @@ export class TelegramUpdate implements OnModuleInit {
       username,
     );
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `✅ Ежедневный отчёт по OpenAI токенам будет приходить сюда.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет'}</code>\n\n` +
@@ -2316,7 +2331,8 @@ export class TelegramUpdate implements OnModuleInit {
     if (!(await this.requireAdmin(ctx))) return;
 
     await this.openaiUsageService.clearReportTarget();
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '🛑 Ежедневный отчёт по OpenAI токенам отключён. Используйте /settokenreport чтобы включить снова.',
     );
   }
@@ -2337,7 +2353,7 @@ export class TelegramUpdate implements OnModuleInit {
     );
 
     for (const chunk of this.chunkString(report, 3900)) {
-      await ctx.reply(chunk);
+      await this.replyAndRemember(ctx, chunk);
     }
   }
 
@@ -2345,7 +2361,10 @@ export class TelegramUpdate implements OnModuleInit {
   async onSetReviewChat(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      await this.replyAndRemember(
+        ctx,
+        'Команду нужно вызывать в группе (и нужном топике).',
+      );
       return;
     }
 
@@ -2356,7 +2375,8 @@ export class TelegramUpdate implements OnModuleInit {
 
     await this.wordReviewService.setTarget(chatId, threadId, username);
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `✅ Проверка словаря будет приходить сюда.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
@@ -2370,12 +2390,16 @@ export class TelegramUpdate implements OnModuleInit {
   async onClearReviewChat(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     await this.wordReviewService.clearTarget();
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '🛑 Проверка словаря отключена. Используйте /setreviewchat чтобы включить снова.',
     );
   }
@@ -2384,13 +2408,17 @@ export class TelegramUpdate implements OnModuleInit {
   async onReviewStatus(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     const status = await this.wordReviewService.getStatus();
     if (!status.target) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Проверка словаря не настроена.\nВызови /setreviewchat в нужном топике.',
       );
       return;
@@ -2407,7 +2435,8 @@ export class TelegramUpdate implements OnModuleInit {
         ).toISOString()
       : 'ещё не отправляли';
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `📍 Проверка словаря идёт сюда:\n` +
         `chat_id: <code>${status.target.chatId}</code>\n` +
         `thread_id: <code>${status.target.threadId ?? 'нет (общий чат)'}</code>\n` +
@@ -2421,7 +2450,8 @@ export class TelegramUpdate implements OnModuleInit {
     );
 
     if (status.activeBatch) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         `Активный пакет №${status.activeBatch.id}: ` +
           `${status.activeBatch.confirmed}/${status.activeBatch.total} подтверждено, ` +
           `${status.activeBatch.awaitingCorrection} ожидают исправления.`,
@@ -2433,31 +2463,44 @@ export class TelegramUpdate implements OnModuleInit {
   async onReviewNow(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
 
     try {
       const result = await this.wordReviewService.sendReviewBatch();
       if (result.status === 'no_target') {
-        await ctx.reply('⚠️ Сначала настрой через /setreviewchat.');
+        await this.replyAndRemember(
+          ctx,
+          '⚠️ Сначала настрой через /setreviewchat.',
+        );
         return;
       }
       if (result.status === 'no_words') {
-        await ctx.reply('Все chat-слова уже отправлялись на проверку.');
+        await this.replyAndRemember(
+          ctx,
+          'Все chat-слова уже отправлялись на проверку.',
+        );
         return;
       }
       if (result.status === 'active_batch') {
-        await ctx.reply(
+        await this.replyAndRemember(
+          ctx,
           'Сначала нужно завершить текущий пакет. Исправляемые слова задерживают весь пакет.',
         );
         return;
       }
 
-      await ctx.reply(`✅ Отправил ${result.count} слов на проверку.`);
+      await this.replyAndRemember(
+        ctx,
+        `✅ Отправил ${result.count} слов на проверку.`,
+      );
     } catch (err) {
       this.logger.error('Manual word review failed', err);
-      await ctx.reply('Ошибка при отправке слов на проверку.');
+      await this.replyAndRemember(ctx, 'Ошибка при отправке слов на проверку.');
     }
   }
 
@@ -2465,7 +2508,10 @@ export class TelegramUpdate implements OnModuleInit {
   async onStartFactDay(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      await this.replyAndRemember(
+        ctx,
+        'Команду нужно вызывать в группе (и нужном топике).',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
@@ -2475,7 +2521,8 @@ export class TelegramUpdate implements OnModuleInit {
 
     await this.factDayConfigService.set(chatId, threadId, username);
 
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `✅ Исторический квиз Цинцкаро запущен в этом топике.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
@@ -2489,17 +2536,22 @@ export class TelegramUpdate implements OnModuleInit {
   async onStopFactDay(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const disabled = await this.factDayConfigService.disable();
     if (!disabled) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Исторический квиз ещё не настроен. Включи через /startfactday в нужном топике.',
       );
       return;
     }
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '🛑 Исторический квиз отключён. Настройка сохранена, включить снова можно через /startfactday.',
     );
   }
@@ -2508,12 +2560,16 @@ export class TelegramUpdate implements OnModuleInit {
   async onFactDayStatus(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const target = await this.factDayConfigService.get();
     if (!target) {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Исторический квиз не настроен.\nВызови /startfactday в нужном топике.',
       );
       return;
@@ -2523,7 +2579,8 @@ export class TelegramUpdate implements OnModuleInit {
     const quizCount = this.factDayScheduler.getFactsCount();
     const nextQuizNumber =
       (((target.nextFactIndex % quizCount) + quizCount) % quizCount) + 1;
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `📍 Исторический квиз:\n` +
         `статус: ${target.enabled === false ? 'отключён' : 'включён'}\n` +
         `chat_id: <code>${target.chatId}</code>\n` +
@@ -2541,7 +2598,10 @@ export class TelegramUpdate implements OnModuleInit {
   async onFactDayNow(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Этот бот работает только в групповых чатах.');
+      await this.replyAndRemember(
+        ctx,
+        'Этот бот работает только в групповых чатах.',
+      );
       return;
     }
     const result = await this.factDayScheduler.sendNext(true);
@@ -2549,16 +2609,21 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (result.reason === 'not_configured') {
-      await ctx.reply('⚠️ Сначала настрой через /startfactday.');
+      await this.replyAndRemember(
+        ctx,
+        '⚠️ Сначала настрой через /startfactday.',
+      );
       return;
     }
     if (result.reason === 'disabled') {
-      await ctx.reply(
+      await this.replyAndRemember(
+        ctx,
         '⚠️ Исторический квиз отключён. Включи через /startfactday.',
       );
       return;
     }
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       '❌ Не получилось отправить исторический квиз. Проверь логи бота.',
     );
   }
@@ -2567,13 +2632,17 @@ export class TelegramUpdate implements OnModuleInit {
   async onThreadId(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
-      await ctx.reply('Команду нужно вызывать в группе (и нужном топике).');
+      await this.replyAndRemember(
+        ctx,
+        'Команду нужно вызывать в группе (и нужном топике).',
+      );
       return;
     }
     const chatId = ctx.chat!.id;
     const message = ctx.message as { message_thread_id?: number };
     const threadId = message.message_thread_id ?? null;
-    await ctx.reply(
+    await this.replyAndRemember(
+      ctx,
       `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>`,
       { parse_mode: 'HTML' },
@@ -2619,7 +2688,7 @@ export class TelegramUpdate implements OnModuleInit {
 
       if (messagesText.length === 0) {
         this.reportFailureNotifications.delete(chatId);
-        await ctx.reply('Сообщений пока нет.');
+        await this.replyAndRemember(ctx, 'Сообщений пока нет.');
         return;
       }
 
@@ -2684,7 +2753,7 @@ export class TelegramUpdate implements OnModuleInit {
         notifyRepeatedFailure ||
         previousFingerprint !== failure.fingerprint
       ) {
-        await ctx.reply(failure.message);
+        await this.replyAndRemember(ctx, failure.message);
       }
     }
   }

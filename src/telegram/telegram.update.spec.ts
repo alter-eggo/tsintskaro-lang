@@ -48,6 +48,10 @@ describe('TelegramUpdate bot mentions', () => {
       })),
     };
     const telegramService = {
+      saveContextMessage: jest.fn(async (message: any) => {
+        void message;
+      }),
+      addMessage: jest.fn(async () => 1),
       getRecentMessages: jest.fn(async () => []),
       getBotMemory: jest.fn(async () => []),
       ensureDefaultGlobalMemory: jest.fn(),
@@ -91,6 +95,7 @@ describe('TelegramUpdate bot mentions', () => {
       message: {},
       from: { username: 'AAlxnv' },
       reply: jest.fn(),
+      sendChatAction: jest.fn(async () => true),
       replyWithPhoto: jest.fn(),
       telegram: { setMessageReaction: jest.fn() },
     };
@@ -557,9 +562,8 @@ describe('TelegramUpdate bot mentions', () => {
     });
   });
 
-  it('still replies with the leaderboard for an explicit leaderboard request', async () => {
+  it('lets the model handle a conversational leaderboard request', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
     await (update as any).handleBotMention(
       ctx,
       'Баласи, покажи топ добавивших слова',
@@ -567,14 +571,11 @@ describe('TelegramUpdate bot mentions', () => {
       123,
       null,
     );
-
-    expect(dictionaryService.getLeaderboard).toHaveBeenCalledTimes(1);
     expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '🏆 Топ добавивших слова:\n1. @anonymous — 410 слов',
-      { reply_parameters: { message_id: 123 } },
-    );
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('sends formatted noun plural rules for /rules', async () => {
@@ -622,7 +623,7 @@ describe('TelegramUpdate bot mentions', () => {
     expect(ctx.reply).toHaveBeenCalledWith('✅ Отправил 10 слов на проверку.');
   });
 
-  it('answers a direct dictionary lookup locally without OpenAI', async () => {
+  it('uses the model for a direct dictionary question with matching entries', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
     dictionaryService.findWord.mockResolvedValueOnce({
       word: 'сахгкал оти',
@@ -640,13 +641,10 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('сахгкал оти');
     expect(dictionaryService.findByTranslation).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Нашёл в словаре:\n\nСлово: сахгкал оти\nПеревод: укроп\nЧасть речи: сущ.',
-      {
-        reply_parameters: { message_id: 123 },
-      },
-    );
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('searches both dictionary directions when translation direction is omitted', async () => {
@@ -669,14 +667,10 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('привет');
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Нашёл в словаре:\n\n' +
-        'Слово: салам\n' +
-        'Перевод: привет\n' +
-        'Часть речи: междометие',
-      { reply_parameters: { message_id: 123 } },
-    );
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('answers the natural "как будет" translation wording from the dictionary', async () => {
@@ -700,15 +694,10 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('порез');
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('порез');
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Нашёл в словаре:\n\n' +
-        'Слово: чâсич\n' +
-        'Перевод: порез\n' +
-        'Часть речи: не указана\n' +
-        'Источник: добавлено участниками чата',
-      { reply_parameters: { message_id: 123 } },
-    );
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('handles a short existence question without the word "словарь"', async () => {
@@ -729,11 +718,11 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('есыр');
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('есыр');
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalled();
   });
 
-  it('explains that both dictionary directions were checked when no match exists', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate();
+  it('lets the model resolve a local lookup miss using context and the dictionary tool', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
 
     await (update as any).handleBotMention(
       ctx,
@@ -745,24 +734,22 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('привет');
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Проверил «привет» среди цинцкарских слов и русских переводов: ' +
-        'в нашем словаре точного совпадения пока нет. ' +
-        'Проверь написание или добавь это значение в словарь.',
-      { reply_parameters: { message_id: 123 } },
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Бот, как перевести слово привет?',
+      [],
+      [],
+      [],
     );
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('understands an explicit translation direction after the word', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate();
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
     dictionaryService.findByTranslation.mockResolvedValueOnce([
-      {
-        word: 'салам',
-        translation: 'привет',
-        partOfSpeech: 'междометие',
-      },
+      { word: 'салам', translation: 'привет', partOfSpeech: 'междометие' },
     ]);
-
     await (update as any).handleBotMention(
       ctx,
       'Бот, как перевести слово привет по-цинцкарски?',
@@ -770,9 +757,9 @@ describe('TelegramUpdate bot mentions', () => {
       123,
       null,
     );
-
     expect(dictionaryService.findWord).not.toHaveBeenCalled();
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('привет');
+    expect(openaiService.processBotMention).toHaveBeenCalled();
   });
 
   it('shows OpenAI diagnostics when a bot reply fails', async () => {
@@ -823,11 +810,10 @@ describe('TelegramUpdate bot mentions', () => {
 
     expect(dictionaryService.findWord).toHaveBeenCalledWith('урожай');
     expect(dictionaryService.findByTranslation).toHaveBeenCalledWith('урожай');
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Да, нашёл в словаре запись для «урожай»:\n\nСлово: махсыл\nПеревод: урожай\nЧасть речи: существительное\nИсточник: эталонный словарь\nПримечание: Общее название собранного урожая.',
-      { reply_parameters: { message_id: 123 } },
-    );
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith('ok', {
+      reply_parameters: { message_id: 123 },
+    });
   });
 
   it('reports the exact OpenAI stage and request id when report analysis fails', async () => {
@@ -1099,7 +1085,7 @@ describe('TelegramUpdate bot mentions', () => {
     expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
     expect(dictionaryService.findRelevantForPrompt).toHaveBeenCalledWith(
       [text],
-      5,
+      30,
     );
     expect(openaiService.processBotMention).toHaveBeenCalledWith(
       text,
@@ -1248,7 +1234,42 @@ describe('TelegramUpdate bot mentions', () => {
     });
   });
 
-  it('does not load chat history or memory for an ordinary AI question', async () => {
+  it('preserves conversation and saved rules for a natural follow-up', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    const recentMessages = [
+      {
+        username: 'alice',
+        text: 'Обсуждаем слово ширин.',
+        sentAt: new Date('2026-07-15T08:00:00.000Z'),
+      },
+    ];
+    const memory = [
+      {
+        text: 'Множественное число образуется по правилам цинцкарского языка.',
+        createdBy: 'admin',
+        createdAt: new Date('2026-07-15T08:00:00.000Z'),
+      },
+    ];
+    telegramService.getRecentMessages.mockResolvedValueOnce(recentMessages);
+    telegramService.getBotMemory.mockResolvedValueOnce(memory);
+
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, а во множественном числе?',
+      'AAlxnv',
+      123,
+      42,
+    );
+
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, а во множественном числе?',
+      recentMessages,
+      memory,
+      [],
+    );
+  });
+
+  it('loads chat history and memory for an ordinary AI question', async () => {
     const { update, ctx, openaiService, telegramService } = makeUpdate();
 
     await (update as any).handleBotMention(
@@ -1259,8 +1280,12 @@ describe('TelegramUpdate bot mentions', () => {
       null,
     );
 
-    expect(telegramService.getRecentMessages).not.toHaveBeenCalled();
-    expect(telegramService.getBotMemory).not.toHaveBeenCalled();
+    expect(telegramService.getRecentMessages).toHaveBeenCalledWith(
+      -100,
+      null,
+      50,
+    );
+    expect(telegramService.getBotMemory).toHaveBeenCalledWith(-100, 50);
     expect(openaiService.processBotMention).toHaveBeenCalledWith(
       'Баласи, помоги красиво сформулировать объявление',
       [],
@@ -1269,7 +1294,7 @@ describe('TelegramUpdate bot mentions', () => {
     );
   });
 
-  it('loads recent messages only for a conversation summary request', async () => {
+  it('loads history and memory for a conversation summary request', async () => {
     const { update, ctx, openaiService, telegramService } = makeUpdate();
     const recentMessages = [
       {
@@ -1293,7 +1318,7 @@ describe('TelegramUpdate bot mentions', () => {
       null,
       50,
     );
-    expect(telegramService.getBotMemory).not.toHaveBeenCalled();
+    expect(telegramService.getBotMemory).toHaveBeenCalledWith(-100, 50);
     expect(openaiService.processBotMention).toHaveBeenCalledWith(
       'Баласи, о чём говорили в последних сообщениях?',
       recentMessages,
@@ -1302,7 +1327,7 @@ describe('TelegramUpdate bot mentions', () => {
     );
   });
 
-  it('loads memory without chat history for a community context question', async () => {
+  it('loads memory and chat history for a community context question', async () => {
     const { update, ctx, openaiService, telegramService } = makeUpdate();
     const memory = [
       {
@@ -1321,7 +1346,11 @@ describe('TelegramUpdate bot mentions', () => {
       null,
     );
 
-    expect(telegramService.getRecentMessages).not.toHaveBeenCalled();
+    expect(telegramService.getRecentMessages).toHaveBeenCalledWith(
+      -100,
+      null,
+      50,
+    );
     expect(telegramService.getBotMemory).toHaveBeenCalledWith(-100, 50);
     expect(openaiService.processBotMention).toHaveBeenCalledWith(
       'Баласи, что известно о встрече Общества Цинцкаро?',
@@ -1329,5 +1358,219 @@ describe('TelegramUpdate bot mentions', () => {
       memory,
       [],
     );
+  });
+  it('answers a Telegram reply without repeating the bot name and passes the quoted message', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    Object.assign(ctx, { botInfo: { id: 900, username: 'balasi_bot' } });
+    ctx.message = {
+      message_id: 124,
+      text: 'А во множественном числе?',
+      date: 1784102460,
+      from: { id: 1, username: 'alice' },
+      message_thread_id: 42,
+      reply_to_message: {
+        message_id: 100,
+        text: 'Âв — дом.',
+        date: 1784000000,
+        from: { id: 900, is_bot: true, username: 'balasi_bot' },
+      },
+    };
+    ctx.reply.mockResolvedValueOnce({
+      message_id: 125,
+      text: 'Âвлâр — дома.',
+      date: 1784102461,
+      message_thread_id: 42,
+      from: { username: 'balasi_bot' },
+    });
+
+    await update.onText(ctx as any);
+
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'А во множественном числе?',
+      [],
+      [],
+      [],
+      expect.objectContaining({
+        replyToMessage: expect.objectContaining({ text: 'Âв — дом.' }),
+      }),
+    );
+    expect(telegramService.saveContextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatId: -100,
+        threadId: 42,
+        telegramMessageId: 124,
+        text: 'А во множественном числе?',
+        isBot: false,
+      }),
+    );
+    expect(telegramService.saveContextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatId: -100,
+        threadId: 42,
+        telegramMessageId: 125,
+        text: 'Âвлâр — дома.',
+        isBot: true,
+      }),
+    );
+    expect(telegramService.addMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not answer replies to a different bot', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    Object.assign(ctx, { botInfo: { id: 900 } });
+    ctx.message = {
+      message_id: 124,
+      text: 'Спасибо',
+      from: { id: 1, username: 'alice' },
+      reply_to_message: { message_id: 100, from: { id: 901, is_bot: true } },
+    };
+    await update.onText(ctx as any);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(telegramService.addMessage).toHaveBeenCalled();
+  });
+
+  it('includes dictionary words from recent discussion for a pronoun follow-up', async () => {
+    const { update, ctx, openaiService, telegramService, dictionaryService } =
+      makeUpdate();
+    const recent = [
+      { username: 'alice', text: 'Обсуждаем слово ширин.', sentAt: new Date() },
+    ];
+    const entry = {
+      word: 'ширин',
+      translation: 'сладкий',
+      partOfSpeech: undefined,
+    };
+    telegramService.getRecentMessages.mockResolvedValueOnce(recent);
+    dictionaryService.findRelevantForPrompt.mockResolvedValueOnce([entry]);
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, расскажи про него',
+      'alice',
+      123,
+      42,
+    );
+    expect(dictionaryService.findRelevantForPrompt).toHaveBeenCalledWith(
+      ['Баласи, расскажи про него', 'Обсуждаем слово ширин.'],
+      30,
+    );
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, расскажи про него',
+      recent,
+      [],
+      [entry],
+    );
+  });
+
+  it('keeps a complete bot exchange for the next question without duplicating the current input', async () => {
+    const { update, ctx, openaiService, telegramService } = makeUpdate();
+    const history: any[] = [];
+    telegramService.saveContextMessage.mockImplementation(
+      async (message: any) => {
+        history.push(message);
+      },
+    );
+    telegramService.getRecentMessages.mockImplementation(async () => [
+      ...history,
+    ]);
+    ctx.reply.mockImplementation(async (text) => ({
+      message_id: 124,
+      text,
+      date: 1784102401,
+    }));
+    ctx.message = {
+      message_id: 123,
+      text: 'Баласи, помоги с объявлением о встрече',
+      date: 1784102400,
+      from: { username: 'alice' },
+    };
+    await update.onText(ctx as any);
+    ctx.message = {
+      message_id: 125,
+      text: 'Баласи, сделай его короче',
+      date: 1784102402,
+      from: { username: 'alice' },
+    };
+    await update.onText(ctx as any);
+    const secondHistory = (
+      openaiService.processBotMention.mock.calls[1] as any[]
+    )[1] as any[];
+    expect(secondHistory.map((message) => message.text)).toEqual([
+      'Баласи, помоги с объявлением о встрече',
+      'ok',
+    ]);
+    expect(secondHistory[1].isBot).toBe(true);
+  });
+
+  it('keeps the context character budget when the newest message is oversized', () => {
+    const { update } = makeUpdate();
+    const history = [
+      { username: 'alice', text: 'а'.repeat(20000), sentAt: new Date() },
+    ];
+    const result = (update as any).limitRecentMessagesByChars(history, 12000);
+    expect(result).toHaveLength(1);
+    expect(
+      result[0].text.length + result[0].username.length + 24,
+    ).toBeLessThanOrEqual(12000);
+  });
+
+  it('uses context when a translation request refers to the previous word', async () => {
+    const { update, ctx, openaiService, telegramService, dictionaryService } =
+      makeUpdate();
+    const history = [{ username: 'alice', text: 'Хатâ', sentAt: new Date() }];
+    telegramService.getRecentMessages.mockResolvedValueOnce(history);
+    dictionaryService.findByTranslation.mockResolvedValue([
+      { word: 'онун', translation: 'его' },
+    ]);
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, переведи его',
+      'alice',
+      123,
+      null,
+    );
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, переведи его',
+      history,
+      [],
+      expect.any(Array),
+    );
+  });
+  it('uses the model to answer every part of a question even when the dictionary word is found', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    dictionaryService.findWord.mockResolvedValueOnce({
+      word: 'сахгкал оти',
+      translation: 'укроп',
+      partOfSpeech: 'сущ.',
+    });
+    const question =
+      'Баласи, что значит «сахгкал оти»? Объясни подробнее и помоги запомнить.';
+    await (update as any).handleBotMention(ctx, question, 'alice', 123, null);
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      question,
+      [],
+      [],
+      [expect.objectContaining({ word: 'сахгкал оти', translation: 'укроп' })],
+    );
+  });
+
+  it('delivers a detailed AI answer in full across Telegram-sized messages', async () => {
+    const { update, ctx, openaiService } = makeUpdate();
+    const answer = 'Подробно: ' + '🌿'.repeat(4500) + '\nКонец ответа.';
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'reply',
+      message: answer,
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, объясни подробно',
+      'alice',
+      123,
+      null,
+    );
+    const chunks = ctx.reply.mock.calls.map((call) => call[0]);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((text) => text.length <= 4000)).toBe(true);
+    expect(chunks.join('')).toBe(answer);
+    expect(chunks.every((text) => !/[\uD800-\uDBFF]$/.test(text))).toBe(true);
   });
 });

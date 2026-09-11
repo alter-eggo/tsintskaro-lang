@@ -58,6 +58,14 @@ export interface BotMemoryEntry {
   memoryKey: string | null;
 }
 
+export interface ConversationMessage {
+  username: string;
+  text: string;
+  sentAt: Date;
+  telegramMessageId?: number | null;
+  isBot?: boolean;
+}
+
 @Injectable()
 export class TelegramService {
   private readonly logger = new Logger(TelegramService.name);
@@ -95,7 +103,12 @@ export class TelegramService {
 
   async getActiveMessages(chatId: number): Promise<CollectedMessage[]> {
     return this.messageRepo.find({
-      where: { chatId, reportId: IsNull(), clearedAt: IsNull() },
+      where: {
+        chatId,
+        reportId: IsNull(),
+        clearedAt: IsNull(),
+        contextOnly: false,
+      },
       order: { sentAt: 'ASC', id: 'ASC' },
     });
   }
@@ -121,27 +134,55 @@ export class TelegramService {
 
   async getCount(chatId: number): Promise<number> {
     return this.messageRepo.count({
-      where: { chatId, reportId: IsNull(), clearedAt: IsNull() },
+      where: {
+        chatId,
+        reportId: IsNull(),
+        clearedAt: IsNull(),
+        contextOnly: false,
+      },
     });
+  }
+
+  async saveContextMessage(
+    message: ConversationMessage & { chatId: number; threadId: number | null },
+  ): Promise<void> {
+    await this.messageRepo.save(
+      this.messageRepo.create({
+        ...message,
+        contextOnly: true,
+      }),
+    );
   }
 
   async getRecentMessages(
     chatId: number,
     threadId: number | null,
     limit = 50,
-  ): Promise<{ username: string; text: string; sentAt: Date }[]> {
-    const where = threadId != null ? { chatId, threadId } : { chatId };
+  ): Promise<ConversationMessage[]> {
+    const where = {
+      chatId,
+      threadId: threadId ?? IsNull(),
+      clearedAt: IsNull(),
+    };
     const rows = await this.messageRepo.find({
       where,
       order: { sentAt: 'DESC', id: 'DESC' },
       take: limit,
-      select: { username: true, text: true, sentAt: true },
+      select: {
+        username: true,
+        text: true,
+        sentAt: true,
+        telegramMessageId: true,
+        isBot: true,
+      },
     });
     // Return in chronological order (oldest first) for natural reading
     return rows.reverse().map((m) => ({
       username: m.username,
       text: m.text,
       sentAt: m.sentAt,
+      telegramMessageId: m.telegramMessageId,
+      isBot: m.isBot,
     }));
   }
 

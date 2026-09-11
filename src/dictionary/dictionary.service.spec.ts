@@ -19,6 +19,24 @@ describe('DictionaryService relevant prompt entries', () => {
     return new DictionaryService(repo as any);
   };
 
+  it('refreshes dictionary entries changed by another application within one minute', async () => {
+    const rows = [{ word: 'ширин', translation: 'сладкий' }];
+    const service = makeService(rows);
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1000);
+    try {
+      expect((await service.findWord('ширин'))?.translation).toBe('сладкий');
+      rows[0].translation = 'сладкий; милый';
+      rows.push({ word: 'хатâ', translation: 'проблема' });
+      now.mockReturnValue(61001);
+      expect((await service.findWord('ширин'))?.translation).toBe(
+        'сладкий; милый',
+      );
+      expect((await service.findWord('хатâ'))?.translation).toBe('проблема');
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('finds exact, multi-word, hyphenated, and folded matches', async () => {
     const service = makeService([
       { word: 'сахгкал оти', translation: 'укроп' },
