@@ -14,6 +14,11 @@ import {
   DictionaryService,
 } from '../dictionary/dictionary.service';
 import {
+  assertCanEditTranslations,
+  TRANSLATION_EDIT_DENIED,
+  TranslationEditForbiddenError,
+} from '../dictionary/translation-permissions';
+import {
   BotDictionaryContextEntry,
   DictionaryEntryInput,
   DictionaryUpdateInput,
@@ -1328,6 +1333,7 @@ export class TelegramUpdate implements OnModuleInit {
     const created: string[] = [];
     const expanded: string[] = [];
     const unchanged: string[] = [];
+    const denied: string[] = [];
     const failed: { word: string; err: unknown }[] = [];
 
     for (const rawEntry of entries) {
@@ -1345,7 +1351,7 @@ export class TelegramUpdate implements OnModuleInit {
           word: entry.word,
           translation: entry.translation,
           partOfSpeech: entry.partOfSpeech,
-          addedBy: username,
+          addedBy: this.dictionarySenderUsername(ctx) ?? 'anonymous',
         });
         const posTag = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
         const displayedTranslation =
@@ -1364,6 +1370,10 @@ export class TelegramUpdate implements OnModuleInit {
           `[Chat ${chatId}] Dictionary ${upserted.created ? 'created' : upserted.translationAdded ? 'expanded' : 'unchanged'} by @${username}: ${entry.word} = ${entry.translation}${posTag}`,
         );
       } catch (err) {
+        if (err instanceof TranslationEditForbiddenError) {
+          denied.push(entry.word);
+          continue;
+        }
         this.logger.error(
           `[Chat ${chatId}] upsertWord failed for "${entry.word}":`,
           err,
@@ -1404,6 +1414,14 @@ export class TelegramUpdate implements OnModuleInit {
         if (lines.length > 0) lines.push('');
         lines.push(
           `⚠️ не получилось сохранить: ${failed.map((f) => f.word).join(', ')}`,
+        );
+      }
+
+      if (denied.length > 0) {
+        lines.push(
+          '',
+          `🚫 ${TRANSLATION_EDIT_DENIED}`,
+          `Перевод не изменён: ${denied.join(', ')}.`,
         );
       }
 
@@ -1694,9 +1712,13 @@ export class TelegramUpdate implements OnModuleInit {
     const notFound: string[] = [];
     const ambiguous: string[] = [];
     const failed: string[] = [];
+    const denied: string[] = [];
+    const editorUsername = this.dictionarySenderUsername(ctx);
 
     for (const entry of entries) {
       try {
+        if (entry.translation?.trim())
+          assertCanEditTranslations(editorUsername);
         const translationOnly =
           entry.translation &&
           (!entry.newWord || entry.newWord === entry.oldWord) &&
@@ -1706,7 +1728,7 @@ export class TelegramUpdate implements OnModuleInit {
             word: entry.oldWord,
             translation: entry.translation!,
             userId: ctx.from?.id,
-            username: ctx.from?.username ?? username,
+            username: editorUsername,
             chatId,
             threadId:
               (ctx.message as { message_thread_id?: number })
@@ -1731,7 +1753,7 @@ export class TelegramUpdate implements OnModuleInit {
           newWord: entry.newWord,
           translation: entry.translation,
           partOfSpeech: entry.partOfSpeech,
-          updatedBy: username,
+          updatedBy: editorUsername,
         });
 
         if (
@@ -1765,6 +1787,10 @@ export class TelegramUpdate implements OnModuleInit {
           continue;
         }
       } catch (err) {
+        if (err instanceof TranslationEditForbiddenError) {
+          denied.push(entry.oldWord);
+          continue;
+        }
         this.logger.error(
           `[Chat ${chatId}] updateWord failed for "${entry.oldWord}":`,
           err,
@@ -1774,7 +1800,9 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     const needsAiFallback =
-      updated.length === 0 && (notFound.length > 0 || ambiguous.length > 0);
+      denied.length === 0 &&
+      updated.length === 0 &&
+      (notFound.length > 0 || ambiguous.length > 0);
     const result = { needsAiFallback };
 
     if (messageId == null) return result;
@@ -1797,6 +1825,13 @@ export class TelegramUpdate implements OnModuleInit {
       if (lines.length > 0) lines.push('');
       lines.push(`⚠️ не получилось поправить: ${failed.join(', ')}`);
     }
+    if (denied.length > 0) {
+      lines.push(
+        '',
+        `🚫 ${TRANSLATION_EDIT_DENIED}`,
+        `Перевод не изменён: ${denied.join(', ')}.`,
+      );
+    }
 
     if (lines.length === 0) {
       if (options.deferUnresolvedReply && needsAiFallback) {
@@ -1818,6 +1853,18 @@ export class TelegramUpdate implements OnModuleInit {
       });
     }
     return result;
+  }
+
+  private dictionarySenderUsername(ctx: Context): string | null {
+    const sender = ctx.from;
+    const message = ctx.message as { sender_chat?: unknown } | undefined;
+    return sender &&
+      Number.isSafeInteger(sender.id) &&
+      sender.id > 0 &&
+      !sender.is_bot &&
+      !message?.sender_chat
+      ? (sender.username ?? null)
+      : null;
   }
 
   private extractBotMemoryText(text: string): string | null {

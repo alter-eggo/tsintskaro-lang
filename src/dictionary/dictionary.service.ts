@@ -4,6 +4,7 @@ import { In, Repository } from 'typeorm';
 import { Word, type WordSource } from './entities/word.entity';
 import { WordTranslationHistory } from './entities/word-translation-history.entity';
 import { compareTsintskaroWords } from './tsintskaro-alphabet';
+import { assertCanEditTranslations } from './translation-permissions';
 
 export interface DictionaryEntry {
   word: string;
@@ -478,6 +479,7 @@ export class DictionaryService {
   async replaceTranslation(
     input: ReplaceTranslationInput,
   ): Promise<ReplaceTranslationResult> {
+    assertCanEditTranslations(input.username);
     const word = this.normalizeWordInput(input.word);
     const translation = input.translation.trim();
     if (
@@ -544,6 +546,7 @@ export class DictionaryService {
       input.translation != null && input.translation.trim()
         ? input.translation.trim()
         : null;
+    if (translation) assertCanEditTranslations(input.updatedBy);
 
     if (
       !requestedOldWord ||
@@ -572,6 +575,8 @@ export class DictionaryService {
         resolvedTarget.entity.id !== currentWord.id
       ) {
         const target = resolvedTarget.entity;
+        // Merging removes an existing entry and can discard its meanings.
+        assertCanEditTranslations(input.updatedBy);
         if (translation) {
           target.translation = translation;
         }
@@ -600,14 +605,26 @@ export class DictionaryService {
     }
     currentWord.source = 'chat';
 
-    const saved = await this.wordRepo.save(currentWord);
+    // A spelling/POS edit must not write back a stale translation that another
+    // participant read before an authorized editor changed it.
+    await this.wordRepo.update(
+      { id: currentWord.id },
+      {
+        word: targetWord,
+        source: 'chat',
+        ...(translation ? { translation } : {}),
+        ...(input.partOfSpeech !== undefined
+          ? { partOfSpeech: input.partOfSpeech }
+          : {}),
+      },
+    );
     this.invalidateCache();
 
     return {
       status: 'updated',
       requestedOldWord,
       resolvedOldWord,
-      word: saved,
+      word: currentWord,
     };
   }
 
@@ -620,8 +637,11 @@ export class DictionaryService {
         existing.translation,
         input.translation,
       );
-      existing.translation = translationMerge.merged;
       const translationAdded = translationMerge.added !== undefined;
+      if (translationAdded) {
+        assertCanEditTranslations(input.addedBy);
+        existing.translation = translationMerge.merged;
+      }
       const partOfSpeech = input.partOfSpeech?.trim();
       const partOfSpeechAdded = Boolean(partOfSpeech && !existing.partOfSpeech);
 
@@ -632,7 +652,13 @@ export class DictionaryService {
         return { created: false, word: existing, translationAdded: false };
       }
 
-      const saved = await this.wordRepo.save(existing);
+      let saved = existing;
+      if (translationAdded) saved = await this.wordRepo.save(existing);
+      else
+        await this.wordRepo.update(
+          { id: existing.id },
+          { partOfSpeech: existing.partOfSpeech },
+        );
       this.invalidateCache();
       return {
         created: false,

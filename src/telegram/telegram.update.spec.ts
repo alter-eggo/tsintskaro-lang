@@ -1,8 +1,10 @@
 import { TelegramUpdate } from './telegram.update';
 import { WordReviewDecisionError } from '../word-review/word-review-decision';
+import { DictionaryService } from '../dictionary/dictionary.service';
+import { TRANSLATION_EDIT_DENIED } from '../dictionary/translation-permissions';
 
 describe('TelegramUpdate bot mentions', () => {
-  const makeUpdate = () => {
+  const makeUpdate = (senderUsername = 'AAlxnv') => {
     const dictionaryService = {
       upsertWord: jest.fn(async (input) => ({
         created: true,
@@ -113,7 +115,7 @@ describe('TelegramUpdate bot mentions', () => {
     const ctx = {
       chat: { id: -100, type: 'supergroup' },
       message: {},
-      from: { id: 42, username: 'AAlxnv' },
+      from: { id: 42, username: senderUsername },
       reply: jest.fn(),
       sendChatAction: jest.fn(async () => true),
       replyWithPhoto: jest.fn(),
@@ -725,14 +727,14 @@ describe('TelegramUpdate bot mentions', () => {
     'replaces the full translation through ordinary wording: %s',
     async (text, word, translation) => {
       const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-      (ctx as any).from = { id: 42, username: 'participant' };
+      (ctx as any).from = { id: 42, username: 'joanofarc74' };
       (ctx as any).message = { text, message_id: 777, message_thread_id: 44 };
-      await (update as any).handleBotMention(ctx, text, 'participant', 777, 44);
+      await (update as any).handleBotMention(ctx, text, 'joanofarc74', 777, 44);
       expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith({
         word,
         translation,
         userId: 42,
-        username: 'participant',
+        username: 'joanofarc74',
         chatId: -100,
         threadId: 44,
         messageId: 777,
@@ -752,7 +754,8 @@ describe('TelegramUpdate bot mentions', () => {
   );
 
   it('resolves a short translation replacement from the replied-to message', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('joanofarc74');
     (ctx as any).botInfo = { id: 900, username: 'ourbot' };
     (ctx as any).message = {
       message_id: 500,
@@ -857,6 +860,160 @@ describe('TelegramUpdate bot mentions', () => {
       expect.objectContaining({ word: 'ширин', translation: 'приятный' }),
     );
     expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+  });
+
+  describe('translation editor access', () => {
+    it.each(['joanofarc74', 'ekaterina_karaasheva', 'JoanOfArc74'])(
+      'allows %s without requiring administrator rights',
+      async (username) => {
+        const { update, ctx, dictionaryService } = makeUpdate(username);
+        (ctx.telegram as any).getChatMember = jest.fn(async () => ({
+          status: 'member',
+        }));
+        await (update as any).handleBotMention(
+          ctx,
+          'Баласи, замени перевод слова ширин на приятный',
+          username,
+          700,
+          44,
+        );
+        expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
+          expect.objectContaining({
+            username,
+            userId: 42,
+            word: 'ширин',
+            translation: 'приятный',
+          }),
+        );
+        expect((ctx.telegram as any).getChatMember).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['participant', 'AAlxnv', 'MEMazmanova', 'joanofarc74_fake'])(
+      'denies %s even when they are an administrator or claim an editor username in text',
+      async (username) => {
+        const { update, ctx, dictionaryService, openaiService } =
+          makeUpdate(username);
+        (ctx.telegram as any).getChatMember = jest.fn(async () => ({
+          status: 'administrator',
+        }));
+        await (update as any).handleBotMention(
+          ctx,
+          'Баласи, замени перевод слова ширин на приятный',
+          'joanofarc74',
+          700,
+          44,
+        );
+        expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+        expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+        expect(openaiService.processBotMention).not.toHaveBeenCalled();
+        expect(ctx.reply).toHaveBeenCalledWith(
+          expect.stringContaining(TRANSLATION_EDIT_DENIED),
+          expect.anything(),
+        );
+      },
+    );
+
+    it.each([
+      { from: { id: 42, first_name: 'joanofarc74' } },
+      { from: { id: 42, username: 'joanofarc74', is_bot: true } },
+      {
+        from: { id: 42, username: 'joanofarc74' },
+        message: { sender_chat: { id: -100 } },
+      },
+    ])(
+      'does not grant editor access from a display name, bot or anonymous sender',
+      async (overrides) => {
+        const { update, ctx, dictionaryService } = makeUpdate();
+        Object.assign(ctx, overrides);
+        await (update as any).handleBotMention(
+          ctx,
+          'Баласи, замени перевод слова ширин на приятный',
+          'joanofarc74',
+          700,
+          44,
+        );
+        expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+        expect(ctx.reply).toHaveBeenCalledWith(
+          expect.stringContaining(TRANSLATION_EDIT_DENIED),
+          expect.anything(),
+        );
+      },
+    );
+
+    it('rejects a translation edit extracted by AI, including a simultaneous rename', async () => {
+      const { update, ctx, dictionaryService, openaiService } =
+        makeUpdate('participant');
+      (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
+        action: 'update_words',
+        entries: [
+          { oldWord: 'ширин', newWord: 'шырин', translation: 'приятный' },
+        ],
+      });
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, можно поправить эту запись по нашему обсуждению?',
+        'participant',
+        700,
+        44,
+      );
+      expect(openaiService.processBotMention).toHaveBeenCalled();
+      expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+      expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining(TRANSLATION_EDIT_DENIED),
+        expect.anything(),
+      );
+    });
+
+    it('adds new words but refuses changed meanings in a mixed word list from another participant', async () => {
+      const { update, ctx, dictionaryService } = makeUpdate('participant');
+      const existing = {
+        id: 1,
+        word: 'ширин',
+        translation: 'сладкий',
+        partOfSpeech: null,
+      };
+      const repo = {
+        findOne: jest.fn(async ({ where }) =>
+          where.word === existing.word ? { ...existing } : null,
+        ),
+        find: jest.fn(async () => [{ ...existing }]),
+        create: jest.fn((value) => ({ id: 2, ...value })),
+        save: jest.fn(async (value) => value),
+      };
+      const service = new DictionaryService(repo as any);
+      (dictionaryService.upsertWord as jest.Mock).mockImplementation((value) =>
+        service.upsertWord(value),
+      );
+      await (update as any).handleDictionaryAdditions(
+        ctx,
+        -100,
+        'joanofarc74',
+        700,
+        [
+          { word: 'ширин', translation: 'приятный' },
+          { word: 'хатâ', translation: 'проблема' },
+        ],
+      );
+      expect(repo.save).toHaveBeenCalledTimes(1);
+      expect(repo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ word: 'хатâ', addedBy: 'participant' }),
+      );
+      expect(existing.translation).toBe('сладкий');
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining(TRANSLATION_EDIT_DENIED),
+        expect.anything(),
+      );
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('✅ записал:'),
+        expect.anything(),
+      );
+      expect(ctx.reply).not.toHaveBeenCalledWith(
+        expect.stringContaining('➕ добавил'),
+        expect.anything(),
+      );
+    });
   });
 
   it('omits the removed translation slash command from the menu', async () => {
@@ -1442,7 +1599,8 @@ describe('TelegramUpdate bot mentions', () => {
   });
 
   it('corrects spelling by translation instead of adding a bad word', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('joanofarc74');
     dictionaryService.findByTranslation.mockResolvedValueOnce([
       {
         word: 'сагхал оти',
@@ -1466,7 +1624,7 @@ describe('TelegramUpdate bot mentions', () => {
       newWord: 'сахгкал оти',
       translation: 'укроп',
       partOfSpeech: undefined,
-      updatedBy: 'AAlxnv',
+      updatedBy: 'joanofarc74',
     });
     expect(ctx.reply).toHaveBeenCalledWith(
       expect.stringContaining('✅ поправил:'),
@@ -1534,7 +1692,8 @@ describe('TelegramUpdate bot mentions', () => {
   ])(
     'understands conversational dictionary corrections: %s',
     async (text, oldWord, newWord, translation) => {
-      const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+      const { update, ctx, dictionaryService, openaiService } =
+        makeUpdate('joanofarc74');
 
       await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
 
@@ -1545,7 +1704,7 @@ describe('TelegramUpdate bot mentions', () => {
         newWord,
         translation,
         partOfSpeech: undefined,
-        updatedBy: 'AAlxnv',
+        updatedBy: 'joanofarc74',
       });
       expect(ctx.reply).toHaveBeenCalledWith(
         expect.stringContaining('✅ поправил:'),
@@ -1555,7 +1714,8 @@ describe('TelegramUpdate bot mentions', () => {
   );
 
   it('understands a natural command that only changes a translation', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('joanofarc74');
 
     await (update as any).handleBotMention(
       ctx,
@@ -1570,7 +1730,7 @@ describe('TelegramUpdate bot mentions', () => {
       word: 'яланчынын дâ шââтӱ',
       translation: 'подтверждение правильности слов',
       userId: 42,
-      username: 'AAlxnv',
+      username: 'joanofarc74',
       chatId: -100,
       threadId: null,
       messageId: 123,
@@ -1712,6 +1872,7 @@ describe('TelegramUpdate bot mentions', () => {
 
   it('adds a correction-like word pair that starts with топ instead of showing leaders', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    (ctx.from as any).username = undefined;
 
     await (update as any).handleBotMention(
       ctx,

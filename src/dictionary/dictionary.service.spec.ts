@@ -1,5 +1,6 @@
 import { DictionaryService } from './dictionary.service';
 import { Word } from './entities/word.entity';
+import { TranslationEditForbiddenError } from './translation-permissions';
 
 describe('DictionaryService relevant prompt entries', () => {
   const makeService = (
@@ -180,6 +181,7 @@ describe('DictionaryService word upserts', () => {
     const result = await service.upsertWord({
       word: 'Ширин',
       translation: 'сахарный; приятный; приятный',
+      addedBy: 'joanofarc74',
     });
 
     expect(result.created).toBe(false);
@@ -208,6 +210,167 @@ describe('DictionaryService word upserts', () => {
     expect(result.translationAdded).toBe(false);
     expect(result.word.translation).toBe('меньше; нехватка');
     expect(repo.save).not.toHaveBeenCalled();
+  });
+});
+
+describe('translation permissions on other dictionary writes', () => {
+  const makeWriter = () => {
+    const rows = [
+      {
+        id: 1,
+        word: 'ширин',
+        translation: 'сладкий',
+        partOfSpeech: null,
+        source: 'etalon',
+        addedBy: 'joanofarc74',
+      },
+      {
+        id: 2,
+        word: 'спанах',
+        translation: 'шпинат',
+        partOfSpeech: null,
+        source: 'chat',
+        addedBy: 'user',
+      },
+    ];
+    const repo = {
+      findOne: jest.fn(async ({ where }) => {
+        const row = rows.find((entry) =>
+          where.id ? entry.id === where.id : entry.word === where.word,
+        );
+        return row ? { ...row } : null;
+      }),
+      find: jest.fn(async () => rows.map((row) => ({ ...row }))),
+      create: jest.fn((value) => ({ id: 3, ...value })),
+      save: jest.fn(async (value) => {
+        const index = rows.findIndex((row) => row.id === value.id);
+        if (index === -1) rows.push({ ...value });
+        else Object.assign(rows[index], value);
+        return { ...value };
+      }),
+      update: jest.fn(async ({ id }, patch) => {
+        Object.assign(rows.find((row) => row.id === id)!, patch);
+        return { affected: 1 };
+      }),
+      delete: jest.fn(),
+    };
+    return { service: new DictionaryService(repo as any), repo, rows };
+  };
+
+  it.each(['AAlxnv', 'participant', undefined])(
+    'blocks appending meanings through upsert for %s',
+    async (addedBy) => {
+      const f = makeWriter();
+      await expect(
+        f.service.upsertWord({
+          word: 'ширин',
+          translation: 'приятный',
+          addedBy,
+        }),
+      ).rejects.toThrow(TranslationEditForbiddenError);
+      expect(f.rows[0].translation).toBe('сладкий');
+      expect(f.repo.save).not.toHaveBeenCalled();
+      expect(f.repo.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['joanofarc74', 'ekaterina_karaasheva'])(
+    'allows appending meanings for %s',
+    async (addedBy) => {
+      const f = makeWriter();
+      expect(
+        (
+          await f.service.upsertWord({
+            word: 'ширин',
+            translation: 'приятный',
+            addedBy,
+          })
+        ).translationAdded,
+      ).toBe(true);
+      expect(f.rows[0].translation).toBe('приятный; сладкий');
+    },
+  );
+
+  it('still allows other participants to add a new word', async () => {
+    const f = makeWriter();
+    const result = await f.service.upsertWord({
+      word: 'хатâ',
+      translation: 'проблема',
+      addedBy: 'participant',
+    });
+    expect(result.created).toBe(true);
+    expect(f.rows).toHaveLength(3);
+    expect(f.rows[0].translation).toBe('сладкий');
+  });
+
+  it.each([
+    { translation: 'приятный' },
+    { newWord: 'шырин', translation: 'приятный' },
+    { partOfSpeech: 'прил.', translation: 'приятный' },
+    { newWord: 'спанах' },
+  ])(
+    'blocks translation edits and merges through the general update path: %s',
+    async (changes) => {
+      const f = makeWriter();
+      const before = structuredClone(f.rows);
+      await expect(
+        f.service.updateWord({
+          oldWord: 'ширин',
+          ...changes,
+          updatedBy: 'AAlxnv',
+        }),
+      ).rejects.toThrow(TranslationEditForbiddenError);
+      expect(f.rows).toEqual(before);
+      expect(f.repo.save).not.toHaveBeenCalled();
+      expect(f.repo.update).not.toHaveBeenCalled();
+      expect(f.repo.delete).not.toHaveBeenCalled();
+    },
+  );
+
+  it('allows an editor to change spelling and translation together', async () => {
+    const f = makeWriter();
+    const result = await f.service.updateWord({
+      oldWord: 'ширин',
+      newWord: 'шырин',
+      translation: 'приятный',
+      updatedBy: 'ekaterina_karaasheva',
+    });
+    expect(result.status).toBe('updated');
+    expect(f.rows[0]).toMatchObject({ word: 'шырин', translation: 'приятный' });
+  });
+
+  it('does not overwrite an authorized translation edit when another participant changes spelling', async () => {
+    const f = makeWriter();
+    f.repo.update.mockImplementationOnce(async ({ id }, patch) => {
+      f.rows[0].translation = 'сладкий; приятный';
+      Object.assign(f.rows.find((row) => row.id === id)!, patch);
+      return { affected: 1 };
+    });
+    await f.service.updateWord({
+      oldWord: 'ширин',
+      newWord: 'шырин',
+      updatedBy: 'participant',
+    });
+    expect(f.rows[0].word).toBe('шырин');
+    expect(f.rows[0].translation).toBe('сладкий; приятный');
+    expect(f.repo.update.mock.calls[0][1]).not.toHaveProperty('translation');
+    expect(f.repo.save).not.toHaveBeenCalled();
+  });
+
+  it('does not write translation while filling a missing part of speech', async () => {
+    const f = makeWriter();
+    await f.service.upsertWord({
+      word: 'ширин',
+      translation: 'сладкий',
+      partOfSpeech: 'прил.',
+      addedBy: 'participant',
+    });
+    expect(f.repo.update).toHaveBeenCalledWith(
+      { id: 1 },
+      { partOfSpeech: 'прил.' },
+    );
+    expect(f.repo.save).not.toHaveBeenCalled();
+    expect(f.rows[0].translation).toBe('сладкий');
   });
 });
 
@@ -243,7 +406,7 @@ describe('DictionaryService explicit translation replacement', () => {
       word: 'Ширин',
       translation: 'сладкий',
       userId: 42,
-      username: 'editor',
+      username: 'joanofarc74',
       chatId: -100,
       threadId: 44,
       messageId: 777,
@@ -286,7 +449,7 @@ describe('DictionaryService explicit translation replacement', () => {
         previousTranslation: 'сахарный; сладкий',
         translation: 'сладкий',
         userId: 42,
-        username: 'editor',
+        username: 'joanofarc74',
         chatId: -100,
         threadId: 44,
         messageId: 777,
@@ -302,6 +465,42 @@ describe('DictionaryService explicit translation replacement', () => {
     await f.service.replaceTranslation(f.input);
     expect((await f.service.findWord('ширин'))?.translation).toBe('сладкий');
   });
+
+  it.each([
+    'joanofarc74',
+    'ekaterina_karaasheva',
+    'JoanOfArc74',
+    'EKATERINA_KARAASHEVA',
+  ])('allows replacement by the named editor %s', async (username) => {
+    const f = makeReplacement();
+    expect(
+      (await f.service.replaceTranslation({ ...f.input, username })).status,
+    ).toBe('updated');
+    expect(f.row.translation).toBe('сладкий');
+  });
+
+  it.each([
+    'participant',
+    'AAlxnv',
+    'MEMazmanova',
+    undefined,
+    null,
+    '',
+    'joanofarc74_fake',
+    '@joanofarc74',
+    'ekaterina\\_karaasheva',
+  ])(
+    'rejects replacement by any other username, including existing admins: %s',
+    async (username) => {
+      const f = makeReplacement();
+      await expect(
+        f.service.replaceTranslation({ ...f.input, username }),
+      ).rejects.toThrow(TranslationEditForbiddenError);
+      expect(f.repo.manager.transaction).not.toHaveBeenCalled();
+      expect(f.history.save).not.toHaveBeenCalled();
+      expect(f.row.translation).toBe('сахарный; сладкий');
+    },
+  );
 
   it('does not create new records or fuzzy-match a different spelling', async () => {
     const f = makeReplacement();
