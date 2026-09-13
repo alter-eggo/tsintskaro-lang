@@ -5,7 +5,12 @@ const bigintTransformer = {
   from: (value: string | null) => (value !== null ? Number(value) : null),
 };
 
-export type WordReviewBatchStatus = 'active' | 'completed';
+export type WordReviewBatchStatus =
+  | 'sending'
+  | 'published'
+  | 'active'
+  | 'completed';
+export type WordReviewFlow = 'dictionary' | 'learning' | 'legacy_chat';
 
 @Entity('word_review_batch')
 @Index(['chatId', 'status'])
@@ -22,8 +27,20 @@ export class WordReviewBatch {
   @Column({ type: 'int', nullable: true })
   messageId: number | null;
 
+  @Column({ type: 'jsonb', default: () => "'[]'::jsonb" })
+  messageIds: number[];
+
   @Column({ type: 'varchar', length: 16, default: 'active' })
   status: WordReviewBatchStatus;
+
+  @Column({ type: 'varchar', length: 16, default: 'legacy_chat' })
+  reviewFlow: WordReviewFlow;
+
+  @Column({ type: 'boolean', default: true })
+  advanceSchedule: boolean;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  discussionEndsAt: Date | null;
 
   @Column({ type: 'int', default: 3 })
   requiredVotes: number;

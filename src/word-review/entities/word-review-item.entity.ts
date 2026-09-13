@@ -1,6 +1,8 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
 export type WordReviewItemStatus =
+  | 'discussion'
+  | 'disputed'
   | 'voting'
   | 'awaiting_correction'
   | 'confirming'

@@ -1,4 +1,5 @@
 import { TelegramUpdate } from './telegram.update';
+import { WordReviewDecisionError } from '../word-review/word-review-decision';
 
 describe('TelegramUpdate bot mentions', () => {
   const makeUpdate = () => {
@@ -12,6 +13,12 @@ describe('TelegramUpdate bot mentions', () => {
           translation: input.translation,
           partOfSpeech: input.partOfSpeech ?? null,
         },
+      })),
+      replaceTranslation: jest.fn(async (input) => ({
+        status: 'updated',
+        word: input.word,
+        previousTranslation: 'старый перевод',
+        translation: input.translation,
       })),
       updateWord: jest.fn(async (input) => ({
         status: 'updated',
@@ -63,22 +70,35 @@ describe('TelegramUpdate bot mentions', () => {
     const wordReviewService = {
       setTarget: jest.fn(async () => ({})),
       clearTarget: jest.fn(async () => undefined),
+      getTarget: jest.fn(async () => ({
+        batchSize: 10,
+        enabled: true,
+        nextRunAt: new Date('2026-09-16T05:00:00Z'),
+      })),
+      setBatchSize: jest.fn(async () => ({ enabled: false })),
       getStatus: jest.fn(async () => ({
         target: null,
-        totalChatWords: 0,
+        totalWords: 0,
         sentWordCount: 0,
         remainingWordCount: 0,
+        waitingNextPassCount: 0,
         lastSentAt: null,
-        activeBatch: null,
+        publishedBatchCount: 0,
+        sendingBatchId: null,
       })),
       sendReviewBatch: jest.fn(async () => ({ status: 'sent', count: 10 })),
-      handleAction: jest.fn(async () => ({
-        status: 'handled',
-        message: 'Голос учтён.',
-      })),
-      handleCorrectionReply: jest.fn(async () => ({
-        status: 'not_correction',
-      })),
+      isReviewMessage: jest.fn(async () => false),
+      recordDecision: jest.fn(async (_input?: any) => {
+        void _input;
+        return {
+          batchId: 5,
+          completed: false,
+          alreadyApplied: false,
+          confirmed: [{ position: 1, word: 'ширин' }],
+          disputed: [{ position: 2, word: 'спанах' }],
+          pending: [{ position: 3, word: 'агошка' }],
+        };
+      }),
     };
     const openaiUsageService = {
       setReportTarget: jest.fn(async () => ({})),
@@ -93,7 +113,7 @@ describe('TelegramUpdate bot mentions', () => {
     const ctx = {
       chat: { id: -100, type: 'supergroup' },
       message: {},
-      from: { username: 'AAlxnv' },
+      from: { id: 42, username: 'AAlxnv' },
       reply: jest.fn(),
       sendChatAction: jest.fn(async () => true),
       replyWithPhoto: jest.fn(),
@@ -106,6 +126,11 @@ describe('TelegramUpdate bot mentions', () => {
       },
     };
 
+    const config = {
+      get: jest.fn((key: string): unknown =>
+        key === 'wordReviewCoordinatorIds' ? [] : 100,
+      ),
+    };
     const update = new TelegramUpdate(
       bot as any,
       telegramService as any,
@@ -117,7 +142,7 @@ describe('TelegramUpdate bot mentions', () => {
       {} as any,
       wordReviewService as any,
       openaiUsageService as any,
-      { get: jest.fn(() => 100) } as any,
+      config as any,
     );
 
     return {
@@ -128,6 +153,7 @@ describe('TelegramUpdate bot mentions', () => {
       telegramService,
       wordReviewService,
       bot,
+      config,
     };
   };
 
@@ -611,16 +637,509 @@ describe('TelegramUpdate bot mentions', () => {
       'AAlxnv',
     );
     expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('Проверка словаря будет приходить сюда'),
-      { parse_mode: 'HTML' },
+      expect.stringContaining('Разбор слов запущен в этой теме'),
     );
 
     (ctx.reply as jest.Mock).mockClear();
-    (ctx as any).message = { text: '/reviewnow 10' };
+    (ctx as any).message = { text: '/reviewnow', message_thread_id: 44 };
     await update.onReviewNow(ctx as any);
 
-    expect(wordReviewService.sendReviewBatch).toHaveBeenCalledWith();
-    expect(ctx.reply).toHaveBeenCalledWith('✅ Отправил 10 слов на проверку.');
+    expect(wordReviewService.sendReviewBatch).toHaveBeenLastCalledWith({
+      extra: true,
+      chatId: -100,
+      threadId: 44,
+    });
+    expect(ctx.reply).toHaveBeenCalledWith(
+      '✅ Дополнительная партия: 10 слов. Регулярное расписание сохранено.',
+    );
+  });
+
+  it('pauses word delivery without clearing its settings', async () => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    (ctx as any).message = { text: '/stopreview', message_thread_id: 44 };
+    await update.onStopReview(ctx as any);
+    expect(wordReviewService.clearTarget).toHaveBeenCalledWith(-100, 44);
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('прогресс сохранены'),
+    );
+  });
+
+  it('sets the next batch size in the current topic', async () => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    (ctx as any).message = {
+      text: '/reviewsize@ourbot 100',
+      message_thread_id: 44,
+    };
+    await update.onReviewSize(ctx as any);
+    expect(wordReviewService.setBatchSize).toHaveBeenCalledWith(
+      -100,
+      44,
+      100,
+      'AAlxnv',
+    );
+    expect(wordReviewService.sendReviewBatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '/reviewsize',
+    '/reviewsize 0',
+    '/reviewsize -1',
+    '/reviewsize 1.5',
+    '/reviewsize 101',
+    '/reviewsize 10 extra',
+  ])('rejects malformed size command %s', async (text) => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    (ctx as any).message = { text, message_thread_id: 44 };
+    await update.onReviewSize(ctx as any);
+    expect(wordReviewService.setBatchSize).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('от 1 до 100'),
+    );
+  });
+
+  it('restricts review controls to administrators in group topics', async () => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    (ctx as any).from = { username: 'participant' };
+    await update.onStartReview(ctx as any);
+    await update.onStopReview(ctx as any);
+    await update.onReviewSize(ctx as any);
+    expect(wordReviewService.setTarget).not.toHaveBeenCalled();
+    expect(wordReviewService.clearTarget).not.toHaveBeenCalled();
+    expect(wordReviewService.setBatchSize).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['Баласи, замени перевод слова ширин на сладкий', 'ширин', 'сладкий'],
+    [
+      'Бот, замени перевод сахгкал оти на укроп; растение',
+      'сахгкал оти',
+      'укроп; растение',
+    ],
+    ['Баласи, поменяй перевод ширин на — сладкий', 'ширин', 'сладкий'],
+    [
+      'Баласи, пожалуйста, исправь перевод у слова ширин на сладкий',
+      'ширин',
+      'сладкий',
+    ],
+  ])(
+    'replaces the full translation through ordinary wording: %s',
+    async (text, word, translation) => {
+      const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+      (ctx as any).from = { id: 42, username: 'participant' };
+      (ctx as any).message = { text, message_id: 777, message_thread_id: 44 };
+      await (update as any).handleBotMention(ctx, text, 'participant', 777, 44);
+      expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith({
+        word,
+        translation,
+        userId: 42,
+        username: 'participant',
+        chatId: -100,
+        threadId: 44,
+        messageId: 777,
+      });
+      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+      expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('Было: старый перевод'),
+        { reply_parameters: { message_id: 777 } },
+      );
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining(`Стало: ${translation}`),
+        { reply_parameters: { message_id: 777 } },
+      );
+    },
+  );
+
+  it('resolves a short translation replacement from the replied-to message', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+    (ctx as any).message = {
+      message_id: 500,
+      text: 'замени перевод на сладкий',
+      message_thread_id: 44,
+      from: { id: 42, username: 'participant' },
+      reply_to_message: {
+        message_id: 777,
+        text: 'ширин — сахарный',
+        date: 1789286400,
+        from: { id: 900, is_bot: true, username: 'ourbot' },
+      },
+    };
+    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
+      action: 'update_words',
+      entries: [{ oldWord: 'ширин', newWord: null, translation: 'сладкий' }],
+    });
+    await update.onText(ctx as any);
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'замени перевод на сладкий',
+      expect.any(Array),
+      expect.any(Array),
+      expect.any(Array),
+      expect.objectContaining({
+        forceAction: true,
+        replyToMessage: expect.objectContaining({ text: 'ширин — сахарный' }),
+      }),
+    );
+    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
+      expect.objectContaining({ word: 'ширин', translation: 'сладкий' }),
+    );
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+  });
+
+  it('asks which word when a short replacement refers to an entire batch', async () => {
+    const { update, ctx, dictionaryService, openaiService, wordReviewService } =
+      makeUpdate();
+    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+    (ctx as any).message = {
+      message_id: 500,
+      text: 'замени перевод на сладкий',
+      message_thread_id: 44,
+      from: { id: 42, username: 'participant' },
+      reply_to_message: {
+        message_id: 777,
+        text: '1. ширин — сахарный\n2. хатâ — проблема',
+        date: 1789286400,
+        from: { id: 900, is_bot: true },
+      },
+    };
+    wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
+    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
+      action: 'reply',
+      message: 'У какого слова заменить перевод?',
+    });
+    await update.onText(ctx as any);
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      'У какого слова заменить перевод?',
+      expect.any(Object),
+    );
+    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+  });
+
+  it('never turns a correction request into an appended translation if the model picks the wrong action', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
+      action: 'add_words',
+      entries: [{ word: 'ширин', translation: 'сладкий', partOfSpeech: null }],
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, можешь заменить перевод ширин на сладкий?',
+      'AAlxnv',
+      123,
+      null,
+    );
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Какое слово'),
+    );
+  });
+
+  it('continues to append a meaning when explicitly asked to add it', async () => {
+    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
+    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
+      action: 'add_words',
+      entries: [{ word: 'ширин', translation: 'приятный', partOfSpeech: null }],
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь ещё значение: ширин — приятный',
+      'AAlxnv',
+      123,
+      null,
+    );
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
+      expect.objectContaining({ word: 'ширин', translation: 'приятный' }),
+    );
+    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+  });
+
+  it('omits the removed translation slash command from the menu', async () => {
+    const { update, bot } = makeUpdate();
+    await update.onModuleInit();
+    const commands = (bot.telegram.setMyCommands as jest.Mock).mock.calls[0][0];
+    expect(
+      commands.some((command) => command.command === 'settranslation'),
+    ).toBe(false);
+  });
+
+  it('keeps replies to review lists as participant discussion rather than bot actions', async () => {
+    const {
+      update,
+      ctx,
+      wordReviewService,
+      telegramService,
+      dictionaryService,
+      openaiService,
+    } = makeUpdate();
+    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+    (ctx as any).message = {
+      message_id: 500,
+      text: 'Не согласен, у ширин другой перевод',
+      message_thread_id: 44,
+      from: { id: 42, username: 'participant' },
+      reply_to_message: { message_id: 777, from: { id: 900 } },
+    };
+    wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
+    await update.onText(ctx as any);
+    expect(wordReviewService.isReviewMessage).toHaveBeenCalledWith(-100, 777);
+    expect(telegramService.addMessage).toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+  });
+
+  it('answers an explicit bot mention even when replying to a review list', async () => {
+    const { update, ctx, wordReviewService, openaiService } = makeUpdate();
+    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+    (ctx as any).message = {
+      message_id: 500,
+      text: 'Баласи, объясни значение',
+      message_thread_id: 44,
+      from: { id: 42, username: 'participant' },
+      reply_to_message: {
+        message_id: 777,
+        from: { id: 900 },
+        text: 'список слов',
+      },
+    };
+    wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
+    await update.onText(ctx as any);
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+  });
+
+  describe('explicit review outcomes in chat', () => {
+    it('records an addressed decision and lists reviewed, disputed and pending words', async () => {
+      const {
+        update,
+        ctx,
+        wordReviewService,
+        openaiService,
+        dictionaryService,
+      } = makeUpdate();
+      (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+      ctx.message = {
+        message_id: 500,
+        message_thread_id: 44,
+        text: 'Баласи, в партии №5 разобраны слова 1',
+        from: ctx.from,
+      };
+      await update.onText(ctx as any);
+      expect(wordReviewService.recordDecision).toHaveBeenCalledWith({
+        request: { batchId: 5, mode: 'confirm', words: [{ position: 1 }] },
+        chatId: -100,
+        threadId: 44,
+        replyToMessageId: undefined,
+        userId: 42,
+        username: 'AAlxnv',
+        messageId: 500,
+      });
+      expect(ctx.reply).toHaveBeenCalledWith(
+        '📝 Партия №5 разобрана частично (1 из 3).\n\nРазобраны:\n1. ширин\n\nСпорные — разбор продолжается:\n2. спанах\n\nОжидают итога:\n3. агошка',
+        { reply_parameters: { message_id: 500 } },
+      );
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    });
+
+    it('accepts an explicit outcome replying to a batch without a bot mention', async () => {
+      const { update, ctx, wordReviewService } = makeUpdate();
+      (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+      ctx.message = {
+        message_id: 500,
+        message_thread_id: 44,
+        text: 'Партия разобрана',
+        from: ctx.from,
+        reply_to_message: { message_id: 777, from: { id: 900 } },
+      };
+      wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
+      wordReviewService.recordDecision.mockResolvedValueOnce({
+        batchId: 5,
+        completed: true,
+        alreadyApplied: false,
+        confirmed: [{ position: 1, word: 'ширин' }],
+        disputed: [],
+        pending: [],
+      });
+      await update.onText(ctx as any);
+      expect(wordReviewService.recordDecision).toHaveBeenCalledWith(
+        expect.objectContaining({
+          request: { mode: 'all', words: [] },
+          replyToMessageId: 777,
+        }),
+      );
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('✅ Партия №5 разобрана полностью (1 из 1).'),
+        expect.anything(),
+      );
+    });
+
+    it('does not turn an unaddressed chat statement into a saved decision', async () => {
+      const { update, ctx, wordReviewService, telegramService } = makeUpdate();
+      ctx.message = {
+        message_id: 500,
+        message_thread_id: 44,
+        text: 'Партия №5 разобрана',
+        from: ctx.from,
+      };
+      await update.onText(ctx as any);
+      expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
+      expect(telegramService.addMessage).toHaveBeenCalled();
+    });
+
+    it('keeps tentative comments replying to a review list as discussion', async () => {
+      const { update, ctx, wordReviewService, telegramService, openaiService } =
+        makeUpdate();
+      (ctx as any).botInfo = { id: 900, username: 'ourbot' };
+      ctx.message = {
+        message_id: 500,
+        message_thread_id: 44,
+        text: 'Слово ширин ещё не разобрано',
+        from: ctx.from,
+        reply_to_message: { message_id: 777, from: { id: 900 } },
+      };
+      wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
+      await update.onText(ctx as any);
+      expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(telegramService.addMessage).toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+    });
+
+    it('does not let a participant close a batch', async () => {
+      const { update, ctx, wordReviewService, openaiService } = makeUpdate();
+      ctx.from = { id: 55, username: 'participant' };
+      (ctx.telegram as any).getChatMember = jest.fn(async () => ({
+        status: 'member',
+      }));
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, партия №5 разобрана',
+        'participant',
+        500,
+        44,
+      );
+      expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'Подводить итоги могут назначенные координаторы и администраторы чата.',
+      );
+    });
+
+    it('allows an appointed coordinator without requiring Telegram admin rights', async () => {
+      const { update, ctx, wordReviewService, config } = makeUpdate();
+      config.get.mockImplementation((key) =>
+        key === 'wordReviewCoordinatorIds' ? [55] : 100,
+      );
+      ctx.from = { id: 55, username: 'coordinator' };
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, партия №5 разобрана',
+        'coordinator',
+        500,
+        44,
+      );
+      expect(wordReviewService.recordDecision).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 55, username: 'coordinator' }),
+      );
+    });
+
+    it.each([
+      { sender_chat: { id: -100 } },
+      { forward_origin: { type: 'user' } },
+    ])('requires an attributable original message', async (message) => {
+      const { update, ctx, wordReviewService } = makeUpdate();
+      ctx.message = message;
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, партия №5 разобрана',
+        'AAlxnv',
+        500,
+        44,
+      );
+      expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'Баласи, партия №5 разобрана?',
+      'Баласи, партия №5 не разобрана',
+      'Баласи, партия №5 разобрана, но слово 3 ещё спорное',
+    ])(
+      'asks for an explicit outcome without sending unclear instructions to AI: %s',
+      async (text) => {
+        const { update, ctx, wordReviewService, openaiService } = makeUpdate();
+        await (update as any).handleBotMention(ctx, text, 'AAlxnv', 500, 44);
+        expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
+        expect(openaiService.processBotMention).not.toHaveBeenCalled();
+        expect(ctx.reply).toHaveBeenCalledWith(
+          expect.stringContaining('Итог не изменён.'),
+        );
+      },
+    );
+
+    it('reports unresolved words without a success message or AI fallback', async () => {
+      const { update, ctx, wordReviewService, openaiService } = makeUpdate();
+      wordReviewService.recordDecision.mockRejectedValueOnce(
+        new WordReviewDecisionError('Слово №99 не найдено. Итог не сохранён.'),
+      );
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, в партии №5 разобраны слова 1 и 99',
+        'AAlxnv',
+        500,
+        44,
+      );
+      expect(ctx.reply).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'Слово №99 не найдено. Итог не сохранён.',
+      );
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    });
+
+    it('retains every reviewed word when the outcome spans multiple messages', async () => {
+      const { update, ctx, wordReviewService } = makeUpdate();
+      const confirmed = Array.from({ length: 100 }, (_, index) => ({
+        position: index + 1,
+        word: `слово${index}${'а'.repeat(150)}`,
+      }));
+      wordReviewService.recordDecision.mockResolvedValueOnce({
+        batchId: 5,
+        completed: true,
+        alreadyApplied: false,
+        confirmed,
+        disputed: [],
+        pending: [],
+      });
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, партия №5 разобрана',
+        'AAlxnv',
+        500,
+        44,
+      );
+      const chunks = ctx.reply.mock.calls.map((call) => call[0] as string);
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.length <= 4000)).toBe(true);
+      for (const word of confirmed)
+        expect(chunks.join('')).toContain(`${word.position}. ${word.word}`);
+    });
+  });
+
+  it('disables legacy review buttons without applying a vote or correction', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate();
+    (ctx as any).answerCbQuery = jest.fn();
+    (ctx as any).editMessageReplyMarkup = jest.fn();
+    await update.onWordReviewAction(ctx as any);
+    expect((ctx as any).editMessageReplyMarkup).toHaveBeenCalledWith({
+      inline_keyboard: [],
+    });
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
   });
 
   it('uses the model for a direct dictionary question with matching entries', async () => {
@@ -1047,12 +1566,14 @@ describe('TelegramUpdate bot mentions', () => {
     );
 
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
-      oldWord: 'яланчынын дâ шââтӱ',
-      newWord: null,
+    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith({
+      word: 'яланчынын дâ шââтӱ',
       translation: 'подтверждение правильности слов',
-      partOfSpeech: undefined,
-      updatedBy: 'AAlxnv',
+      userId: 42,
+      username: 'AAlxnv',
+      chatId: -100,
+      threadId: null,
+      messageId: 123,
     });
   });
 

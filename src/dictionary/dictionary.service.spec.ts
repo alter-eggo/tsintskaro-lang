@@ -1,4 +1,5 @@
 import { DictionaryService } from './dictionary.service';
+import { Word } from './entities/word.entity';
 
 describe('DictionaryService relevant prompt entries', () => {
   const makeService = (
@@ -208,4 +209,139 @@ describe('DictionaryService word upserts', () => {
     expect(result.word.translation).toBe('меньше; нехватка');
     expect(repo.save).not.toHaveBeenCalled();
   });
+});
+
+describe('DictionaryService explicit translation replacement', () => {
+  const makeReplacement = () => {
+    const row = {
+      id: 5,
+      word: 'ширин',
+      translation: 'сахарный; сладкий',
+      partOfSpeech: 'прил.',
+      source: 'etalon',
+      addedBy: 'original-author',
+    };
+    const history = {
+      create: jest.fn((value) => value),
+      save: jest.fn(async (value) => value),
+    };
+    const repo = {
+      find: jest.fn(async () => [{ ...row }]),
+      findOne: jest.fn(async (options) =>
+        options.where.word === row.word ? { ...row } : null,
+      ),
+      update: jest.fn(async (_criteria, values) => {
+        Object.assign(row, values);
+        return { affected: 1 };
+      }),
+      manager: { transaction: jest.fn() },
+    };
+    repo.manager.transaction.mockImplementation(async (action) =>
+      action({ getRepository: (entity) => (entity === Word ? repo : history) }),
+    );
+    const input = {
+      word: 'Ширин',
+      translation: 'сладкий',
+      userId: 42,
+      username: 'editor',
+      chatId: -100,
+      threadId: 44,
+      messageId: 777,
+    };
+    return {
+      row,
+      repo,
+      history,
+      input,
+      service: new DictionaryService(repo as any),
+    };
+  };
+
+  it('replaces rather than appends while preserving word provenance and other fields', async () => {
+    const f = makeReplacement();
+    const result = await f.service.replaceTranslation(f.input);
+    expect(result).toEqual({
+      status: 'updated',
+      word: 'ширин',
+      previousTranslation: 'сахарный; сладкий',
+      translation: 'сладкий',
+    });
+    expect(f.row).toMatchObject({
+      translation: 'сладкий',
+      source: 'etalon',
+      addedBy: 'original-author',
+      partOfSpeech: 'прил.',
+    });
+    expect(f.repo.update).toHaveBeenCalledWith(
+      { id: 5 },
+      { translation: 'сладкий' },
+    );
+    expect(f.repo.findOne).toHaveBeenCalledWith({
+      where: { word: 'ширин' },
+      lock: { mode: 'pessimistic_write' },
+    });
+    expect(f.history.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wordId: 5,
+        previousTranslation: 'сахарный; сладкий',
+        translation: 'сладкий',
+        userId: 42,
+        username: 'editor',
+        chatId: -100,
+        threadId: 44,
+        messageId: 777,
+      }),
+    );
+  });
+
+  it('invalidates cached lookup answers after replacement', async () => {
+    const f = makeReplacement();
+    expect((await f.service.findWord('ширин'))?.translation).toBe(
+      'сахарный; сладкий',
+    );
+    await f.service.replaceTranslation(f.input);
+    expect((await f.service.findWord('ширин'))?.translation).toBe('сладкий');
+  });
+
+  it('does not create new records or fuzzy-match a different spelling', async () => {
+    const f = makeReplacement();
+    expect(
+      await f.service.replaceTranslation({ ...f.input, word: 'шырин' }),
+    ).toEqual({ status: 'not_found', word: 'шырин' });
+    expect(f.repo.update).not.toHaveBeenCalled();
+    expect(f.history.save).not.toHaveBeenCalled();
+  });
+
+  it('does not duplicate history for an unchanged translation', async () => {
+    const f = makeReplacement();
+    const result = await f.service.replaceTranslation({
+      ...f.input,
+      translation: 'сахарный; сладкий',
+    });
+    expect(result.status).toBe('unchanged');
+    expect(f.repo.update).not.toHaveBeenCalled();
+    expect(f.history.save).not.toHaveBeenCalled();
+  });
+
+  it('does not change the word if saving its history fails', async () => {
+    const f = makeReplacement();
+    f.history.save.mockRejectedValueOnce(new Error('database failure'));
+    await expect(f.service.replaceTranslation(f.input)).rejects.toThrow(
+      'database failure',
+    );
+    expect(f.repo.update).not.toHaveBeenCalled();
+    expect(f.row.translation).toBe('сахарный; сладкий');
+  });
+
+  it.each(['', '   ', '\n'])(
+    'rejects an empty translation %s',
+    async (translation) => {
+      const f = makeReplacement();
+      expect(
+        (await f.service.replaceTranslation({ ...f.input, translation }))
+          .status,
+      ).toBe('invalid');
+      expect(f.repo.manager.transaction).not.toHaveBeenCalled();
+    },
+  );
 });

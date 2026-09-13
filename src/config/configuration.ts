@@ -22,6 +22,10 @@ export default () => {
     pollEnableInDev,
     factDayEnableInDev,
     wordReviewEnableInDev,
+    wordReviewCoordinatorIds: (process.env.WORD_REVIEW_COORDINATOR_IDS ?? '')
+      .split(',')
+      .map((value) => Number(value.trim()))
+      .filter((value) => Number.isSafeInteger(value) && value > 0),
     openaiUsageReportEnableInDev,
     openaiUsageReportChatId: Number.isFinite(openaiUsageReportChatId)
       ? openaiUsageReportChatId

@@ -21,4 +21,16 @@ export class WordReviewConfig {
 
   @Column({ type: 'timestamptz', default: () => 'NOW()' })
   setAt: Date;
+
+  @Column({ type: 'boolean', default: false })
+  enabled: boolean;
+
+  @Column({ type: 'int', default: 10 })
+  batchSize: number;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  nextRunAt: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  dictionaryCutoffAt: Date | null;
 }

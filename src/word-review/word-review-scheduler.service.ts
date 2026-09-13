@@ -2,9 +2,9 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron } from '@nestjs/schedule';
 import { WordReviewService } from './word-review.service';
+import { WORD_REVIEW_TIME_ZONE } from './word-review-schedule';
 
-const WORD_REVIEW_CRON = '0 11 * * *';
-const WORD_REVIEW_TZ = 'Asia/Tbilisi';
+const WORD_REVIEW_CRON = '* * * * *';
 
 @Injectable()
 export class WordReviewSchedulerService {
@@ -15,19 +15,16 @@ export class WordReviewSchedulerService {
     private readonly wordReview: WordReviewService,
   ) {}
 
-  @Cron(WORD_REVIEW_CRON, { timeZone: WORD_REVIEW_TZ })
+  @Cron(WORD_REVIEW_CRON, { timeZone: WORD_REVIEW_TIME_ZONE })
   async runScheduled() {
     const isDev = this.config.get('isDev');
     const enableInDev = this.config.get('wordReviewEnableInDev');
     if (isDev && !enableInDev) {
-      this.logger.log(
-        'Skipping word review — dev environment (set WORD_REVIEW_ENABLE_IN_DEV=true to enable)',
-      );
       return;
     }
 
     try {
-      await this.wordReview.sendReviewBatch();
+      await this.wordReview.sendReviewBatch({ scheduled: true });
     } catch (err) {
       this.logger.error('Scheduled word review failed', err);
     }

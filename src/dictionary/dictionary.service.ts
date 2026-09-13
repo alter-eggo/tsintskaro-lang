@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { Word, type WordSource } from './entities/word.entity';
+import { WordTranslationHistory } from './entities/word-translation-history.entity';
 import { compareTsintskaroWords } from './tsintskaro-alphabet';
 
 export interface DictionaryEntry {
@@ -25,6 +26,26 @@ export interface UpsertWordResult {
   translationAdded: boolean;
   addedTranslation?: string;
 }
+
+export interface ReplaceTranslationInput {
+  word: string;
+  translation: string;
+  userId: number;
+  username?: string | null;
+  chatId: number;
+  threadId?: number | null;
+  messageId?: number | null;
+}
+
+export type ReplaceTranslationResult =
+  | { status: 'invalid'; word: string }
+  | { status: 'not_found'; word: string }
+  | {
+      status: 'updated' | 'unchanged';
+      word: string;
+      previousTranslation: string;
+      translation: string;
+    };
 
 export interface UpdateWordInput {
   oldWord: string;
@@ -452,6 +473,65 @@ export class DictionaryService {
     }
 
     return { deleted, notFound };
+  }
+
+  async replaceTranslation(
+    input: ReplaceTranslationInput,
+  ): Promise<ReplaceTranslationResult> {
+    const word = this.normalizeWordInput(input.word);
+    const translation = input.translation.trim();
+    if (
+      !word ||
+      word.length > 255 ||
+      !translation ||
+      !Number.isSafeInteger(input.userId)
+    ) {
+      return { status: 'invalid', word };
+    }
+    const result =
+      await this.wordRepo.manager.transaction<ReplaceTranslationResult>(
+        async (manager) => {
+          const words = manager.getRepository(Word);
+          // Replacement requires the exact spelling, never a fuzzy match to another word.
+          const current = await words.findOne({
+            where: { word },
+            lock: { mode: 'pessimistic_write' },
+          });
+          if (!current) return { status: 'not_found', word };
+          const previousTranslation = current.translation;
+          if (previousTranslation === translation) {
+            return {
+              status: 'unchanged',
+              word: current.word,
+              previousTranslation,
+              translation,
+            };
+          }
+          const history = manager.getRepository(WordTranslationHistory);
+          await history.save(
+            history.create({
+              wordId: current.id,
+              word: current.word,
+              previousTranslation,
+              translation,
+              userId: input.userId,
+              username: input.username ?? null,
+              chatId: input.chatId,
+              threadId: input.threadId ?? null,
+              messageId: input.messageId ?? null,
+            }),
+          );
+          await words.update({ id: current.id }, { translation });
+          return {
+            status: 'updated',
+            word: current.word,
+            previousTranslation,
+            translation,
+          };
+        },
+      );
+    if (result.status === 'updated') this.invalidateCache();
+    return result;
   }
 
   async updateWord(input: UpdateWordInput): Promise<UpdateWordResult> {

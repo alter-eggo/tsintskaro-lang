@@ -27,8 +27,20 @@ import { PollConfigService } from '../poll/poll-config.service';
 import { PollSchedulerService } from '../poll/poll-scheduler.service';
 import {
   DEFAULT_WORD_REVIEW_LIMIT,
+  MAX_WORD_REVIEW_LIMIT,
+  ReviewDecisionResult,
   WordReviewService,
 } from '../word-review/word-review.service';
+import {
+  parseReviewDecision,
+  REVIEW_DECISION_HELP,
+  ReviewDecisionRequest,
+  WordReviewDecisionError,
+} from '../word-review/word-review-decision';
+import {
+  formatReviewDate,
+  WORD_REVIEW_SCHEDULE_LABEL,
+} from '../word-review/word-review-schedule';
 import { FactDayConfigService } from '../fact-day/fact-day-config.service';
 import {
   FACT_DAY_SCHEDULE_LABEL,
@@ -127,6 +139,15 @@ export class TelegramUpdate implements OnModuleInit {
         description: 'Показать отчёт по OpenAI токенам за сегодня',
       },
       {
+        command: 'startreview',
+        description: 'Запустить разбор слов в этой теме',
+      },
+      { command: 'stopreview', description: 'Приостановить отправку слов' },
+      {
+        command: 'reviewsize',
+        description: 'Количество слов в партии: /reviewsize 10',
+      },
+      {
         command: 'setreviewchat',
         description: 'Слать слова на проверку в этот топик',
       },
@@ -140,7 +161,7 @@ export class TelegramUpdate implements OnModuleInit {
       },
       {
         command: 'reviewnow',
-        description: 'Отправить слова на проверку сейчас',
+        description: 'Отправить дополнительную партию слов',
       },
       { command: 'rules', description: 'Правила цинцкарского языка' },
       { command: 'leaderboard', description: 'Топ добавивших слова' },
@@ -191,6 +212,11 @@ export class TelegramUpdate implements OnModuleInit {
         '/setsummarythread - Слать отчёты в этот топик\n' +
         '/settokenreport - Слать ежедневный отчёт по OpenAI токенам сюда\n' +
         '/tokenreport - Показать расход OpenAI токенов за сегодня\n' +
+        '/startreview - Запустить разбор слов в этой теме\n' +
+        '/stopreview - Приостановить отправку слов\n' +
+        '/reviewsize 10 - Задать количество слов в партии\n' +
+        '/reviewstatus - Прогресс и следующая отправка\n' +
+        '/reviewnow - Дополнительная партия вне очереди\n' +
         '/startfactday - Запустить исторический квиз в этом топике\n' +
         '/rules - Правила цинцкарского языка\n' +
         '/leaderboard - Топ добавивших слова\n' +
@@ -262,34 +288,26 @@ export class TelegramUpdate implements OnModuleInit {
     const username = message.from?.username || 'anonymous';
 
     const replyToMessageId = message.reply_to_message?.message_id;
-    const userId = message.from?.id;
-    if (replyToMessageId && userId) {
-      const correction = await this.wordReviewService.handleCorrectionReply({
-        chatId,
-        userId,
-        username: message.from?.username ?? null,
-        replyToMessageId,
-        text,
-      });
-      if (correction.status !== 'not_correction') {
-        if (correction.message) {
-          await this.replyAndRemember(ctx, correction.message, {
-            reply_parameters: { message_id: message.message_id! },
-          });
-        }
-        return;
-      }
-    }
-
     const isReplyToBot =
       ctx.botInfo?.id != null &&
       message.reply_to_message?.from?.id === ctx.botInfo.id;
+    const isReplyToReview =
+      isReplyToBot && replyToMessageId != null
+        ? await this.wordReviewService.isReviewMessage(chatId, replyToMessageId)
+        : false;
     const isUsernameMention =
       ctx.botInfo?.username &&
       text.toLowerCase().includes(`@${ctx.botInfo.username.toLowerCase()}`);
+    const reviewReplyDecision = isReplyToReview
+      ? parseReviewDecision(text)
+      : null;
     if (
       TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
-      isReplyToBot ||
+      (isReplyToBot &&
+        (!isReplyToReview ||
+          this.extractDictionaryCorrectionInstruction(text) != null ||
+          (reviewReplyDecision != null &&
+            reviewReplyDecision !== 'invalid'))) ||
       isUsernameMention
     ) {
       await this.rememberContextMessage({
@@ -335,35 +353,15 @@ export class TelegramUpdate implements OnModuleInit {
 
   @Action(/^wr:(?:correct|fix):\d+:\d+$/)
   async onWordReviewAction(@Ctx() ctx: Context) {
-    const callback = ctx.callbackQuery as
-      | { data?: string; from?: { id?: number; username?: string } }
-      | undefined;
-    const data = callback?.data;
-    const userId = ctx.from?.id ?? callback?.from?.id;
-    const chatId = ctx.chat?.id;
-    if (!data || !userId || !chatId) {
-      await ctx.answerCbQuery('Не получилось обработать ответ.');
-      return;
-    }
-
-    const firstName = ctx.from?.first_name?.trim() ?? '';
-    const lastName = ctx.from?.last_name?.trim() ?? '';
-    const displayName = ctx.from?.username
-      ? `@${ctx.from.username}`
-      : [firstName, lastName].filter(Boolean).join(' ') || 'Участник';
-
+    await ctx.answerCbQuery(
+      'Голосование кнопками отключено. Обсуждайте слова в теме.',
+    );
     try {
-      const result = await this.wordReviewService.handleAction({
-        data,
-        chatId,
-        userId,
-        username: ctx.from?.username ?? null,
-        displayName,
-      });
-      await ctx.answerCbQuery(result.message || 'Ответ записан.');
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
     } catch (error) {
-      this.logger.error('Word review button failed', error);
-      await ctx.answerCbQuery('Ошибка. Попробуйте ещё раз.');
+      this.logger.warn(
+        `Could not remove legacy review buttons: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -388,6 +386,23 @@ export class TelegramUpdate implements OnModuleInit {
   ): Promise<void> {
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] @${username} addressed bot: "${text}"`);
+    const reviewDecision = parseReviewDecision(text);
+    if (reviewDecision != null) {
+      if (reviewDecision === 'invalid') {
+        await this.replyAndRemember(
+          ctx,
+          'Итог не изменён. ' + REVIEW_DECISION_HELP,
+        );
+      } else {
+        await this.handleReviewDecision(
+          ctx,
+          reviewDecision,
+          messageId,
+          threadId,
+        );
+      }
+      return;
+    }
     const replyToMessage = this.getReplyContext(ctx);
 
     const directMemoryText = this.extractBotMemoryText(text);
@@ -646,6 +661,14 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
+    if (useAiDictionaryCorrectionFallback) {
+      await this.replyAndRemember(
+        ctx,
+        'Какое слово и на какой перевод нужно заменить? Укажите оба значения.',
+      );
+      return;
+    }
+
     // action === 'add_words'
     const groundedEntries = this.filterGroundedDictionaryEntries(
       text,
@@ -671,6 +694,97 @@ export class TelegramUpdate implements OnModuleInit {
       messageId,
       groundedEntries,
     );
+  }
+
+  private async handleReviewDecision(
+    ctx: Context,
+    request: ReviewDecisionRequest,
+    messageId: number | undefined,
+    threadId: number | null,
+  ): Promise<void> {
+    const message = ctx.message as {
+      sender_chat?: unknown;
+      forward_origin?: unknown;
+      reply_to_message?: { message_id?: number; from?: { id?: number } };
+    };
+    if (
+      !ctx.from?.id ||
+      ctx.from.is_bot ||
+      message.sender_chat ||
+      message.forward_origin
+    ) {
+      await this.replyAndRemember(
+        ctx,
+        'Подведите итоги своим сообщением от личного аккаунта, чтобы сохранить автора решения.',
+      );
+      return;
+    }
+    const coordinatorIds = this.config.get<number[]>(
+      'wordReviewCoordinatorIds',
+    );
+    const coordinator =
+      Array.isArray(coordinatorIds) && coordinatorIds.includes(ctx.from.id);
+    if (!coordinator && !(await this.isAdmin(ctx, ctx.from.username))) {
+      await this.replyAndRemember(
+        ctx,
+        'Подводить итоги могут назначенные координаторы и администраторы чата.',
+      );
+      return;
+    }
+    let result: ReviewDecisionResult;
+    try {
+      result = await this.wordReviewService.recordDecision({
+        request,
+        chatId: ctx.chat!.id,
+        threadId,
+        replyToMessageId:
+          message.reply_to_message?.from?.id === ctx.botInfo?.id
+            ? message.reply_to_message?.message_id
+            : undefined,
+        userId: ctx.from.id,
+        username: ctx.from.username ?? null,
+        messageId: messageId!,
+      });
+    } catch (error) {
+      if (!(error instanceof WordReviewDecisionError))
+        this.logger.error('Could not record word review decision', error);
+      await this.replyAndRemember(
+        ctx,
+        error instanceof WordReviewDecisionError
+          ? error.message
+          : 'Не удалось завершить сохранение итогов. Повторите сообщение: уже сохранённые решения не потеряются.',
+      );
+      return;
+    }
+
+    const total =
+      result.confirmed.length + result.disputed.length + result.pending.length;
+    const lines = [
+      result.completed
+        ? `✅ Партия №${result.batchId} разобрана полностью (${total} из ${total}).`
+        : result.confirmed.length
+          ? `📝 Партия №${result.batchId} разобрана частично (${result.confirmed.length} из ${total}).`
+          : `📝 Партия №${result.batchId} ещё не разобрана (0 из ${total}).`,
+    ];
+    if (result.alreadyApplied)
+      lines.push('Это сообщение уже учтено. Ниже текущий итог.');
+    for (const [title, words] of [
+      ['Разобраны', result.confirmed],
+      ['Спорные — разбор продолжается', result.disputed],
+      ['Ожидают итога', result.pending],
+    ] as const) {
+      lines.push('', `${title}:`);
+      lines.push(
+        ...(words.length
+          ? words.map((word) => `${word.position}. ${word.word}`)
+          : ['нет']),
+      );
+    }
+    for (const chunk of this.chunkBotAnswer(lines.join('\n'))) {
+      await this.replyAndRemember(ctx, chunk, {
+        reply_parameters: { message_id: messageId! },
+      });
+    }
   }
 
   private async extractDirectDictionaryEntries(
@@ -1324,8 +1438,18 @@ export class TelegramUpdate implements OnModuleInit {
       }
     }
 
+    // A short reply such as “замени перевод на сладкий” needs the quoted
+    // word or conversation context. Never treat “перевод” as a word to rename.
+    if (
+      /^(?:(?:его|её|этот|текущий)\s+)?перевод\s+(?:на|в|будет|=|—|-)(?:\s|$)/i.test(
+        instruction,
+      )
+    ) {
+      return null;
+    }
+
     const translationOnly = instruction.match(
-      /^перевод\s+(?:(?:у|для|в)\s+)?(?:(?:словосочетани[еяи]|выражени[еяи]|слова?|фраз[ыае]|запис[ьи])\s+)?(.+?)\s+(?:на|в|будет|=|—|-)\s+(.+?)[.!?]*$/i,
+      /^перевод\s+(?:(?:у|для|в)\s+)?(?:(?:словосочетани[еяи]|выражени[еяи]|слова?|фраз[ыае]|запис[ьи])\s+)?(.+?)\s+(?:на|в|будет|=|—|-)\s+(?:[—-]\s+)?(.+?)[.!?]*$/i,
     );
     if (translationOnly) {
       const oldWord = this.cleanDictionaryUpdateWord(translationOnly[1]);
@@ -1334,6 +1458,9 @@ export class TelegramUpdate implements OnModuleInit {
         return { oldWord, newWord: null, translation };
       }
     }
+
+    if (/^(?:(?:его|её|этот|текущий)\s+)?перевод(?:\s|$)/i.test(instruction))
+      return null;
 
     const renameInstruction =
       this.stripLeadingDictionaryUpdateLabel(instruction);
@@ -1570,6 +1697,35 @@ export class TelegramUpdate implements OnModuleInit {
 
     for (const entry of entries) {
       try {
+        const translationOnly =
+          entry.translation &&
+          (!entry.newWord || entry.newWord === entry.oldWord) &&
+          entry.partOfSpeech == null;
+        if (translationOnly) {
+          const result = await this.dictionaryService.replaceTranslation({
+            word: entry.oldWord,
+            translation: entry.translation!,
+            userId: ctx.from?.id,
+            username: ctx.from?.username ?? username,
+            chatId,
+            threadId:
+              (ctx.message as { message_thread_id?: number })
+                ?.message_thread_id ?? null,
+            messageId: messageId ?? null,
+          });
+          if (result.status === 'updated' || result.status === 'unchanged') {
+            updated.push(
+              result.status === 'updated'
+                ? `${result.word}\nБыло: ${result.previousTranslation || '(пусто)'}\nСтало: ${result.translation}`
+                : `${result.word} — ${result.translation} (перевод уже такой)`,
+            );
+          } else if (result.status === 'not_found') {
+            notFound.push(entry.oldWord);
+          } else {
+            failed.push(entry.oldWord);
+          }
+          continue;
+        }
         const result = await this.dictionaryService.updateWord({
           oldWord: entry.oldWord,
           newWord: entry.newWord,
@@ -1656,9 +1812,11 @@ export class TelegramUpdate implements OnModuleInit {
       return result;
     }
 
-    await this.replyAndRemember(ctx, lines.join('\n'), {
-      reply_parameters: { message_id: messageId },
-    });
+    for (const chunk of this.chunkString(lines.join('\n'), 3900)) {
+      await this.replyAndRemember(ctx, chunk, {
+        reply_parameters: { message_id: messageId },
+      });
+    }
     return result;
   }
 
@@ -2357,51 +2515,136 @@ export class TelegramUpdate implements OnModuleInit {
     }
   }
 
-  @Command('setreviewchat')
-  async onSetReviewChat(@Ctx() ctx: Context) {
+  @Command('startreview')
+  async onStartReview(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
       await this.replyAndRemember(
         ctx,
-        'Команду нужно вызывать в группе (и нужном топике).',
+        'Вызовите команду в теме «Язык (профессионалы)».',
       );
       return;
     }
-
     const chatId = ctx.chat!.id;
-    const message = ctx.message as { message_thread_id?: number };
-    const threadId = message.message_thread_id ?? null;
-    const username = ctx.from?.username || 'unknown';
+    const threadId =
+      (ctx.message as { message_thread_id?: number }).message_thread_id ?? null;
+    try {
+      await this.wordReviewService.setTarget(
+        chatId,
+        threadId,
+        ctx.from?.username ?? 'unknown',
+      );
+      const result = await this.wordReviewService.sendReviewBatch({
+        scheduled: true,
+        chatId,
+        threadId,
+      });
+      const target = await this.wordReviewService.getTarget();
+      const outcome =
+        result.status === 'sent'
+          ? `Отправлено ${result.count} слов.`
+          : result.status === 'no_words'
+            ? 'Новых слов для отправки пока нет. Бот проверит их появление по расписанию.'
+            : 'Расписание сохранено.';
+      await this.replyAndRemember(
+        ctx,
+        `▶️ Разбор слов запущен в этой теме.\n${outcome}\n` +
+          `Размер партии: ${target?.batchSize ?? DEFAULT_WORD_REVIEW_LIMIT}.\n` +
+          `Расписание: ${WORD_REVIEW_SCHEDULE_LABEL}.\n` +
+          (target?.nextRunAt
+            ? `Ближайшая отправка: ${formatReviewDate(new Date(target.nextRunAt))}.`
+            : ''),
+      );
+    } catch (error) {
+      this.logger.error('Could not start word review', error);
+      await this.replyAndRemember(
+        ctx,
+        error instanceof Error &&
+          error.message.startsWith('Проверка уже настроена')
+          ? error.message
+          : 'Не удалось завершить запуск. Сохранённый прогресс отправки будет использован при повторной попытке.',
+      );
+    }
+  }
 
-    await this.wordReviewService.setTarget(chatId, threadId, username);
+  @Command('setreviewchat')
+  async onSetReviewChat(@Ctx() ctx: Context) {
+    await this.onStartReview(ctx);
+  }
 
-    await this.replyAndRemember(
-      ctx,
-      `✅ Проверка словаря будет приходить сюда.\n` +
-        `chat_id: <code>${chatId}</code>\n` +
-        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
-        `Расписание: каждый день в 11:00 по Тбилиси.\n` +
-        `В пакете: ${DEFAULT_WORD_REVIEW_LIMIT} слов. Новый пакет приходит сразу после завершения текущего.`,
-      { parse_mode: 'HTML' },
-    );
+  @Command('stopreview')
+  async onStopReview(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await this.replyAndRemember(
+        ctx,
+        'Вызовите команду в теме, где идёт разбор слов.',
+      );
+      return;
+    }
+    const threadId =
+      (ctx.message as { message_thread_id?: number }).message_thread_id ?? null;
+    try {
+      await this.wordReviewService.clearTarget(ctx.chat!.id, threadId);
+      await this.replyAndRemember(
+        ctx,
+        '⏸ Отправка слов приостановлена. Размер партии, расписание и прогресс сохранены. Возобновить: /startreview',
+      );
+    } catch (error) {
+      this.logger.error('Could not stop word review', error);
+      await this.replyAndRemember(
+        ctx,
+        'Не удалось остановить отправку. Вызовите /stopreview в теме разбора слов.',
+      );
+    }
   }
 
   @Command('clearreviewchat')
   async onClearReviewChat(@Ctx() ctx: Context) {
+    await this.onStopReview(ctx);
+  }
+
+  @Command('reviewsize')
+  async onReviewSize(@Ctx() ctx: Context) {
     if (!(await this.requireAdmin(ctx))) return;
     if (this.isPrivateChat(ctx)) {
+      await this.replyAndRemember(ctx, 'Вызовите команду в теме разбора слов.');
+      return;
+    }
+    const message = ctx.message as {
+      text?: string;
+      message_thread_id?: number;
+    };
+    const match = /^\S+\s+([1-9]\d*)\s*$/.exec(message.text ?? '');
+    const size = match ? Number(match[1]) : Number.NaN;
+    if (!Number.isInteger(size) || size < 1 || size > MAX_WORD_REVIEW_LIMIT) {
       await this.replyAndRemember(
         ctx,
-        'Этот бот работает только в групповых чатах.',
+        `Укажите целое число от 1 до ${MAX_WORD_REVIEW_LIMIT}: /reviewsize 10`,
       );
       return;
     }
-
-    await this.wordReviewService.clearTarget();
-    await this.replyAndRemember(
-      ctx,
-      '🛑 Проверка словаря отключена. Используйте /setreviewchat чтобы включить снова.',
-    );
+    try {
+      const target = await this.wordReviewService.setBatchSize(
+        ctx.chat!.id,
+        message.message_thread_id ?? null,
+        size,
+        ctx.from?.username ?? 'unknown',
+      );
+      await this.replyAndRemember(
+        ctx,
+        `✅ В следующих партиях будет по ${size} слов. Текущая партия сохраняет свой состав.` +
+          (target.enabled
+            ? ''
+            : '\nОтправка приостановлена. Запустить: /startreview'),
+      );
+    } catch (error) {
+      this.logger.error('Could not change word review size', error);
+      await this.replyAndRemember(
+        ctx,
+        'Не удалось изменить размер партии. Вызовите команду в теме разбора слов.',
+      );
+    }
   }
 
   @Command('reviewstatus')
@@ -2419,7 +2662,7 @@ export class TelegramUpdate implements OnModuleInit {
     if (!status.target) {
       await this.replyAndRemember(
         ctx,
-        '⚠️ Проверка словаря не настроена.\nВызови /setreviewchat в нужном топике.',
+        '⚠️ Проверка словаря не настроена.\nВызови /startreview в нужной теме.',
       );
       return;
     }
@@ -2442,21 +2685,29 @@ export class TelegramUpdate implements OnModuleInit {
         `thread_id: <code>${status.target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${status.target.setBy}\n` +
         `когда: ${setAt.toISOString()}\n\n` +
-        `Слов из чата всего: ${status.totalChatWords}\n` +
-        `Уже отправлялись на проверку: ${status.sentWordCount}\n` +
-        `Осталось неотправленных: ${status.remainingWordCount}\n` +
+        `Состояние: ${status.target.enabled ? 'запущено' : 'пауза'}\n` +
+        `Размер партии: ${status.target.batchSize}\n` +
+        `Расписание: ${WORD_REVIEW_SCHEDULE_LABEL}\n` +
+        `Ближайшая отправка: ${status.target.enabled && status.target.nextRunAt ? formatReviewDate(new Date(status.target.nextRunAt)) : 'не запланирована'}\n` +
+        `Слов в списке разбора: ${status.totalWords}\n` +
+        `Включено в партии: ${status.sentWordCount}\n` +
+        `Осталось отправить в текущем проходе: ${status.remainingWordCount}\n` +
+        `Новых слов на следующий проход: ${status.waitingNextPassCount}\n` +
+        `Разобрано слов: ${status.confirmedWordCount}\n` +
+        `Спорных слов: ${status.disputedWordCount}\n` +
+        `Ожидают завершения разбора (включая спорные): ${status.openWordCount}\n` +
         `Последняя отправка: ${lastSent}`,
       { parse_mode: 'HTML' },
     );
 
-    if (status.activeBatch) {
-      await this.replyAndRemember(
-        ctx,
-        `Активный пакет №${status.activeBatch.id}: ` +
-          `${status.activeBatch.confirmed}/${status.activeBatch.total} подтверждено, ` +
-          `${status.activeBatch.awaitingCorrection} ожидают исправления.`,
-      );
-    }
+    await this.replyAndRemember(
+      ctx,
+      `Опубликовано партий: ${status.publishedBatchCount}. Полностью разобрано: ${status.completedBatchCount}.` +
+        (status.sendingBatchId
+          ? ` Сейчас отправляется партия №${status.sendingBatchId}.`
+          : '') +
+        '\nОбсуждение предыдущих партий не задерживает новые отправки.',
+    );
   }
 
   @Command('reviewnow')
@@ -2471,32 +2722,31 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     try {
-      const result = await this.wordReviewService.sendReviewBatch();
+      const result = await this.wordReviewService.sendReviewBatch({
+        extra: true,
+        chatId: ctx.chat!.id,
+        threadId:
+          (ctx.message as { message_thread_id?: number }).message_thread_id ??
+          null,
+      });
       if (result.status === 'no_target') {
         await this.replyAndRemember(
           ctx,
-          '⚠️ Сначала настрой через /setreviewchat.',
+          '⚠️ Сначала запустите разбор через /startreview.',
         );
         return;
       }
       if (result.status === 'no_words') {
         await this.replyAndRemember(
           ctx,
-          'Все chat-слова уже отправлялись на проверку.',
-        );
-        return;
-      }
-      if (result.status === 'active_batch') {
-        await this.replyAndRemember(
-          ctx,
-          'Сначала нужно завершить текущий пакет. Исправляемые слова задерживают весь пакет.',
+          'Новых слов для отправки пока нет. Уже отправленные слова остаются в своих партиях.',
         );
         return;
       }
 
       await this.replyAndRemember(
         ctx,
-        `✅ Отправил ${result.count} слов на проверку.`,
+        `✅ Дополнительная партия: ${result.count} слов. Регулярное расписание сохранено.`,
       );
     } catch (err) {
       this.logger.error('Manual word review failed', err);

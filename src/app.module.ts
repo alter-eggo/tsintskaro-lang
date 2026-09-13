@@ -17,6 +17,7 @@ import { WordReviewConfig } from './word-review/entities/word-review-config.enti
 import { WordReviewHistory } from './word-review/entities/word-review-history.entity';
 import { WordReviewBatch } from './word-review/entities/word-review-batch.entity';
 import { WordReviewItem } from './word-review/entities/word-review-item.entity';
+import { WordReviewDecision } from './word-review/entities/word-review-decision.entity';
 import { WordReviewVote } from './word-review/entities/word-review-vote.entity';
 import { WordReviewCorrectionRequest } from './word-review/entities/word-review-correction-request.entity';
 import { CollectedMessage } from './telegram/entities/collected-message.entity';
@@ -24,6 +25,7 @@ import { SummaryConfig } from './telegram/entities/summary-config.entity';
 import { SummaryReport } from './telegram/entities/summary-report.entity';
 import { BotMemory } from './telegram/entities/bot-memory.entity';
 import { Word } from './dictionary/entities/word.entity';
+import { WordTranslationHistory } from './dictionary/entities/word-translation-history.entity';
 import configuration from './config/configuration';
 
 @Module({
@@ -46,6 +48,7 @@ import configuration from './config/configuration';
           WordReviewHistory,
           WordReviewBatch,
           WordReviewItem,
+          WordReviewDecision,
           WordReviewVote,
           WordReviewCorrectionRequest,
           CollectedMessage,
@@ -55,6 +58,7 @@ import configuration from './config/configuration';
           OpenaiUsageLog,
           OpenaiUsageReportConfig,
           Word,
+          WordTranslationHistory,
         ],
         synchronize: true,
       }),

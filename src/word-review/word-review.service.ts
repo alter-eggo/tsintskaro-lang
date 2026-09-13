@@ -2,63 +2,61 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectBot } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
-import { IsNull, Not, Repository } from 'typeorm';
-import { DictionaryService } from '../dictionary/dictionary.service';
+import { In, IsNull, Repository } from 'typeorm';
 import { Word } from '../dictionary/entities/word.entity';
 import { WordReviewBatch } from './entities/word-review-batch.entity';
 import { WordReviewConfig } from './entities/word-review-config.entity';
-import { WordReviewCorrectionRequest } from './entities/word-review-correction-request.entity';
 import { WordReviewHistory } from './entities/word-review-history.entity';
 import { WordReviewItem } from './entities/word-review-item.entity';
-import { WordReviewVote } from './entities/word-review-vote.entity';
+import {
+  WordReviewDecision,
+  WordReviewDecisionChange,
+} from './entities/word-review-decision.entity';
+import {
+  normalizeReviewWord,
+  ReviewDecisionRequest,
+  ReviewWordReference,
+  WordReviewDecisionError,
+} from './word-review-decision';
+
+import { compareTsintskaroWords } from '../dictionary/tsintskaro-alphabet';
+import {
+  formatReviewDate,
+  nextReviewDate,
+  reviewCalendarDate,
+} from './word-review-schedule';
 
 export const DEFAULT_WORD_REVIEW_LIMIT = 10;
-export const WORD_REVIEW_REQUIRED_VOTES = 3;
+export const MAX_WORD_REVIEW_LIMIT = 100;
 
 export interface WordReviewSendResult {
-  status: 'sent' | 'no_target' | 'no_words' | 'active_batch';
+  status: 'sent' | 'no_target' | 'no_words' | 'paused' | 'not_due';
   count: number;
   messageId?: number;
 }
 
 export interface WordReviewStatus {
   target: WordReviewConfig | null;
-  totalChatWords: number;
+  totalWords: number;
   sentWordCount: number;
   remainingWordCount: number;
+  waitingNextPassCount: number;
   lastSentAt: Date | null;
-  activeBatch: {
-    id: number;
-    total: number;
-    confirmed: number;
-    awaitingCorrection: number;
-  } | null;
+  publishedBatchCount: number;
+  sendingBatchId: number | null;
+  confirmedWordCount: number;
+  disputedWordCount: number;
+  openWordCount: number;
+  completedBatchCount: number;
 }
 
-export interface WordReviewActionInput {
-  data: string;
-  chatId: number;
-  userId: number;
-  username: string | null;
-  displayName: string;
-}
-
-export interface WordReviewActionResult {
-  status: 'handled' | 'ignored';
-  message: string;
-}
-
-export interface WordReviewCorrectionReplyInput {
-  chatId: number;
-  userId: number;
-  username: string | null;
-  replyToMessageId: number;
-  text: string;
-}
-
-export interface WordReviewCorrectionReplyResult {
-  status: 'not_correction' | 'invalid_format' | 'stale' | 'applied';
-  message?: string;
+export interface ReviewDecisionResult {
+  batchId: number;
+  completed: boolean;
+  alreadyApplied: boolean;
+  confirmed: { position: number; word: string }[];
+  disputed: { position: number; word: string }[];
+  pending: { position: number; word: string }[];
 }
 
 @Injectable()
@@ -67,7 +65,6 @@ export class WordReviewService {
 
   constructor(
     @InjectBot() private readonly bot: Telegraf<Context>,
-    private readonly dictionary: DictionaryService,
     @InjectRepository(WordReviewConfig)
     private readonly configRepo: Repository<WordReviewConfig>,
     @InjectRepository(WordReviewHistory)
@@ -76,10 +73,6 @@ export class WordReviewService {
     private readonly batchRepo: Repository<WordReviewBatch>,
     @InjectRepository(WordReviewItem)
     private readonly itemRepo: Repository<WordReviewItem>,
-    @InjectRepository(WordReviewVote)
-    private readonly voteRepo: Repository<WordReviewVote>,
-    @InjectRepository(WordReviewCorrectionRequest)
-    private readonly correctionRepo: Repository<WordReviewCorrectionRequest>,
     @InjectRepository(Word)
     private readonly wordRepo: Repository<Word>,
   ) {}
@@ -92,568 +85,667 @@ export class WordReviewService {
     return configs[0] ?? null;
   }
 
+  private async withScheduleLock<T>(action: () => Promise<T>): Promise<T> {
+    const runner = this.configRepo.manager.connection.createQueryRunner();
+    await runner.connect();
+    try {
+      await runner.query(
+        "SELECT pg_advisory_lock(hashtext('tsintskaro.word-review'))",
+      );
+      try {
+        return await action();
+      } finally {
+        await runner.query(
+          "SELECT pg_advisory_unlock(hashtext('tsintskaro.word-review'))",
+        );
+      }
+    } finally {
+      await runner.release();
+    }
+  }
+
   async setTarget(
     chatId: number,
     threadId: number | null,
     setBy: string,
   ): Promise<WordReviewConfig> {
-    await this.configRepo.clear();
-    const entity = this.configRepo.create({
-      chatId,
-      threadId,
-      setBy,
-      setAt: new Date(),
+    return this.withScheduleLock(async () => {
+      const previous = await this.getTarget();
+      if (
+        previous &&
+        (previous.chatId !== chatId || previous.threadId !== threadId)
+      ) {
+        throw new Error(
+          'Проверка уже настроена в другой теме. Управляйте ею из той темы.',
+        );
+      }
+      const now = new Date();
+      const target =
+        previous ??
+        this.configRepo.create({
+          chatId,
+          threadId,
+          batchSize: DEFAULT_WORD_REVIEW_LIMIT,
+          nextRunAt: now,
+        });
+      target.enabled = true;
+      target.setBy = setBy;
+      target.setAt = now;
+      target.nextRunAt ??= now;
+      target.dictionaryCutoffAt ??= now;
+      return this.configRepo.save(target);
     });
-    const saved = await this.configRepo.save(entity);
-    this.logger.log(
-      `Word review target set: chat=${chatId}, thread=${threadId ?? 'none'}, by=${setBy}`,
-    );
-    return saved;
   }
 
-  async clearTarget(): Promise<void> {
-    await this.configRepo.clear();
-    this.logger.log('Word review target cleared');
+  async clearTarget(chatId: number, threadId: number | null): Promise<void> {
+    await this.withScheduleLock(async () => {
+      const target = await this.getTarget();
+      if (!target) return;
+      this.assertTarget(target, chatId, threadId);
+      await this.configRepo.update({ id: target.id }, { enabled: false });
+    });
   }
 
-  async sendReviewBatch(): Promise<WordReviewSendResult> {
-    const target = await this.getTarget();
-    if (!target) {
-      this.logger.log('Skipping word review — target chat is not configured');
-      return { status: 'no_target', count: 0 };
-    }
-
-    const activeBatch = await this.batchRepo.findOne({
-      where: { chatId: target.chatId, status: 'active' },
-    });
-    if (activeBatch) {
-      this.logger.log(
-        `Skipping word review — batch ${activeBatch.id} is still active`,
+  async setBatchSize(
+    chatId: number,
+    threadId: number | null,
+    size: number,
+    setBy: string,
+  ): Promise<WordReviewConfig> {
+    if (!Number.isInteger(size) || size < 1 || size > MAX_WORD_REVIEW_LIMIT) {
+      throw new Error(
+        `Количество слов должно быть целым числом от 1 до ${MAX_WORD_REVIEW_LIMIT}.`,
       );
-      return { status: 'active_batch', count: 0 };
     }
+    return this.withScheduleLock(async () => {
+      const existing = await this.getTarget();
+      if (existing) this.assertTarget(existing, chatId, threadId);
+      const target =
+        existing ??
+        this.configRepo.create({
+          chatId,
+          threadId,
+          enabled: false,
+          nextRunAt: null,
+        });
+      target.batchSize = size;
+      target.setBy = setBy;
+      target.setAt = new Date();
+      return this.configRepo.save(target);
+    });
+  }
 
-    const words = await this.pickWordsForReview(DEFAULT_WORD_REVIEW_LIMIT);
-    if (words.length === 0) {
-      this.logger.log('Skipping word review — no unchecked chat words left');
-      return { status: 'no_words', count: 0 };
+  private assertTarget(
+    target: WordReviewConfig,
+    chatId: number,
+    threadId: number | null,
+  ) {
+    if (target.chatId !== chatId || target.threadId !== threadId) {
+      throw new Error(
+        'Вызовите команду в теме, где настроена проверка словаря.',
+      );
     }
+  }
 
-    const batch = await this.batchRepo.save(
-      this.batchRepo.create({
-        chatId: target.chatId,
-        threadId: target.threadId,
-        messageId: null,
-        status: 'active',
-        requiredVotes: WORD_REVIEW_REQUIRED_VOTES,
-        completedAt: null,
-      }),
-    );
-
-    const items = await this.itemRepo.save(
-      words.map((word, index) =>
-        this.itemRepo.create({
-          batchId: batch.id,
-          wordId: word.id,
-          position: index + 1,
-          originalWord: word.word,
-          originalTranslation: word.translation,
-          proposedWord: word.word,
-          proposedTranslation: word.translation,
-          partOfSpeech: word.partOfSpeech,
-          source: word.source,
-          status: 'voting',
-          revision: 1,
-          confirmedAt: null,
-        }),
-      ),
-    );
-
-    let sent: Awaited<ReturnType<typeof this.bot.telegram.sendMessage>>;
-    try {
-      const text = this.buildReviewMessage(batch, items, new Map());
-      sent = await this.bot.telegram.sendMessage(target.chatId, text, {
-        message_thread_id: target.threadId ?? undefined,
-        reply_markup: this.buildKeyboard(items),
+  async sendReviewBatch(
+    options: {
+      scheduled?: boolean;
+      extra?: boolean;
+      chatId?: number;
+      threadId?: number | null;
+    } = {},
+  ): Promise<WordReviewSendResult> {
+    return this.withScheduleLock(async () => {
+      const target = await this.getTarget();
+      if (!target) return { status: 'no_target', count: 0 };
+      if (options.chatId != null)
+        this.assertTarget(target, options.chatId, options.threadId ?? null);
+      if (!target.enabled && !options.extra)
+        return { status: 'paused', count: 0 };
+      if (!target.dictionaryCutoffAt) return { status: 'no_target', count: 0 };
+      const now = new Date();
+      const pendingBatch = await this.batchRepo.findOne({
+        where: { chatId: target.chatId, status: 'sending' },
+        order: { id: 'ASC' },
       });
-    } catch (error) {
-      await this.itemRepo.delete({ batchId: batch.id });
-      await this.batchRepo.delete({ id: batch.id });
-      throw error;
-    }
+      if (
+        options.scheduled &&
+        pendingBatch?.status !== 'sending' &&
+        target.nextRunAt &&
+        new Date(target.nextRunAt) > now
+      ) {
+        return { status: 'not_due', count: 0 };
+      }
 
-    batch.messageId =
-      sent && 'message_id' in sent ? Number(sent.message_id) : null;
-    await this.batchRepo.save(batch);
-    try {
-      await this.historyRepo.save(
-        words.map((word) =>
-          this.historyRepo.create({
-            wordId: word.id,
-            word: word.word,
-            translation: word.translation,
-            partOfSpeech: word.partOfSpeech,
-            source: word.source,
-            chatId: target.chatId,
-            threadId: target.threadId,
-            messageId: batch.messageId,
-            sentAt: new Date(),
+      let batch = pendingBatch;
+      let items: WordReviewItem[];
+      if (batch) {
+        items = await this.itemRepo.find({
+          where: { batchId: batch.id },
+          order: { position: 'ASC' },
+        });
+      } else {
+        let passCutoff = target.dictionaryCutoffAt;
+        let words = await this.pickWordsForReview(
+          target.batchSize ?? DEFAULT_WORD_REVIEW_LIMIT,
+          passCutoff,
+        );
+        if (words.length === 0 && new Date(passCutoff) < now) {
+          // Finish the current snapshot before admitting later additions. The
+          // delivery ledger keeps both reviewed and still-discussed words out.
+          passCutoff = now;
+          words = await this.pickWordsForReview(
+            target.batchSize ?? DEFAULT_WORD_REVIEW_LIMIT,
+            passCutoff,
+          );
+        }
+        if (words.length === 0) {
+          if (!options.extra) {
+            await this.configRepo.update(
+              { id: target.id },
+              {
+                nextRunAt:
+                  target.nextRunAt && new Date(target.nextRunAt) > now
+                    ? target.nextRunAt
+                    : nextReviewDate(target.nextRunAt ?? now, now),
+              },
+            );
+          }
+          return { status: 'no_words', count: 0 };
+        }
+        // Persist the batch and all its items together before publishing any page.
+        const saved = await this.batchRepo.manager.transaction(
+          async (manager) => {
+            const batches = manager.getRepository(WordReviewBatch);
+            const reviewItems = manager.getRepository(WordReviewItem);
+            // Save a new pass boundary with its first batch so interrupted
+            // delivery resumes the same snapshot after a restart.
+            if (passCutoff !== target.dictionaryCutoffAt) {
+              await manager
+                .getRepository(WordReviewConfig)
+                .update({ id: target.id }, { dictionaryCutoffAt: passCutoff });
+            }
+            const newBatch = await batches.save(
+              batches.create({
+                chatId: target.chatId,
+                threadId: target.threadId,
+                messageId: null,
+                messageIds: [],
+                status: 'sending',
+                reviewFlow: 'dictionary',
+                requiredVotes: 0,
+                advanceSchedule: !options.extra,
+                discussionEndsAt: this.discussionEnd(now),
+                completedAt: null,
+              }),
+            );
+            const newItems = await reviewItems.save(
+              words.map((word, index) =>
+                reviewItems.create({
+                  batchId: newBatch.id,
+                  wordId: word.id,
+                  position: index + 1,
+                  originalWord: word.word,
+                  originalTranslation: word.translation,
+                  proposedWord: word.word,
+                  proposedTranslation: word.translation,
+                  partOfSpeech: word.partOfSpeech,
+                  source: word.source,
+                  status: 'discussion',
+                  revision: 1,
+                  confirmedAt: null,
+                }),
+              ),
+            );
+            return { batch: newBatch, items: newItems };
+          },
+        );
+        batch = saved.batch;
+        items = saved.items;
+      }
+
+      batch.discussionEndsAt ??= this.discussionEnd(now);
+      const pages = this.buildReviewPages(batch, items);
+      batch.messageIds ??= [];
+      for (let index = batch.messageIds.length; index < pages.length; index++) {
+        const page = pages[index];
+        const sent = await this.bot.telegram.sendMessage(
+          target.chatId,
+          page.text,
+          {
+            message_thread_id: target.threadId ?? undefined,
+            entities: page.entities,
+          },
+        );
+        batch.messageIds.push(sent.message_id);
+        batch.messageId ??= sent.message_id;
+        await this.batchRepo.save(batch);
+      }
+      batch.status = 'published';
+      await this.batchRepo.manager.transaction(async (manager) => {
+        await manager.getRepository(WordReviewBatch).save(batch);
+        if (batch.advanceSchedule) {
+          await manager.getRepository(WordReviewConfig).update(
+            { id: target.id },
+            {
+              nextRunAt:
+                target.nextRunAt && new Date(target.nextRunAt) > now
+                  ? target.nextRunAt
+                  : nextReviewDate(target.nextRunAt ?? now, now),
+            },
+          );
+        }
+      });
+      // Items are the authoritative delivery ledger. History is retained for old reports.
+      try {
+        await this.historyRepo.save(
+          items.map((item) =>
+            this.historyRepo.create({
+              wordId: item.wordId,
+              word: item.originalWord,
+              translation: item.originalTranslation,
+              partOfSpeech: item.partOfSpeech,
+              source: item.source,
+              chatId: target.chatId,
+              threadId: target.threadId,
+              messageId: batch.messageId,
+              sentAt: now,
+            }),
+          ),
+        );
+      } catch (error) {
+        this.logger.error(
+          `Could not write legacy history for word review batch ${batch.id}`,
+          error,
+        );
+      }
+      return {
+        status: 'sent',
+        count: items.length,
+        messageId: batch.messageId ?? undefined,
+      };
+    });
+  }
+
+  async isReviewMessage(chatId: number, messageId: number): Promise<boolean> {
+    return this.batchRepo
+      .createQueryBuilder('batch')
+      .where('batch.chatId = :chatId', { chatId })
+      .andWhere(
+        '(batch.messageId = :messageId OR batch.messageIds @> CAST(:messageIds AS jsonb))',
+        {
+          messageId,
+          messageIds: JSON.stringify([messageId]),
+        },
+      )
+      .getExists();
+  }
+
+  async recordDecision(input: {
+    request: ReviewDecisionRequest;
+    chatId: number;
+    threadId: number | null;
+    replyToMessageId?: number;
+    userId: number;
+    username: string | null;
+    messageId: number;
+  }): Promise<ReviewDecisionResult> {
+    if (
+      !Number.isSafeInteger(input.userId) ||
+      input.userId <= 0 ||
+      !Number.isSafeInteger(input.messageId) ||
+      input.messageId <= 0
+    ) {
+      throw new WordReviewDecisionError(
+        'Не удалось определить автора итогов. Отправьте сообщение от своего аккаунта.',
+      );
+    }
+    return this.withScheduleLock(async () => {
+      const target = await this.getTarget();
+      if (
+        !target ||
+        target.chatId !== input.chatId ||
+        target.threadId !== input.threadId
+      )
+        throw new WordReviewDecisionError(
+          'Подведите итоги в теме, где бот публикует партии слов.',
+        );
+
+      return this.batchRepo.manager.transaction(async (manager) => {
+        const batches = manager.getRepository(WordReviewBatch);
+        const reviewItems = manager.getRepository(WordReviewItem);
+        const decisions = manager.getRepository(WordReviewDecision);
+        const previous = await decisions.findOne({
+          where: { chatId: input.chatId, messageId: input.messageId },
+        });
+        const available = await batches.find({
+          where: {
+            chatId: input.chatId,
+            threadId: input.threadId ?? IsNull(),
+            reviewFlow: 'dictionary',
+          },
+        });
+        const replyBatch =
+          input.replyToMessageId == null
+            ? undefined
+            : available.find(
+                (batch) =>
+                  batch.messageId === input.replyToMessageId ||
+                  batch.messageIds?.includes(input.replyToMessageId),
+              );
+        let batch = previous
+          ? available.find((entry) => entry.id === previous.batchId)
+          : input.request.batchId != null
+            ? available.find((entry) => entry.id === input.request.batchId)
+            : replyBatch;
+        if (
+          !previous &&
+          replyBatch &&
+          input.request.batchId != null &&
+          replyBatch.id !== input.request.batchId
+        )
+          throw new WordReviewDecisionError(
+            'Номер партии в тексте не совпадает с партией в ответе. Укажите одну партию.',
+          );
+
+        // A word name can identify a batch only when every requested word matches
+        // exactly one item in exactly one published batch in this topic.
+        if (
+          !batch &&
+          input.request.batchId == null &&
+          !replyBatch &&
+          !previous &&
+          ['confirm', 'dispute'].includes(input.request.mode) &&
+          input.request.words.length &&
+          input.request.words.every((word) => 'word' in word)
+        ) {
+          const published = available.filter((entry) =>
+            ['published', 'completed'].includes(entry.status),
+          );
+          const candidates = published.length
+            ? await reviewItems.find({
+                where: { batchId: In(published.map((entry) => entry.id)) },
+              })
+            : [];
+          const matches = published.filter((entry) =>
+            input.request.words.every(
+              (word) =>
+                candidates.filter(
+                  (item) =>
+                    item.batchId === entry.id &&
+                    this.matchesReviewWord(item, word),
+                ).length === 1,
+            ),
+          );
+          if (matches.length === 1) batch = matches[0];
+        }
+        if (!batch)
+          throw new WordReviewDecisionError(
+            'Не удалось однозначно определить партию. Укажите её номер и номера слов или ответьте на список бота.',
+          );
+        if (!['published', 'completed'].includes(batch.status))
+          throw new WordReviewDecisionError(
+            'Эта партия ещё не опубликована полностью. Подведите итоги после завершения отправки.',
+          );
+        const items = await reviewItems.find({
+          where: { batchId: batch.id },
+          order: { position: 'ASC' },
+        });
+        if (!items.length)
+          throw new WordReviewDecisionError(
+            'В этой партии нет слов для подведения итогов.',
+          );
+        if (previous) return this.decisionResult(batch, items, true);
+
+        const selected = new Set<number>();
+        for (const reference of input.request.words) {
+          const matches = items.filter((item) =>
+            this.matchesReviewWord(item, reference),
+          );
+          if (matches.length !== 1) {
+            const label =
+              'position' in reference
+                ? `№${reference.position}`
+                : `«${reference.word}»`;
+            throw new WordReviewDecisionError(
+              `Слово ${label} не найдено однозначно в партии №${batch.id}. Уточните список; итог не сохранён.`,
+            );
+          }
+          selected.add(matches[0].id);
+        }
+        if (input.request.mode !== 'all' && !selected.size)
+          throw new WordReviewDecisionError(
+            'Перечислите слова, по которым подводите итог.',
+          );
+
+        const now = new Date();
+        const changes: WordReviewDecisionChange[] = [];
+        const changed: WordReviewItem[] = [];
+        for (const item of items) {
+          let status: 'confirmed' | 'disputed';
+          if (input.request.mode === 'all') status = 'confirmed';
+          else if (input.request.mode === 'all_except')
+            status = selected.has(item.id) ? 'disputed' : 'confirmed';
+          else if (selected.has(item.id))
+            status =
+              input.request.mode === 'confirm' ? 'confirmed' : 'disputed';
+          else continue;
+          if (item.status === status) continue;
+          changes.push({
+            itemId: item.id,
+            wordId: item.wordId,
+            word: item.originalWord,
+            previousStatus: item.status,
+            status,
+          });
+          item.status = status;
+          item.confirmedAt = status === 'confirmed' ? now : null;
+          changed.push(item);
+        }
+        if (changed.length) await reviewItems.save(changed);
+        const completed = items.every((item) => item.status === 'confirmed');
+        batch.status = completed ? 'completed' : 'published';
+        batch.completedAt = completed ? (batch.completedAt ?? now) : null;
+        await batches.save(batch);
+        await decisions.save(
+          decisions.create({
+            batchId: batch.id,
+            chatId: input.chatId,
+            threadId: input.threadId,
+            messageId: input.messageId,
+            userId: input.userId,
+            username: input.username,
+            changes,
           }),
-        ),
-      );
-    } catch (error) {
-      this.logger.error(
-        `Could not write legacy history for word review batch ${batch.id}`,
-        error,
-      );
-    }
-
-    this.logger.log(
-      `Sent interactive word review batch ${batch.id}: ${words.length} words, chat=${target.chatId}`,
-    );
-    return {
-      status: 'sent',
-      count: words.length,
-      messageId: batch.messageId ?? undefined,
-    };
+        );
+        return this.decisionResult(batch, items, false);
+      });
+    });
   }
 
-  async handleAction(
-    input: WordReviewActionInput,
-  ): Promise<WordReviewActionResult> {
-    const match = /^wr:(correct|fix):(\d+):(\d+)$/.exec(input.data);
-    if (!match) return { status: 'ignored', message: '' };
-
-    const action = match[1] as 'correct' | 'fix';
-    const itemId = Number(match[2]);
-    const revision = Number(match[3]);
-    const item = await this.itemRepo.findOne({ where: { id: itemId } });
-    if (!item) {
-      return { status: 'handled', message: 'Это слово уже недоступно.' };
-    }
-
-    const batch = await this.batchRepo.findOne({
-      where: { id: item.batchId },
-    });
-    if (!batch || batch.chatId !== input.chatId || batch.status !== 'active') {
-      return { status: 'handled', message: 'Этот пакет уже завершён.' };
-    }
-    if (item.revision !== revision) {
-      return {
-        status: 'handled',
-        message: 'Слово уже исправили. Нажмите кнопку под новым вариантом.',
-      };
-    }
-    if (item.status === 'confirmed') {
-      return { status: 'handled', message: 'Слово уже подтверждено.' };
-    }
-
-    if (action === 'fix') {
-      return this.requestCorrection(batch, item, input);
-    }
-
-    if (item.status === 'awaiting_correction') {
-      return {
-        status: 'handled',
-        message: 'Сначала ждём исправленный вариант этого слова.',
-      };
-    }
-    if (item.status === 'confirming') {
-      return { status: 'handled', message: 'Подтверждаем слово…' };
-    }
-
-    const existingVote = await this.voteRepo.findOne({
-      where: { itemId: item.id, userId: input.userId, revision },
-    });
-    if (existingVote) {
-      return { status: 'handled', message: 'Ваш голос уже учтён.' };
-    }
-
-    await this.voteRepo.save(
-      this.voteRepo.create({
-        itemId: item.id,
-        userId: input.userId,
-        username: input.username,
-        revision,
-      }),
-    );
-    const votes = await this.voteRepo.count({
-      where: { itemId: item.id, revision },
-    });
-
-    if (votes < batch.requiredVotes) {
-      await this.refreshBatchMessage(batch);
-      return {
-        status: 'handled',
-        message: `Голос учтён: ${votes} из ${batch.requiredVotes}.`,
-      };
-    }
-
-    const claimed = await this.itemRepo.update(
-      { id: item.id, status: 'voting', revision },
-      { status: 'confirming' },
-    );
-    if (!claimed.affected) {
-      await this.refreshBatchMessage(batch);
-      return { status: 'handled', message: 'Голос учтён.' };
-    }
-
-    try {
-      await this.applyConfirmedCorrection(item);
-      item.status = 'confirmed';
-      item.confirmedAt = new Date();
-      await this.itemRepo.save(item);
-      await this.correctionRepo.update(
-        { itemId: item.id, resolvedAt: IsNull() },
-        { resolvedAt: new Date() },
-      );
-      await this.refreshBatchMessage(batch);
-      await this.completeBatchIfReady(batch);
-      return { status: 'handled', message: 'Слово подтверждено ✅' };
-    } catch (error) {
-      await this.itemRepo.update(
-        { id: item.id, status: 'confirming' },
-        { status: 'voting' },
-      );
-      await this.refreshBatchMessage(batch);
-      this.logger.error(`Failed to confirm review item ${item.id}`, error);
-      return {
-        status: 'handled',
-        message: 'Не получилось сохранить подтверждение. Попробуйте ещё раз.',
-      };
-    }
+  private matchesReviewWord(
+    item: WordReviewItem,
+    reference: ReviewWordReference,
+  ): boolean {
+    return 'position' in reference
+      ? item.position === reference.position
+      : normalizeReviewWord(item.originalWord) ===
+          normalizeReviewWord(reference.word);
   }
 
-  async handleCorrectionReply(
-    input: WordReviewCorrectionReplyInput,
-  ): Promise<WordReviewCorrectionReplyResult> {
-    const request = await this.correctionRepo.findOne({
-      where: {
-        chatId: input.chatId,
-        userId: input.userId,
-        promptMessageId: input.replyToMessageId,
-        resolvedAt: IsNull(),
-      },
-    });
-    if (!request) return { status: 'not_correction' };
-
-    const item = await this.itemRepo.findOne({
-      where: { id: request.itemId },
-    });
-    if (!item || item.revision !== request.revision) {
-      request.resolvedAt = new Date();
-      await this.correctionRepo.save(request);
-      return {
-        status: 'stale',
-        message: 'Это слово уже исправили. Используйте кнопки в пакете.',
-      };
-    }
-
-    const batch = await this.batchRepo.findOne({
-      where: { id: item.batchId },
-    });
-    if (!batch || batch.status !== 'active') {
-      request.resolvedAt = new Date();
-      await this.correctionRepo.save(request);
-      return { status: 'stale', message: 'Этот пакет уже завершён.' };
-    }
-
-    const correction = this.parseCorrection(input.text);
-    if (!correction) {
-      return {
-        status: 'invalid_format',
-        message:
-          'Напишите одним сообщением так:\nправильное слово — правильный перевод',
-      };
-    }
-
-    item.proposedWord = correction.word;
-    item.proposedTranslation = correction.translation;
-    item.revision += 1;
-    item.status = 'voting';
-    item.confirmedAt = null;
-    await this.itemRepo.save(item);
-    await this.voteRepo.delete({ itemId: item.id });
-    await this.correctionRepo.update(
-      { itemId: item.id, resolvedAt: IsNull() },
-      { resolvedAt: new Date() },
-    );
-    await this.refreshBatchMessage(batch);
-
+  private decisionResult(
+    batch: WordReviewBatch,
+    items: WordReviewItem[],
+    alreadyApplied: boolean,
+  ): ReviewDecisionResult {
+    const list = (predicate: (item: WordReviewItem) => boolean) =>
+      items
+        .filter(predicate)
+        .map((item) => ({ position: item.position, word: item.originalWord }));
     return {
-      status: 'applied',
-      message:
-        `Исправление внесено в пакет:\n` +
-        `${correction.word} — ${correction.translation}\n` +
-        'Теперь слово нужно подтвердить заново.',
+      batchId: batch.id,
+      completed: batch.status === 'completed',
+      alreadyApplied,
+      confirmed: list((item) => item.status === 'confirmed'),
+      disputed: list((item) => item.status === 'disputed'),
+      pending: list(
+        (item) => item.status !== 'confirmed' && item.status !== 'disputed',
+      ),
     };
   }
 
   async getStatus(): Promise<WordReviewStatus> {
     const target = await this.getTarget();
-    const [totalChatWords, sentRaw, lastRows] = await Promise.all([
-      this.wordRepo.count({ where: { source: 'chat' } }),
-      this.historyRepo
-        .createQueryBuilder('history')
-        .select('COUNT(DISTINCT history.wordId)', 'count')
-        .getRawOne<{ count: string }>(),
-      this.historyRepo.find({ order: { sentAt: 'DESC' }, take: 1 }),
+    const [allWords, allCandidates, lastRows] = await Promise.all([
+      this.reviewWordQuery(target?.dictionaryCutoffAt).getMany(),
+      this.pickWordsForReview(Number.MAX_SAFE_INTEGER, new Date()),
+      this.batchRepo.find({
+        where: { status: In(['active', 'published', 'completed']) },
+        order: { createdAt: 'DESC' },
+        take: 1,
+      }),
     ]);
-    const sentWordCount = Number(sentRaw?.count ?? 0);
+    const candidates = target?.dictionaryCutoffAt
+      ? allCandidates.filter(
+          (word) =>
+            new Date(word.createdAt) <= new Date(target.dictionaryCutoffAt),
+        )
+      : allCandidates;
+    const totalWords = allWords.length;
+    const remainingWordCount = candidates.length;
+    const sentWordCount = totalWords - remainingWordCount;
 
-    let activeBatch: WordReviewStatus['activeBatch'] = null;
-    if (target) {
-      const batch = await this.batchRepo.findOne({
-        where: { chatId: target.chatId, status: 'active' },
-      });
-      if (batch) {
-        const [total, confirmed, awaitingCorrection] = await Promise.all([
-          this.itemRepo.count({ where: { batchId: batch.id } }),
-          this.itemRepo.count({
-            where: { batchId: batch.id, status: 'confirmed' },
+    const [publishedBatchCount, sendingBatch] = target
+      ? await Promise.all([
+          this.batchRepo.count({
+            where: {
+              chatId: target.chatId,
+              status: In(['active', 'published', 'completed']),
+            },
           }),
-          this.itemRepo.count({
-            where: { batchId: batch.id, status: 'awaiting_correction' },
+          this.batchRepo.findOne({
+            where: { chatId: target.chatId, status: 'sending' },
           }),
-        ]);
-        activeBatch = { id: batch.id, total, confirmed, awaitingCorrection };
-      }
-    }
+        ])
+      : [0, null];
+
+    const reviewBatches = target
+      ? await this.batchRepo.find({
+          where: {
+            chatId: target.chatId,
+            threadId: target.threadId ?? IsNull(),
+            reviewFlow: 'dictionary',
+            status: In(['published', 'completed']),
+          },
+        })
+      : [];
+    const reviewItems = reviewBatches.length
+      ? await this.itemRepo.find({
+          where: { batchId: In(reviewBatches.map((batch) => batch.id)) },
+        })
+      : [];
 
     return {
       target,
-      totalChatWords,
+      totalWords,
       sentWordCount,
-      remainingWordCount: Math.max(totalChatWords - sentWordCount, 0),
-      lastSentAt: lastRows[0]?.sentAt ?? null,
-      activeBatch,
+      remainingWordCount,
+      waitingNextPassCount: allCandidates.length - candidates.length,
+      lastSentAt: lastRows[0]?.createdAt ?? null,
+      publishedBatchCount,
+      sendingBatchId: sendingBatch?.id ?? null,
+      confirmedWordCount: reviewItems.filter(
+        (item) => item.status === 'confirmed',
+      ).length,
+      disputedWordCount: reviewItems.filter(
+        (item) => item.status === 'disputed',
+      ).length,
+      openWordCount: reviewItems.filter((item) => item.status !== 'confirmed')
+        .length,
+      completedBatchCount: reviewBatches.filter(
+        (batch) => batch.status === 'completed',
+      ).length,
     };
   }
 
-  private async requestCorrection(
-    batch: WordReviewBatch,
-    item: WordReviewItem,
-    input: WordReviewActionInput,
-  ): Promise<WordReviewActionResult> {
-    const existing = await this.correctionRepo.findOne({
-      where: {
-        itemId: item.id,
-        userId: input.userId,
-        revision: item.revision,
-        resolvedAt: IsNull(),
-      },
-    });
-    if (existing) {
-      return {
-        status: 'handled',
-        message: 'Ответьте на сообщение бота с просьбой об исправлении.',
-      };
-    }
-
-    if (item.status !== 'awaiting_correction') {
-      item.status = 'awaiting_correction';
-      await this.itemRepo.save(item);
-    }
-
-    try {
-      const prompt = await this.bot.telegram.sendMessage(
-        batch.chatId,
-        `${input.displayName}, как правильно записать слово №${item.position}?\n\n` +
-          `Сейчас: ${item.proposedWord} — ${item.proposedTranslation}\n\n` +
-          'Ответьте на это сообщение так:\n' +
-          'правильное слово — правильный перевод\n\n' +
-          'Если нажали случайно, отправьте текущий вариант без изменений.',
-        {
-          message_thread_id: batch.threadId ?? undefined,
-          reply_parameters: batch.messageId
-            ? { message_id: batch.messageId }
-            : undefined,
-        },
-      );
-      const promptMessageId =
-        prompt && 'message_id' in prompt ? Number(prompt.message_id) : null;
-      if (!promptMessageId) throw new Error('Telegram returned no message id');
-
-      await this.correctionRepo.save(
-        this.correctionRepo.create({
-          itemId: item.id,
-          chatId: batch.chatId,
-          userId: input.userId,
-          username: input.username,
-          promptMessageId,
-          revision: item.revision,
-          resolvedAt: null,
-        }),
-      );
-      await this.refreshBatchMessage(batch);
-      return {
-        status: 'handled',
-        message: 'Напишите правильный вариант в ответ на сообщение бота.',
-      };
-    } catch (error) {
-      item.status = 'voting';
-      await this.itemRepo.save(item);
-      await this.refreshBatchMessage(batch);
-      this.logger.error(
-        `Could not request correction for review item ${item.id}`,
-        error,
-      );
-      return {
-        status: 'handled',
-        message: 'Не получилось запросить исправление. Попробуйте ещё раз.',
-      };
-    }
+  private discussionEnd(sentAt: Date): Date {
+    const end = new Date(`${reviewCalendarDate(sentAt)}T22:00:00+04:00`);
+    end.setUTCDate(end.getUTCDate() + 1);
+    return end;
   }
 
-  private async applyConfirmedCorrection(item: WordReviewItem): Promise<void> {
-    const changed =
-      item.proposedWord.trim().toLowerCase() !==
-        item.originalWord.trim().toLowerCase() ||
-      item.proposedTranslation.trim() !== item.originalTranslation.trim();
-    if (!changed) return;
-
-    const result = await this.dictionary.updateWord({
-      oldWord: item.originalWord,
-      newWord: item.proposedWord,
-      translation: item.proposedTranslation,
-      updatedBy: 'word-review',
-    });
-    if (result.status !== 'updated' && result.status !== 'merged') {
-      throw new Error(`Dictionary update returned ${result.status}`);
-    }
-    if (result.word) {
-      item.wordId = result.word.id;
-      item.proposedWord = result.word.word;
-      item.proposedTranslation = result.word.translation;
-    }
-  }
-
-  private async completeBatchIfReady(batch: WordReviewBatch): Promise<void> {
-    const unresolved = await this.itemRepo.count({
-      where: { batchId: batch.id, status: Not('confirmed') },
-    });
-    if (unresolved > 0) return;
-
-    const completedAt = new Date();
-    const claimed = await this.batchRepo.update(
-      { id: batch.id, status: 'active' },
-      { status: 'completed', completedAt },
-    );
-    if (!claimed.affected) return;
-
-    batch.status = 'completed';
-    batch.completedAt = completedAt;
-    await this.refreshBatchMessage(batch);
-
-    const next = await this.sendReviewBatch();
-    if (next.status === 'no_words') {
-      await this.bot.telegram.sendMessage(
-        batch.chatId,
-        '🎉 Все доступные слова прошли первый круг проверки.',
-        { message_thread_id: batch.threadId ?? undefined },
-      );
-    }
-  }
-
-  private async refreshBatchMessage(batch: WordReviewBatch): Promise<void> {
-    if (!batch.messageId) return;
-    const items = await this.itemRepo.find({
-      where: { batchId: batch.id },
-      order: { position: 'ASC' },
-    });
-    const voteCounts = new Map<number, number>();
-    await Promise.all(
-      items.map(async (item) => {
-        const count = await this.voteRepo.count({
-          where: { itemId: item.id, revision: item.revision },
-        });
-        voteCounts.set(item.id, count);
-      }),
-    );
-
-    try {
-      await this.bot.telegram.editMessageText(
-        batch.chatId,
-        batch.messageId,
-        undefined,
-        this.buildReviewMessage(batch, items, voteCounts),
-        { reply_markup: this.buildKeyboard(items) },
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes('message is not modified')) {
-        this.logger.warn(
-          `Could not refresh word review batch ${batch.id}: ${message}`,
-        );
+  private buildReviewPages(batch: WordReviewBatch, items: WordReviewItem[]) {
+    const flowLabel =
+      batch.reviewFlow === 'learning' ? '💬 Обучение' : '📚 Словарь';
+    const heading = [
+      `${flowLabel} · партия №${batch.id} · ${items.length} слов`,
+      `Обсуждение до ${formatReviewDate(new Date(batch.discussionEndsAt))} по Тбилиси.`,
+      '',
+    ].join('\n');
+    type CodeEntity = { type: 'code'; offset: number; length: number };
+    const pages: { text: string; entities: CodeEntity[] }[] = [];
+    let entities: CodeEntity[] = [];
+    let lines: string[] = [];
+    let length = heading.length;
+    // Preserve full words and translations. Split long entries across messages
+    // instead of hiding meanings that participants need to review.
+    for (const item of items) {
+      const pos = item.partOfSpeech ? ` (${item.partOfSpeech})` : '';
+      const prefix = `${item.position}. `;
+      const line = `${prefix}${item.originalWord} — ${item.originalTranslation}${pos}`;
+      if (
+        lines.length &&
+        (lines.length >= 10 ||
+          length + prefix.length + item.originalWord.length + 1 > 3800 ||
+          (line.length <= 3800 - heading.length - 1 &&
+            length + line.length + 1 > 3800))
+      ) {
+        pages.push({ text: heading + '\n' + lines.join('\n'), entities });
+        lines = [];
+        entities = [];
+        length = heading.length;
+      }
+      for (let offset = 0; offset < line.length; ) {
+        const room = 3800 - length - 1;
+        if (room <= 0) {
+          pages.push({ text: heading + '\n' + lines.join('\n'), entities });
+          lines = [];
+          entities = [];
+          length = heading.length;
+          continue;
+        }
+        let end = Math.min(offset + room, line.length);
+        // Avoid cutting a UTF-16 surrogate pair in half.
+        if (end < line.length && /[\uD800-\uDBFF]/.test(line[end - 1])) end--;
+        const part = line.slice(offset, end);
+        if (offset === 0 && item.originalWord.length) {
+          // Telegram entity offsets use UTF-16, matching JavaScript string lengths.
+          entities.push({
+            type: 'code',
+            offset: length + 1 + prefix.length,
+            length: item.originalWord.length,
+          });
+        }
+        lines.push(part);
+        length += part.length + 1;
+        offset = end;
       }
     }
+    if (lines.length)
+      pages.push({ text: heading + '\n' + lines.join('\n'), entities });
+    return pages;
   }
 
-  private buildReviewMessage(
-    batch: WordReviewBatch,
-    items: WordReviewItem[],
-    voteCounts: Map<number, number>,
-  ): string {
-    const confirmed = items.filter(
-      (item) => item.status === 'confirmed',
-    ).length;
-    const lines = [
-      batch.status === 'completed'
-        ? `✅ Пакет проверен: ${confirmed} из ${items.length}`
-        : `📖 Проверка словаря: ${confirmed} из ${items.length}`,
-      '',
-      `Для подтверждения нужны ${batch.requiredVotes} голоса «Верно».`,
-      'Если есть ошибка, нажмите «Исправить» и ответьте боту.',
-      'Следующий пакет придёт только после проверки всех слов.',
-      '',
-    ];
-
-    for (const item of items) {
-      const votes = voteCounts.get(item.id) ?? 0;
-      const marker =
-        item.status === 'confirmed'
-          ? '✅'
-          : item.status === 'awaiting_correction'
-            ? '✏️'
-            : `⏳ ${votes}/${batch.requiredVotes}`;
-      const pos = item.partOfSpeech ? ` (${item.partOfSpeech})` : '';
-      lines.push(
-        `${item.position}. ${marker} ${item.proposedWord} — ${this.truncate(item.proposedTranslation, 160)}${pos}`,
-      );
-    }
-
-    return lines.join('\n');
+  private reviewWordQuery(cutoff?: Date | null) {
+    const query = this.wordRepo.createQueryBuilder('word');
+    if (cutoff) query.where('word.createdAt <= :cutoff', { cutoff });
+    return query;
   }
 
-  private buildKeyboard(items: WordReviewItem[]) {
-    return {
-      inline_keyboard: items
-        .filter((item) => item.status !== 'confirmed')
-        .map((item) => [
-          {
-            text: `${item.position} ✅ Верно`,
-            callback_data: `wr:correct:${item.id}:${item.revision}`,
-          },
-          {
-            text: `${item.position} ✏️ Исправить`,
-            callback_data: `wr:fix:${item.id}:${item.revision}`,
-          },
-        ]),
-    };
-  }
-
-  private parseCorrection(
-    text: string,
-  ): { word: string; translation: string } | null {
-    const match = /^(.+?)(?:\s+[–-]\s+|\s*—\s*)(.+)$/s.exec(text.trim());
-    if (!match) return null;
-    const word = match[1].trim();
-    const translation = match[2].trim();
-    if (!word || !translation || word.length > 255) return null;
-    return { word, translation };
-  }
-
-  private async pickWordsForReview(limit: number): Promise<Word[]> {
+  private async pickWordsForReview(
+    limit: number,
+    cutoff?: Date | null,
+  ): Promise<Word[]> {
     const [sentRows, reviewItems] = await Promise.all([
       this.historyRepo.find({ select: { wordId: true } }),
       this.itemRepo.find({ select: { wordId: true } }),
@@ -665,20 +757,13 @@ export class WordReviewService {
       ]),
     ];
 
-    const query = this.wordRepo
-      .createQueryBuilder('word')
-      .where('word.source = :source', { source: 'chat' })
-      .andWhere("word.translation <> ''")
-      .orderBy('word.createdAt', 'ASC')
-      .addOrderBy('word.id', 'ASC')
-      .limit(limit);
+    const query = this.reviewWordQuery(cutoff);
     if (sentIds.length > 0) {
       query.andWhere('word.id NOT IN (:...sentIds)', { sentIds });
     }
-    return query.getMany();
-  }
-
-  private truncate(text: string, max: number): string {
-    return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+    const words = await query.getMany();
+    return words
+      .sort((a, b) => compareTsintskaroWords(a.word, b.word) || a.id - b.id)
+      .slice(0, limit);
   }
 }
