@@ -657,7 +657,14 @@ describe('OpenaiService requests', () => {
     );
     await service.processBotMention(
       'А во множественном числе?',
-      [{ username: 'bot', text: 'Âв — дом.', sentAt: new Date(), isBot: true }],
+      [
+        {
+          username: 'bot',
+          text: 'Âв — дом.',
+          sentAt: new Date('2026-09-14T21:30:00Z'),
+          isBot: true,
+        },
+      ],
       [
         {
           text: 'После â используется -лâр.',
@@ -680,6 +687,8 @@ describe('OpenaiService requests', () => {
       'СООБЩЕНИЕ, НА КОТОРОЕ ОТВЕЧАЕТ ПОЛЬЗОВАТЕЛЬ',
     );
     expect(request.input[1].content).toContain('Баласи (бот): Âв — дом.');
+    expect(request.input[1].content).toContain('[15.09.2026, 00:30 МСК]');
+    expect(request.input[0].content).toContain('Europe/Moscow');
     expect(request.input[1].content).toContain('После â используется -лâр.');
     expect(request.input[1].content).toContain('âв = дом');
   });

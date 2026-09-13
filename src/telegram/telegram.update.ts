@@ -53,6 +53,7 @@ import {
 } from '../fact-day/fact-day-scheduler.service';
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
+import { formatBotDate, formatBotDateTime } from '../common/bot-time';
 
 interface SpellingCorrectionByTranslation {
   newWord: string;
@@ -2400,7 +2401,7 @@ export class TelegramUpdate implements OnModuleInit {
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${target.setBy}\n` +
-        `когда: ${setAt.toISOString()}`,
+        `когда: ${formatBotDateTime(setAt)}`,
       { parse_mode: 'HTML' },
     );
   }
@@ -2475,7 +2476,7 @@ export class TelegramUpdate implements OnModuleInit {
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${target.setBy}\n` +
-        `когда: ${setAt.toISOString()}\n\n` +
+        `когда: ${formatBotDateTime(setAt)}\n\n` +
         `Расписание: 8, 10, 12, 14, 16, 18, 20 МСК.`,
       { parse_mode: 'HTML' },
     );
@@ -2526,7 +2527,7 @@ export class TelegramUpdate implements OnModuleInit {
       `✅ Ежедневный отчёт по OpenAI токенам будет приходить сюда.\n` +
         `chat_id: <code>${chatId}</code>\n` +
         `thread_id: <code>${threadId ?? 'нет'}</code>\n\n` +
-        `Расписание: каждый день в 09:00 (${OPENAI_USAGE_REPORT_TIME_ZONE}), отчёт за предыдущие сутки.`,
+        `Расписание: каждый день в 08:00 МСК, отчёт за предыдущие сутки по МСК.`,
       { parse_mode: 'HTML' },
     );
   }
@@ -2719,10 +2720,7 @@ export class TelegramUpdate implements OnModuleInit {
         ? status.target.setAt
         : new Date(status.target.setAt);
     const lastSent = status.lastSentAt
-      ? (status.lastSentAt instanceof Date
-          ? status.lastSentAt
-          : new Date(status.lastSentAt)
-        ).toISOString()
+      ? formatBotDateTime(new Date(status.lastSentAt))
       : 'ещё не отправляли';
 
     await this.replyAndRemember(
@@ -2731,7 +2729,7 @@ export class TelegramUpdate implements OnModuleInit {
         `chat_id: <code>${status.target.chatId}</code>\n` +
         `thread_id: <code>${status.target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${status.target.setBy}\n` +
-        `когда: ${setAt.toISOString()}\n\n` +
+        `когда: ${formatBotDateTime(setAt)}\n\n` +
         `Состояние: ${status.target.enabled ? 'запущено' : 'пауза'}\n` +
         `Размер партии: ${status.target.batchSize}\n` +
         `Расписание: ${WORD_REVIEW_SCHEDULE_LABEL}\n` +
@@ -2876,6 +2874,18 @@ export class TelegramUpdate implements OnModuleInit {
     const quizCount = this.factDayScheduler.getFactsCount();
     const nextQuizNumber =
       (((target.nextFactIndex % quizCount) + quizCount) % quizCount) + 1;
+    // Slots store the Tbilisi date/hour, sometimes with midnight as hour 24.
+    // They determine the Moscow date without inventing an exact sending time.
+    const lastSlot = /^(\d{4}-\d{2}-\d{2})-(\d{2})$/.exec(
+      target.lastSentSlot ?? '',
+    );
+    const lastSentDate = lastSlot
+      ? formatBotDate(
+          new Date(
+            `${lastSlot[1]}T${lastSlot[2] === '24' ? '00' : lastSlot[2]}:00:00+04:00`,
+          ),
+        )
+      : (target.lastSentDate ?? 'ещё не было');
     await this.replyAndRemember(
       ctx,
       `📍 Исторический квиз:\n` +
@@ -2883,9 +2893,9 @@ export class TelegramUpdate implements OnModuleInit {
         `chat_id: <code>${target.chatId}</code>\n` +
         `thread_id: <code>${target.threadId ?? 'нет (общий чат)'}</code>\n` +
         `настроил: @${target.setBy}\n` +
-        `когда: ${setAt.toISOString()}\n\n` +
+        `когда: ${formatBotDateTime(setAt)}\n\n` +
         `следующий вопрос: ${nextQuizNumber}/${quizCount}\n` +
-        `последняя отправка: ${target.lastSentDate ?? 'ещё не было'}\n` +
+        `последняя отправка: ${lastSentDate}\n` +
         `расписание: ${FACT_DAY_SCHEDULE_LABEL}.`,
       { parse_mode: 'HTML' },
     );

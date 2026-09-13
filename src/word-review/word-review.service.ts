@@ -679,7 +679,7 @@ export class WordReviewService {
       batch.reviewFlow === 'learning' ? '💬 Обучение' : '📚 Словарь';
     const heading = [
       `${flowLabel} · партия №${batch.id} · ${items.length} слов`,
-      `Обсуждение до ${formatReviewDate(new Date(batch.discussionEndsAt))} по Тбилиси.`,
+      `Обсуждение до ${formatReviewDate(new Date(batch.discussionEndsAt))}.`,
       '',
     ].join('\n');
     type CodeEntity = { type: 'code'; offset: number; length: number };

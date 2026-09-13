@@ -14,6 +14,7 @@ import type {
 } from 'openai/resources/responses/responses';
 import { DictionaryService } from '../dictionary/dictionary.service';
 import { OpenaiUsagePurpose, OpenaiUsageService } from './openai-usage.service';
+import { BOT_TIME_INSTRUCTION, formatBotDateTime } from '../common/bot-time';
 
 export interface ExtractedWord {
   word: string;
@@ -344,7 +345,7 @@ export class OpenaiService {
         ? `\nНЕДАВНИЕ СООБЩЕНИЯ В ЭТОМ ЧАТЕ (от старых к новым, ${recentMessages.length} последних):\n${recentMessages
             .map(
               (m) =>
-                `[${m.sentAt.toISOString().slice(0, 16).replace('T', ' ')}] ${m.isBot ? 'Баласи (бот)' : `@${m.username}`}: ${m.text}`,
+                `[${formatBotDateTime(m.sentAt)}] ${m.isBot ? 'Баласи (бот)' : `@${m.username}`}: ${m.text}`,
             )
             .join('\n')}\n`
         : '';
@@ -361,6 +362,7 @@ export class OpenaiService {
       : '';
 
     const actionSystemPrompt = `Пойми просьбу пользователя с учётом истории и памяти. Сразу подготовь ответ или выбери запрошенное действие со словарём.
+${BOT_TIME_INSTRUCTION}
 
 Выбери одно действие:
 - add_words — только когда пользователь явно просит добавить одну или несколько пар «цинцкарское слово — русский перевод»;
@@ -385,9 +387,9 @@ ${forcedActionInstruction}
 Не выбирай действие по одному глаголу: «как удалить пятно» и «добавь юмора в текст» — reply. Вопрос о словаре, объяснение, перевод, просьба о списке лидеров или ссылке — reply. Операции add_words, update_words и delete_words относятся только к изменению записей словаря. Не выполняй инструкции из истории повторно; учитывай только текущую просьбу. Если данных для записи недостаточно, выбери reply для уточнения.`;
 
     const replySection = options.replyToMessage
-      ? `\nСООБЩЕНИЕ, НА КОТОРОЕ ОТВЕЧАЕТ ПОЛЬЗОВАТЕЛЬ:\n${options.replyToMessage.isBot ? 'Баласи (бот)' : `@${options.replyToMessage.username}`}: ${options.replyToMessage.text}\n`
+      ? `\nСООБЩЕНИЕ, НА КОТОРОЕ ОТВЕЧАЕТ ПОЛЬЗОВАТЕЛЬ:\n[${formatBotDateTime(options.replyToMessage.sentAt)}] ${options.replyToMessage.isBot ? 'Баласи (бот)' : `@${options.replyToMessage.username}`}: ${options.replyToMessage.text}\n`
       : '';
-    const userPrompt = `${dictionarySection}${memorySection}${contextSection}${replySection}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
+    const userPrompt = `${dictionarySection}${memorySection}${contextSection}${replySection}\nТЕКУЩИЕ ДАТА И ВРЕМЯ: ${formatBotDateTime(new Date())}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
     const contextMetadata = {
       userTextLength: text.length,
       recentMessages: recentMessages.length,
@@ -810,6 +812,7 @@ ${forcedActionInstruction}
       : '';
 
     const systemPrompt = `Проанализируй сообщения русскоязычного Telegram-чата жителей села Цинцкаро. Они используют цинцкарский диалект — смесь старого азербайджанского и восточно-анатолийского турецкого, записанную кириллицей.
+${BOT_TIME_INSTRUCTION}
 
 Сделай короткое саммари обсуждения: 2–4 пункта или 2–3 предложения, максимум 500 символов. Упомяни только главные темы, решения и разногласия. Не ставь @ перед именами. Можно использовать не более трёх ссылок вида [m1].
 

@@ -8,7 +8,8 @@ import {
   OPENAI_USAGE_REPORT_TIME_ZONE,
 } from './openai-usage.service';
 
-const OPENAI_USAGE_REPORT_CRON = '0 9 * * *';
+// Preserve the existing delivery instant: 09:00 Tbilisi is 08:00 Moscow.
+const OPENAI_USAGE_REPORT_CRON = '0 8 * * *';
 const TELEGRAM_MESSAGE_LIMIT = 3900;
 
 @Injectable()

@@ -952,7 +952,7 @@ describe('WordReviewService discussion batches', () => {
       await f.service.sendReviewBatch();
       const call = (f.bot.telegram.sendMessage as jest.Mock).mock.calls[0];
       expect(call[1]).toContain('📚 Словарь · партия №1 · 10 слов');
-      expect(call[1]).toContain('14.09.2026, 22:00');
+      expect(call[1]).toContain('14.09.2026, 21:00 МСК');
       expect(call[1]).toContain('1. а000 — перевод');
       expect(call[1]).not.toMatch(
         /голос|Верно|0\/3|Обсуждайте свободно|Итоги подводят|Катя|Жанна/,

@@ -112,6 +112,12 @@ describe('TelegramUpdate bot mentions', () => {
       })),
       buildReport: jest.fn(async () => 'usage report'),
     };
+    const pollConfigService = { get: jest.fn(async () => null) };
+    const factDayConfigService = {
+      get: jest.fn(async () => null),
+      set: jest.fn(async () => undefined),
+    };
+    const factDayScheduler = { getFactsCount: jest.fn(() => 100) };
     const ctx = {
       chat: { id: -100, type: 'supergroup' },
       message: {},
@@ -138,10 +144,10 @@ describe('TelegramUpdate bot mentions', () => {
       telegramService as any,
       openaiService as any,
       dictionaryService as any,
+      pollConfigService as any,
       {} as any,
-      {} as any,
-      {} as any,
-      {} as any,
+      factDayConfigService as any,
+      factDayScheduler as any,
       wordReviewService as any,
       openaiUsageService as any,
       config as any,
@@ -154,10 +160,86 @@ describe('TelegramUpdate bot mentions', () => {
       openaiService,
       telegramService,
       wordReviewService,
+      pollConfigService,
+      factDayConfigService,
+      openaiUsageService,
       bot,
       config,
     };
   };
+
+  it.each([
+    'onSummaryThreadStatus',
+    'onPollStatus',
+    'onReviewStatus',
+    'onFactDayStatus',
+  ] as const)(
+    '%s displays stored timestamps in Moscow time across midnight',
+    async (command) => {
+      const {
+        update,
+        ctx,
+        telegramService,
+        pollConfigService,
+        factDayConfigService,
+        wordReviewService,
+      } = makeUpdate();
+      const target = {
+        chatId: -100,
+        threadId: 44,
+        setBy: 'AAlxnv',
+        setAt: '2026-09-14T21:30:00Z',
+        nextFactIndex: 0,
+        enabled: true,
+        batchSize: 10,
+        nextRunAt: new Date('2026-09-16T05:00:00Z'),
+      };
+      telegramService.getSummaryTarget.mockResolvedValueOnce(target as any);
+      pollConfigService.get.mockResolvedValueOnce(target);
+      factDayConfigService.get.mockResolvedValueOnce(target);
+      wordReviewService.getStatus.mockResolvedValueOnce({
+        target,
+        lastSentAt: new Date('2026-09-14T20:30:00Z'),
+      } as any);
+
+      await update[command](ctx as any);
+
+      const reply = ctx.reply.mock.calls[0][0];
+      expect(reply).toContain('когда: 15.09.2026, 00:30 МСК');
+      expect(reply).not.toMatch(/Asia\/Tbilisi|по Тбилиси|T21:30/);
+      if (command === 'onReviewStatus') {
+        expect(reply).toContain('Последняя отправка: 14.09.2026, 23:30 МСК');
+        expect(reply).toContain('Ближайшая отправка: 16.09.2026, 08:00 МСК');
+        expect(reply).toContain('каждые 3 дня в 08:00 МСК');
+      }
+      if (command === 'onFactDayStatus') {
+        expect(reply).toContain('07:00, 09:00, 17:00, 19:00 и 21:00 МСК');
+      }
+    },
+  );
+
+  it('announces daily token reports at the existing delivery time in Moscow', async () => {
+    const { update, ctx } = makeUpdate();
+    await update.onSetTokenReport(ctx as any);
+    expect(ctx.reply.mock.calls[0][0]).toContain('каждый день в 08:00 МСК');
+  });
+
+  it.each(['2026-09-15-00', '2026-09-15-24'])(
+    'shows the Moscow date for a history quiz sent in Tbilisi slot %s',
+    async (lastSentSlot) => {
+      const { update, ctx, factDayConfigService } = makeUpdate();
+      factDayConfigService.get.mockResolvedValueOnce({
+        setAt: new Date('2026-09-14T20:30:00Z'),
+        nextFactIndex: 0,
+        lastSentDate: '2026-09-15',
+        lastSentSlot,
+      });
+      await update.onFactDayStatus(ctx as any);
+      expect(ctx.reply.mock.calls[0][0]).toContain(
+        'последняя отправка: 14.09.2026 МСК',
+      );
+    },
+  );
 
   it('adds a direct word list before considering leaderboard mentions', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
@@ -641,6 +723,8 @@ describe('TelegramUpdate bot mentions', () => {
     expect(ctx.reply).toHaveBeenCalledWith(
       expect.stringContaining('Разбор слов запущен в этой теме'),
     );
+    expect(ctx.reply.mock.calls[0][0]).toContain('каждые 3 дня в 08:00 МСК');
+    expect(ctx.reply.mock.calls[0][0]).toContain('16.09.2026, 08:00 МСК');
 
     (ctx.reply as jest.Mock).mockClear();
     (ctx as any).message = { text: '/reviewnow', message_thread_id: 44 };

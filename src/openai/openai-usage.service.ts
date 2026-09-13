@@ -4,8 +4,9 @@ import type { CompletionUsage } from 'openai/resources/completions';
 import { And, LessThan, MoreThanOrEqual, Repository } from 'typeorm';
 import { OpenaiUsageLog } from './entities/openai-usage-log.entity';
 import { OpenaiUsageReportConfig } from './entities/openai-usage-report-config.entity';
+import { BOT_TIME_ZONE, formatBotDateTime } from '../common/bot-time';
 
-export const OPENAI_USAGE_REPORT_TIME_ZONE = 'Asia/Tbilisi';
+export const OPENAI_USAGE_REPORT_TIME_ZONE = BOT_TIME_ZONE;
 
 export type OpenaiUsagePurpose =
   | 'bot_mention'
@@ -311,14 +312,7 @@ export class OpenaiUsageService {
   }
 
   private formatDateTime(date: Date, timeZone: string): string {
-    return new Intl.DateTimeFormat('ru-RU', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    }).format(date);
+    return formatBotDateTime(date, timeZone);
   }
 
   private formatNumber(value: number): string {

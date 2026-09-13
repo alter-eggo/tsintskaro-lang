@@ -1,6 +1,8 @@
+import { formatBotDateTime } from '../common/bot-time';
+
 export const WORD_REVIEW_TIME_ZONE = 'Asia/Tbilisi';
 export const WORD_REVIEW_INTERVAL_DAYS = 3;
-export const WORD_REVIEW_SCHEDULE_LABEL = 'каждые 3 дня в 09:00 по Тбилиси';
+export const WORD_REVIEW_SCHEDULE_LABEL = 'каждые 3 дня в 08:00 МСК';
 
 /** Tbilisi calendar date, independent of the server's local time zone. */
 export function reviewCalendarDate(date: Date): string {
@@ -23,9 +25,5 @@ export function nextReviewDate(anchor: Date, now: Date): Date {
 }
 
 export function formatReviewDate(date: Date): string {
-  return new Intl.DateTimeFormat('ru-RU', {
-    timeZone: WORD_REVIEW_TIME_ZONE,
-    dateStyle: 'short',
-    timeStyle: 'short',
-  }).format(date);
+  return formatBotDateTime(date);
 }

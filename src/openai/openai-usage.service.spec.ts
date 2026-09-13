@@ -1,6 +1,42 @@
 import { OpenaiUsageService } from './openai-usage.service';
 
 describe('OpenaiUsageService reports', () => {
+  it.each([
+    [
+      '2026-09-14T20:30:00Z',
+      0,
+      '2026-09-14',
+      '2026-09-13T21:00:00Z',
+      '2026-09-14T21:00:00Z',
+    ],
+    [
+      '2026-09-14T21:00:00Z',
+      0,
+      '2026-09-15',
+      '2026-09-14T21:00:00Z',
+      '2026-09-15T21:00:00Z',
+    ],
+    [
+      '2027-01-01T05:00:00Z',
+      -1,
+      '2026-12-31',
+      '2026-12-30T21:00:00Z',
+      '2026-12-31T21:00:00Z',
+    ],
+  ])(
+    'uses Moscow calendar days at %s with offset %s',
+    (now, offset, label, start, end) => {
+      const service = new OpenaiUsageService({} as any, {} as any);
+      expect(
+        service.getCalendarDayRange(new Date(now), undefined, offset),
+      ).toEqual({
+        label,
+        start: new Date(start),
+        end: new Date(end),
+      });
+    },
+  );
+
   it('shows cached tokens, reasoning tokens, p95, and request metadata', async () => {
     const usageRepo = {
       find: jest.fn(async () => [
@@ -54,5 +90,10 @@ describe('OpenaiUsageService reports', () => {
     expect(report).toContain('словарь=3');
     expect(report).toContain('reasoning=none');
     expect(report).toContain('лимит=800');
+    expect(report).toContain(
+      'Период: 14.07.2026, 23:00 МСК - 15.07.2026, 23:00 МСК',
+    );
+    expect(report).toContain('15.07.2026, 11:00 МСК');
+    expect(report).toContain('15.07.2026, 12:00 МСК');
   });
 });

@@ -14,7 +14,7 @@ import {
 export const FACT_DAY_CRON = '0 8,10,18,20,22 * * *';
 export const FACT_DAY_TZ = 'Asia/Tbilisi';
 export const FACT_DAY_SCHEDULE_LABEL =
-  'каждый день в 08:00, 10:00, 18:00, 20:00 и 22:00 (Asia/Tbilisi)';
+  'каждый день в 07:00, 09:00, 17:00, 19:00 и 21:00 МСК';
 
 type FactDaySendResult = {
   sent: boolean;
