@@ -271,6 +271,7 @@ export class WordReviewService {
                 threadId: target.threadId,
                 messageId: null,
                 messageIds: [],
+                messageFormatVersion: 2,
                 status: 'sending',
                 reviewFlow: 'dictionary',
                 requiredVotes: 0,
@@ -684,55 +685,67 @@ export class WordReviewService {
     ].join('\n');
     type CodeEntity = { type: 'code'; offset: number; length: number };
     const pages: { text: string; entities: CodeEntity[] }[] = [];
+    // Resume old, partially sent batches with exactly the same page boundaries.
+    const legacy = batch.messageFormatVersion !== 2;
+    const messageLimit = legacy ? 3800 : 4096;
     let entities: CodeEntity[] = [];
-    let lines: string[] = [];
-    let length = heading.length;
+    let text = heading;
+    let linesOnPage = 0;
+    const flushPage = () => {
+      pages.push({ text, entities });
+      text = legacy ? heading : '';
+      entities = [];
+      linesOnPage = 0;
+    };
     // Preserve full words and translations. Split long entries across messages
     // instead of hiding meanings that participants need to review.
     for (const item of items) {
       const pos = item.partOfSpeech ? ` (${item.partOfSpeech})` : '';
       const prefix = `${item.position}. `;
       const line = `${prefix}${item.originalWord} — ${item.originalTranslation}${pos}`;
+      const separatorLength = text ? 1 : 0;
       if (
-        lines.length &&
-        (lines.length >= 10 ||
-          length + prefix.length + item.originalWord.length + 1 > 3800 ||
-          (line.length <= 3800 - heading.length - 1 &&
-            length + line.length + 1 > 3800))
+        linesOnPage &&
+        ((legacy && linesOnPage >= 10) ||
+          text.length +
+            prefix.length +
+            item.originalWord.length +
+            separatorLength >
+            messageLimit ||
+          (line.length <= messageLimit - (legacy ? heading.length + 1 : 0) &&
+            text.length + line.length + separatorLength > messageLimit))
       ) {
-        pages.push({ text: heading + '\n' + lines.join('\n'), entities });
-        lines = [];
-        entities = [];
-        length = heading.length;
+        flushPage();
       }
       for (let offset = 0; offset < line.length; ) {
-        const room = 3800 - length - 1;
+        const separator = text ? '\n' : '';
+        const room = messageLimit - text.length - separator.length;
         if (room <= 0) {
-          pages.push({ text: heading + '\n' + lines.join('\n'), entities });
-          lines = [];
-          entities = [];
-          length = heading.length;
+          flushPage();
           continue;
         }
         let end = Math.min(offset + room, line.length);
         // Avoid cutting a UTF-16 surrogate pair in half.
         if (end < line.length && /[\uD800-\uDBFF]/.test(line[end - 1])) end--;
+        if (end === offset) {
+          flushPage();
+          continue;
+        }
         const part = line.slice(offset, end);
         if (offset === 0 && item.originalWord.length) {
           // Telegram entity offsets use UTF-16, matching JavaScript string lengths.
           entities.push({
             type: 'code',
-            offset: length + 1 + prefix.length,
+            offset: text.length + separator.length + prefix.length,
             length: item.originalWord.length,
           });
         }
-        lines.push(part);
-        length += part.length + 1;
+        text += separator + part;
+        linesOnPage++;
         offset = end;
       }
     }
-    if (lines.length)
-      pages.push({ text: heading + '\n' + lines.join('\n'), entities });
+    if (linesOnPage) flushPage();
     return pages;
   }
 

@@ -294,7 +294,7 @@ describe('WordReviewService discussion batches', () => {
         status: 'not_due',
         count: 0,
       });
-      expect(f.bot.telegram.sendMessage).toHaveBeenCalledTimes(2);
+      expect(f.bot.telegram.sendMessage).toHaveBeenCalledTimes(1);
     });
 
     it('rejects management and manual delivery from another topic or group', async () => {
@@ -464,6 +464,7 @@ describe('WordReviewService discussion batches', () => {
           ...sample,
           id: index + 2,
           word: `б${index}`,
+          translation: 'я'.repeat(350),
           createdAt: new Date('2026-09-14T05:00:00Z'),
         });
       jest.setSystemTime(new Date('2026-09-16T05:00:00Z'));
@@ -545,6 +546,45 @@ describe('WordReviewService discussion batches', () => {
       );
     });
 
+    it.each([7, 27])(
+      'sends one hundred short words in a single message (translation length %i)',
+      async (length) => {
+        const f = makeDelivery(100);
+        f.words.forEach((word) => {
+          word.translation = 'я'.repeat(length);
+        });
+        await f.service.sendReviewBatch({ extra: true });
+        expect(f.bot.telegram.sendMessage).toHaveBeenCalledTimes(1);
+        const [, text, options] = (f.bot.telegram.sendMessage as jest.Mock).mock
+          .calls[0];
+        expect(text).toContain('1. а000 — ' + 'я'.repeat(length));
+        expect(text).toContain('100. а099 — ' + 'я'.repeat(length));
+        if (length === 27) expect(text.length).toBeGreaterThan(3800);
+        expect(text.length).toBeLessThanOrEqual(4096);
+        expect(options.entities).toHaveLength(100);
+        expect(f.state().items).toHaveLength(100);
+      },
+    );
+
+    it('splits only at the message limit without repeating the heading', async () => {
+      const f = makeDelivery(100);
+      f.words.forEach((word) => {
+        word.translation = 'я'.repeat(50);
+      });
+      await f.service.sendReviewBatch();
+      const calls = (f.bot.telegram.sendMessage as jest.Mock).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[0][1]).toContain('📚 Словарь');
+      expect(calls[1][1]).not.toMatch(/Словарь|Обсуждение до/);
+      const positions = calls.flatMap((call) =>
+        Array.from(call[1].matchAll(/^(\d+)\. /gm), (match: any) =>
+          Number(match[1]),
+        ),
+      );
+      expect(positions).toEqual(Array.from({ length: 100 }, (_, i) => i + 1));
+      expect(calls.every((call) => call[1].length <= 4096)).toBe(true);
+    });
+
     it('delivers one hundred words in bounded pages with every word represented once', async () => {
       const f = makeDelivery(100);
       for (const word of f.words) {
@@ -609,7 +649,7 @@ describe('WordReviewService discussion batches', () => {
       expect(copiedWords).toEqual(
         f.state().items.map((item) => item.originalWord),
       );
-      expect(calls.every((call) => call[1].length <= 3800)).toBe(true);
+      expect(calls.every((call) => call[1].length <= 4096)).toBe(true);
       expect(
         calls.every((call) => !call[2].parse_mode && !call[2].reply_markup),
       ).toBe(true);
@@ -618,27 +658,49 @@ describe('WordReviewService discussion batches', () => {
       );
     });
 
-    it('resumes an interrupted multi-page delivery without resending completed pages', async () => {
-      const f = makeDelivery(25);
-      f.state().target.nextRunAt = new Date('2026-09-16T05:00:00Z');
-      f.bot.telegram.sendMessage
-        .mockResolvedValueOnce({ message_id: 701 })
-        .mockRejectedValueOnce(new Error('temporary failure'));
-      await expect(f.service.sendReviewBatch()).rejects.toThrow(
-        'temporary failure',
-      );
-      expect(f.state().batches[0]).toMatchObject({
-        status: 'sending',
-        messageIds: [701],
-      });
-      expect(f.state().items).toHaveLength(25);
-      await f.service.sendReviewBatch({ scheduled: true });
-      expect(f.state().batches).toHaveLength(1);
-      expect(f.state().batches[0].status).toBe('published');
-      const calls = (f.bot.telegram.sendMessage as jest.Mock).mock.calls;
-      expect(calls).toHaveLength(4);
-      expect(calls[2][1]).toContain('11. а010 — перевод');
-    });
+    it.each([false, true])(
+      'resumes an interrupted multi-page delivery without resending completed pages (legacy: %s)',
+      async (legacy) => {
+        const f = makeDelivery(25);
+        if (legacy) {
+          f.batchRepo.create.mockImplementation((value) => ({
+            ...value,
+            messageFormatVersion: 1,
+          }));
+        } else {
+          f.words.forEach((word) => {
+            word.translation = 'я'.repeat(350);
+          });
+        }
+        f.state().target.nextRunAt = new Date('2026-09-16T05:00:00Z');
+        f.bot.telegram.sendMessage
+          .mockResolvedValueOnce({ message_id: 701 })
+          .mockRejectedValueOnce(new Error('temporary failure'));
+        await expect(f.service.sendReviewBatch()).rejects.toThrow(
+          'temporary failure',
+        );
+        expect(f.state().batches[0]).toMatchObject({
+          status: 'sending',
+          messageIds: [701],
+        });
+        expect(f.state().items).toHaveLength(25);
+        await f.service.sendReviewBatch({ scheduled: true });
+        expect(f.state().batches).toHaveLength(1);
+        expect(f.state().batches[0].status).toBe('published');
+        const calls = (f.bot.telegram.sendMessage as jest.Mock).mock.calls;
+        expect(calls).toHaveLength(4);
+        expect(calls[2][1]).toEqual(calls[1][1]);
+        const delivered = [calls[0], ...calls.slice(2)];
+        expect(
+          delivered.flatMap((call) =>
+            Array.from(call[1].matchAll(/^(\d+)\. /gm), (match: any) =>
+              Number(match[1]),
+            ),
+          ),
+        ).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
+        if (legacy) expect(calls[2][1]).toContain('11. а010 — перевод');
+      },
+    );
 
     it('serializes simultaneous scheduled and manual delivery', async () => {
       const f = makeDelivery();
@@ -695,6 +757,9 @@ describe('WordReviewService discussion batches', () => {
 
     it('resumes an extra delivery without consuming the regular scheduled slot', async () => {
       const f = makeDelivery(25);
+      f.words.forEach((word) => {
+        word.translation = 'я'.repeat(350);
+      });
       const next = f.state().target.nextRunAt;
       f.bot.telegram.sendMessage
         .mockResolvedValueOnce({ message_id: 701 })
@@ -808,6 +873,9 @@ describe('WordReviewService discussion batches', () => {
 
     it('resolves a reply to any page while several batches are open', async () => {
       const f = makeDelivery(15);
+      f.words.forEach((word) => {
+        word.translation = 'я'.repeat(350);
+      });
       await f.service.sendReviewBatch();
       await f.service.sendReviewBatch({ extra: true });
       const result = await f.service.recordDecision({
@@ -881,6 +949,9 @@ describe('WordReviewService discussion batches', () => {
 
     it('does not finalize a delivery that failed before its last page', async () => {
       const f = makeDelivery(15);
+      f.words.forEach((word) => {
+        word.translation = 'я'.repeat(350);
+      });
       f.bot.telegram.sendMessage
         .mockResolvedValueOnce({ message_id: 701 })
         .mockRejectedValueOnce(new Error('offline'));

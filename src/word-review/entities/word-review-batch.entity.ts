@@ -30,6 +30,10 @@ export class WordReviewBatch {
   @Column({ type: 'jsonb', default: () => "'[]'::jsonb" })
   messageIds: number[];
 
+  // Existing interrupted deliveries must retain their original page boundaries.
+  @Column({ type: 'int', default: 1 })
+  messageFormatVersion: number;
+
   @Column({ type: 'varchar', length: 16, default: 'active' })
   status: WordReviewBatchStatus;
 

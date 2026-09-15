@@ -31,7 +31,6 @@ import {
 import { PollConfigService } from '../poll/poll-config.service';
 import { PollSchedulerService } from '../poll/poll-scheduler.service';
 import {
-  DEFAULT_WORD_REVIEW_LIMIT,
   MAX_WORD_REVIEW_LIMIT,
   ReviewDecisionResult,
   WordReviewService,
@@ -1917,11 +1916,6 @@ export class TelegramUpdate implements OnModuleInit {
       this.logger.log(
         `[Chat ${chatId}] @${username} added bot memory: "${trimmed}"`,
       );
-      if (messageId != null) {
-        await this.replyAndRemember(ctx, '🧠 Запомнил.', {
-          reply_parameters: { message_id: messageId },
-        });
-      }
     } catch (err) {
       this.logger.error(`[Chat ${chatId}] addBotMemory failed:`, err);
       if (messageId != null) {
@@ -2132,7 +2126,6 @@ export class TelegramUpdate implements OnModuleInit {
     }
     const chatId = ctx.chat!.id;
     await this.telegramService.clearBuffer(chatId);
-    await this.replyAndRemember(ctx, '🗑 Буфер очищен.');
   }
 
   @Command('leaderboard')
@@ -2242,14 +2235,12 @@ export class TelegramUpdate implements OnModuleInit {
     const message = ctx.message as { message_thread_id?: number };
     const threadId = message.message_thread_id ?? null;
     const username = ctx.from?.username || 'unknown';
-    const saved = await this.telegramService.addBotMemory(
+    await this.telegramService.addBotMemory(
       chatId,
       threadId,
       payload,
       username,
     );
-
-    await this.replyAndRemember(ctx, `🧠 Добавил в память #${saved.id}.`);
   }
 
   @Command('memoryedit')
@@ -2289,8 +2280,6 @@ export class TelegramUpdate implements OnModuleInit {
       );
       return;
     }
-
-    await this.replyAndRemember(ctx, `🧠 Обновил память #${updated.id}.`);
   }
 
   @Command('memorydel')
@@ -2327,8 +2316,6 @@ export class TelegramUpdate implements OnModuleInit {
       );
       return;
     }
-
-    await this.replyAndRemember(ctx, `🧠 Удалил память #${parsed[1]}.`);
   }
 
   @Command('setsummarythread')
@@ -2348,14 +2335,6 @@ export class TelegramUpdate implements OnModuleInit {
     const username = ctx.from?.username || 'unknown';
 
     await this.telegramService.setSummaryTarget(chatId, threadId, username);
-
-    await this.replyAndRemember(
-      ctx,
-      `✅ Отчёты и подробные описания обсуждений будут приходить сюда.\n` +
-        `chat_id: <code>${chatId}</code>\n` +
-        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>`,
-      { parse_mode: 'HTML' },
-    );
   }
 
   @Command('clearsummarythread')
@@ -2369,10 +2348,6 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     await this.telegramService.clearSummaryTarget();
-    await this.replyAndRemember(
-      ctx,
-      '🛑 Отдельный топик отчётов отключён. Используйте /setsummarythread чтобы включить снова.',
-    );
   }
 
   @Command('summarythreadstatus')
@@ -2422,15 +2397,6 @@ export class TelegramUpdate implements OnModuleInit {
     const username = ctx.from?.username || 'unknown';
 
     await this.pollConfigService.set(chatId, threadId, username);
-
-    await this.replyAndRemember(
-      ctx,
-      `✅ Опросы будут приходить сюда.\n` +
-        `chat_id: <code>${chatId}</code>\n` +
-        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
-        `Расписание: 8, 10, 12, 14, 16, 18, 20 МСК — два опроса в каждой точке.`,
-      { parse_mode: 'HTML' },
-    );
   }
 
   @Command('clearpollchat')
@@ -2444,10 +2410,6 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     await this.pollConfigService.clear();
-    await this.replyAndRemember(
-      ctx,
-      '🛑 Опросы отключены. Используйте /setpollchat чтобы включить снова.',
-    );
   }
 
   @Command('pollstatus')
@@ -2500,7 +2462,6 @@ export class TelegramUpdate implements OnModuleInit {
       );
       return;
     }
-    await this.replyAndRemember(ctx, '🚀 Отправляю пару опросов...');
     await this.pollScheduler.sendBoth();
   }
 
@@ -2521,15 +2482,6 @@ export class TelegramUpdate implements OnModuleInit {
       username,
       username,
     );
-
-    await this.replyAndRemember(
-      ctx,
-      `✅ Ежедневный отчёт по OpenAI токенам будет приходить сюда.\n` +
-        `chat_id: <code>${chatId}</code>\n` +
-        `thread_id: <code>${threadId ?? 'нет'}</code>\n\n` +
-        `Расписание: каждый день в 08:00 МСК, отчёт за предыдущие сутки по МСК.`,
-      { parse_mode: 'HTML' },
-    );
   }
 
   @Command('cleartokenreport')
@@ -2537,10 +2489,6 @@ export class TelegramUpdate implements OnModuleInit {
     if (!(await this.requireAdmin(ctx))) return;
 
     await this.openaiUsageService.clearReportTarget();
-    await this.replyAndRemember(
-      ctx,
-      '🛑 Ежедневный отчёт по OpenAI токенам отключён. Используйте /settokenreport чтобы включить снова.',
-    );
   }
 
   @Command('tokenreport')
@@ -2582,27 +2530,11 @@ export class TelegramUpdate implements OnModuleInit {
         threadId,
         ctx.from?.username ?? 'unknown',
       );
-      const result = await this.wordReviewService.sendReviewBatch({
+      await this.wordReviewService.sendReviewBatch({
         scheduled: true,
         chatId,
         threadId,
       });
-      const target = await this.wordReviewService.getTarget();
-      const outcome =
-        result.status === 'sent'
-          ? `Отправлено ${result.count} слов.`
-          : result.status === 'no_words'
-            ? 'Новых слов для отправки пока нет. Бот проверит их появление по расписанию.'
-            : 'Расписание сохранено.';
-      await this.replyAndRemember(
-        ctx,
-        `▶️ Разбор слов запущен в этой теме.\n${outcome}\n` +
-          `Размер партии: ${target?.batchSize ?? DEFAULT_WORD_REVIEW_LIMIT}.\n` +
-          `Расписание: ${WORD_REVIEW_SCHEDULE_LABEL}.\n` +
-          (target?.nextRunAt
-            ? `Ближайшая отправка: ${formatReviewDate(new Date(target.nextRunAt))}.`
-            : ''),
-      );
     } catch (error) {
       this.logger.error('Could not start word review', error);
       await this.replyAndRemember(
@@ -2634,10 +2566,6 @@ export class TelegramUpdate implements OnModuleInit {
       (ctx.message as { message_thread_id?: number }).message_thread_id ?? null;
     try {
       await this.wordReviewService.clearTarget(ctx.chat!.id, threadId);
-      await this.replyAndRemember(
-        ctx,
-        '⏸ Отправка слов приостановлена. Размер партии, расписание и прогресс сохранены. Возобновить: /startreview',
-      );
     } catch (error) {
       this.logger.error('Could not stop word review', error);
       await this.replyAndRemember(
@@ -2673,18 +2601,11 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     try {
-      const target = await this.wordReviewService.setBatchSize(
+      await this.wordReviewService.setBatchSize(
         ctx.chat!.id,
         message.message_thread_id ?? null,
         size,
         ctx.from?.username ?? 'unknown',
-      );
-      await this.replyAndRemember(
-        ctx,
-        `✅ В следующих партиях будет по ${size} слов. Текущая партия сохраняет свой состав.` +
-          (target.enabled
-            ? ''
-            : '\nОтправка приостановлена. Запустить: /startreview'),
       );
     } catch (error) {
       this.logger.error('Could not change word review size', error);
@@ -2781,18 +2702,6 @@ export class TelegramUpdate implements OnModuleInit {
         );
         return;
       }
-      if (result.status === 'no_words') {
-        await this.replyAndRemember(
-          ctx,
-          'Новых слов для отправки пока нет. Уже отправленные слова остаются в своих партиях.',
-        );
-        return;
-      }
-
-      await this.replyAndRemember(
-        ctx,
-        `✅ Дополнительная партия: ${result.count} слов. Регулярное расписание сохранено.`,
-      );
     } catch (err) {
       this.logger.error('Manual word review failed', err);
       await this.replyAndRemember(ctx, 'Ошибка при отправке слов на проверку.');
@@ -2815,16 +2724,6 @@ export class TelegramUpdate implements OnModuleInit {
     const username = ctx.from?.username || 'unknown';
 
     await this.factDayConfigService.set(chatId, threadId, username);
-
-    await this.replyAndRemember(
-      ctx,
-      `✅ Исторический квиз Цинцкаро запущен в этом топике.\n` +
-        `chat_id: <code>${chatId}</code>\n` +
-        `thread_id: <code>${threadId ?? 'нет (общий чат)'}</code>\n\n` +
-        `Расписание: ${FACT_DAY_SCHEDULE_LABEL}.\n` +
-        `Всего вопросов: ${this.factDayScheduler.getFactsCount()}.`,
-      { parse_mode: 'HTML' },
-    );
   }
 
   @Command('stopfactday')
@@ -2845,10 +2744,6 @@ export class TelegramUpdate implements OnModuleInit {
       );
       return;
     }
-    await this.replyAndRemember(
-      ctx,
-      '🛑 Исторический квиз отключён. Настройка сохранена, включить снова можно через /startfactday.',
-    );
   }
 
   @Command('factdaystatus')

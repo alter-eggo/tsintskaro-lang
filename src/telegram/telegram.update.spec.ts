@@ -68,6 +68,12 @@ describe('TelegramUpdate bot mentions', () => {
       getSummaryTarget: jest.fn(async () => null),
       createSummaryReport: jest.fn(async () => ({ id: 1 })),
       markMessagesReported: jest.fn(async () => undefined),
+      setSummaryTarget: jest.fn(async () => undefined),
+      clearSummaryTarget: jest.fn(async () => undefined),
+      clearBuffer: jest.fn(async () => undefined),
+      addBotMemory: jest.fn(async () => ({ id: 1 })),
+      updateBotMemory: jest.fn(async () => ({ id: 1 })),
+      deleteBotMemory: jest.fn(async () => true),
     };
     const wordReviewService = {
       setTarget: jest.fn(async () => ({})),
@@ -112,10 +118,16 @@ describe('TelegramUpdate bot mentions', () => {
       })),
       buildReport: jest.fn(async () => 'usage report'),
     };
-    const pollConfigService = { get: jest.fn(async () => null) };
+    const pollConfigService = {
+      get: jest.fn(async () => null),
+      set: jest.fn(async () => undefined),
+      clear: jest.fn(async () => undefined),
+    };
+    const pollScheduler = { sendBoth: jest.fn(async () => undefined) };
     const factDayConfigService = {
       get: jest.fn(async () => null),
       set: jest.fn(async () => undefined),
+      disable: jest.fn(async () => true),
     };
     const factDayScheduler = { getFactsCount: jest.fn(() => 100) };
     const ctx = {
@@ -145,7 +157,7 @@ describe('TelegramUpdate bot mentions', () => {
       openaiService as any,
       dictionaryService as any,
       pollConfigService as any,
-      {} as any,
+      pollScheduler as any,
       factDayConfigService as any,
       factDayScheduler as any,
       wordReviewService as any,
@@ -161,6 +173,7 @@ describe('TelegramUpdate bot mentions', () => {
       telegramService,
       wordReviewService,
       pollConfigService,
+      pollScheduler,
       factDayConfigService,
       openaiUsageService,
       bot,
@@ -218,10 +231,72 @@ describe('TelegramUpdate bot mentions', () => {
     },
   );
 
-  it('announces daily token reports at the existing delivery time in Moscow', async () => {
-    const { update, ctx } = makeUpdate();
-    await update.onSetTokenReport(ctx as any);
-    expect(ctx.reply.mock.calls[0][0]).toContain('каждый день в 08:00 МСК');
+  it.each([
+    ['onSetSummaryThread', '/setsummarythread'],
+    ['onClearSummaryThread', '/clearsummarythread'],
+    ['onSetPollChat', '/setpollchat'],
+    ['onClearPollChat', '/clearpollchat'],
+    ['onPollNow', '/pollnow'],
+    ['onSetTokenReport', '/settokenreport'],
+    ['onClearTokenReport', '/cleartokenreport'],
+    ['onStartFactDay', '/startfactday'],
+    ['onStopFactDay', '/stopfactday'],
+    ['onClear', '/clear'],
+    ['onMemoryAdd', '/memoryadd правило'],
+    ['onMemoryEdit', '/memoryedit 1 новое правило'],
+    ['onMemoryDelete', '/memorydel 1'],
+  ] as const)(
+    'runs %s without service announcements',
+    async (command, text) => {
+      const {
+        update,
+        ctx,
+        telegramService,
+        pollConfigService,
+        pollScheduler,
+        openaiUsageService,
+        factDayConfigService,
+      } = makeUpdate();
+      ctx.message = { text, message_thread_id: 44 };
+      pollConfigService.get.mockResolvedValue({ chatId: -100, threadId: 44 });
+      const actions = {
+        onSetSummaryThread: telegramService.setSummaryTarget,
+        onClearSummaryThread: telegramService.clearSummaryTarget,
+        onSetPollChat: pollConfigService.set,
+        onClearPollChat: pollConfigService.clear,
+        onPollNow: pollScheduler.sendBoth,
+        onSetTokenReport: openaiUsageService.setReportTarget,
+        onClearTokenReport: openaiUsageService.clearReportTarget,
+        onStartFactDay: factDayConfigService.set,
+        onStopFactDay: factDayConfigService.disable,
+        onClear: telegramService.clearBuffer,
+        onMemoryAdd: telegramService.addBotMemory,
+        onMemoryEdit: telegramService.updateBotMemory,
+        onMemoryDelete: telegramService.deleteBotMemory,
+      };
+      await update[command](ctx as any);
+      expect(actions[command]).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).not.toHaveBeenCalled();
+    },
+  );
+
+  it('remembers a direct request without a service reply', async () => {
+    const { update, ctx, telegramService, openaiService } = makeUpdate();
+    ctx.message = {
+      text: 'Баласи, запомни правило',
+      from: ctx.from,
+      message_id: 42,
+      message_thread_id: 44,
+    };
+    await update.onText(ctx as any);
+    expect(telegramService.addBotMemory).toHaveBeenCalledWith(
+      -100,
+      44,
+      'правило',
+      'AAlxnv',
+    );
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).not.toHaveBeenCalled();
   });
 
   it.each(['2026-09-15-00', '2026-09-15-24'])(
@@ -720,11 +795,13 @@ describe('TelegramUpdate bot mentions', () => {
       44,
       'AAlxnv',
     );
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('Разбор слов запущен в этой теме'),
-    );
-    expect(ctx.reply.mock.calls[0][0]).toContain('каждые 3 дня в 08:00 МСК');
-    expect(ctx.reply.mock.calls[0][0]).toContain('16.09.2026, 08:00 МСК');
+    expect(ctx.reply).not.toHaveBeenCalled();
+
+    expect(wordReviewService.sendReviewBatch).toHaveBeenCalledWith({
+      scheduled: true,
+      chatId: -100,
+      threadId: 44,
+    });
 
     (ctx.reply as jest.Mock).mockClear();
     (ctx as any).message = { text: '/reviewnow', message_thread_id: 44 };
@@ -735,9 +812,7 @@ describe('TelegramUpdate bot mentions', () => {
       chatId: -100,
       threadId: 44,
     });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '✅ Дополнительная партия: 10 слов. Регулярное расписание сохранено.',
-    );
+    expect(ctx.reply).not.toHaveBeenCalled();
   });
 
   it('pauses word delivery without clearing its settings', async () => {
@@ -745,10 +820,50 @@ describe('TelegramUpdate bot mentions', () => {
     (ctx as any).message = { text: '/stopreview', message_thread_id: 44 };
     await update.onStopReview(ctx as any);
     expect(wordReviewService.clearTarget).toHaveBeenCalledWith(-100, 44);
+    expect(ctx.reply).not.toHaveBeenCalled();
+  });
+
+  it.each(['sent', 'not_due', 'no_words'])(
+    'starts review silently when the result is %s',
+    async (status) => {
+      const { update, ctx, wordReviewService } = makeUpdate();
+      ctx.message = { text: '/startreview', message_thread_id: 44 };
+      wordReviewService.sendReviewBatch.mockResolvedValue({ status, count: 0 });
+      await update.onStartReview(ctx as any);
+      expect(wordReviewService.setTarget).toHaveBeenCalled();
+      expect(wordReviewService.sendReviewBatch).toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reports a failed review delivery', async () => {
+    const { update, ctx, wordReviewService } = makeUpdate();
+    ctx.message = { text: '/reviewnow', message_thread_id: 44 };
+    wordReviewService.sendReviewBatch.mockRejectedValue(new Error('offline'));
+    await update.onReviewNow(ctx as any);
     expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('прогресс сохранены'),
+      'Ошибка при отправке слов на проверку.',
     );
   });
+
+  it.each(['sent', 'no_words'])(
+    'finishes a manual delivery silently when the result is %s',
+    async (status) => {
+      const { update, ctx, wordReviewService } = makeUpdate();
+      ctx.message = { text: '/reviewnow', message_thread_id: 44 };
+      wordReviewService.sendReviewBatch.mockResolvedValue({
+        status,
+        count: status === 'sent' ? 100 : 0,
+      });
+      await update.onReviewNow(ctx as any);
+      expect(wordReviewService.sendReviewBatch).toHaveBeenCalledWith({
+        extra: true,
+        chatId: -100,
+        threadId: 44,
+      });
+      expect(ctx.reply).not.toHaveBeenCalled();
+    },
+  );
 
   it('sets the next batch size in the current topic', async () => {
     const { update, ctx, wordReviewService } = makeUpdate();
@@ -764,6 +879,7 @@ describe('TelegramUpdate bot mentions', () => {
       'AAlxnv',
     );
     expect(wordReviewService.sendReviewBatch).not.toHaveBeenCalled();
+    expect(ctx.reply).not.toHaveBeenCalled();
   });
 
   it.each([
