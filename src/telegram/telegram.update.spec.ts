@@ -1984,6 +1984,58 @@ describe('TelegramUpdate bot mentions', () => {
     });
   });
 
+  it.each([6, 100])(
+    'applies all %i dictionary corrections from one message',
+    async (count) => {
+      const { update, ctx, dictionaryService, openaiService } =
+        makeUpdate('joanofarc74');
+      const entries = Array.from({ length: count }, (_, index) => ({
+        oldWord: `слово ${index + 1}`,
+        newWord: index % 2 === 0 ? `исправленное слово ${index + 1}` : null,
+        translation: index % 2 === 0 ? null : `новый перевод ${index + 1}`,
+      }));
+      openaiService.processBotMention.mockResolvedValueOnce({
+        action: 'update_words',
+        entries,
+      } as any);
+      const text = `Баласи, внеси эти исправления в словарь:\n${entries
+        .map((entry) => `${entry.oldWord}: ${entry.newWord ?? entry.translation}`)
+        .join('\n')}`;
+
+      await (update as any).handleBotMention(
+        ctx,
+        text,
+        'joanofarc74',
+        123,
+        null,
+      );
+
+      expect(dictionaryService.updateWord).toHaveBeenCalledTimes(count / 2);
+      expect(dictionaryService.replaceTranslation).toHaveBeenCalledTimes(
+        count / 2,
+      );
+      const replies = ctx.reply.mock.calls.map(([reply]) => reply as string);
+      expect(replies.length).toBeGreaterThan(0);
+      expect(replies.every((reply) => reply.length <= 3900)).toBe(true);
+      if (count === 100) expect(replies.length).toBeGreaterThan(1);
+      const response = replies.join('\n');
+      expect(response).toContain('✅ поправил:');
+      for (const entry of entries) {
+        const serviceCall = entry.newWord
+          ? dictionaryService.updateWord
+          : dictionaryService.replaceTranslation;
+        expect(serviceCall).toHaveBeenCalledWith(
+          expect.objectContaining(
+            entry.newWord
+              ? { oldWord: entry.oldWord, newWord: entry.newWord }
+              : { word: entry.oldWord, translation: entry.translation },
+          ),
+        );
+        expect(response).toContain(entry.newWord ?? entry.translation);
+      }
+    },
+  );
+
   it('falls back to AI when a locally parsed old word is not found', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
     const text =

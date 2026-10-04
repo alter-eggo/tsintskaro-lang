@@ -372,7 +372,6 @@ export class TelegramUpdate implements OnModuleInit {
 
   private static readonly BOT_MENTION_REGEX = /^\s*(?:бот|баласи)[\s,:!.\-—]/i;
   private static readonly MAX_DELETE_BATCH = 10;
-  private static readonly MAX_UPDATE_BATCH = 5;
 
   private static readonly BOT_CONTEXT_MESSAGE_LIMIT = 50;
 
@@ -1697,17 +1696,6 @@ export class TelegramUpdate implements OnModuleInit {
     entries: DictionaryUpdateInput[],
     options: DictionaryUpdateHandlingOptions = {},
   ): Promise<DictionaryUpdateHandlingResult> {
-    if (entries.length > TelegramUpdate.MAX_UPDATE_BATCH) {
-      if (messageId != null) {
-        await this.replyAndRemember(
-          ctx,
-          `За один раз можно поправить до ${TelegramUpdate.MAX_UPDATE_BATCH} слов. Пришли остальные отдельно.`,
-          { reply_parameters: { message_id: messageId } },
-        );
-      }
-      return { needsAiFallback: false };
-    }
-
     const updated: string[] = [];
     const notFound: string[] = [];
     const ambiguous: string[] = [];
