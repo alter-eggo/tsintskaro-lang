@@ -274,7 +274,7 @@ describe('translation permissions on other dictionary writes', () => {
     },
   );
 
-  it.each(['joanofarc74', 'ekaterina_karaasheva'])(
+  it.each(['joanofarc74', 'ekaterina_karaasheva', 'Elvardi'])(
     'allows appending meanings for %s',
     async (addedBy) => {
       const f = makeWriter();
@@ -471,6 +471,8 @@ describe('DictionaryService explicit translation replacement', () => {
     'ekaterina_karaasheva',
     'JoanOfArc74',
     'EKATERINA_KARAASHEVA',
+    'elvardi',
+    'Elvardi',
   ])('allows replacement by the named editor %s', async (username) => {
     const f = makeReplacement();
     expect(

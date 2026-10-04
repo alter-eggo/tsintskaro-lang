@@ -1063,7 +1063,7 @@ describe('TelegramUpdate bot mentions', () => {
   });
 
   describe('translation editor access', () => {
-    it.each(['joanofarc74', 'ekaterina_karaasheva', 'JoanOfArc74'])(
+    it.each(['joanofarc74', 'ekaterina_karaasheva', 'JoanOfArc74', 'Elvardi'])(
       'allows %s without requiring administrator rights',
       async (username) => {
         const { update, ctx, dictionaryService } = makeUpdate(username);
