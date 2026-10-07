@@ -31,6 +31,10 @@ describe('TelegramUpdate bot mentions', () => {
           partOfSpeech: input.partOfSpeech ?? null,
         },
       })),
+      deleteWords: jest.fn(async (words: string[]) => ({
+        deleted: words,
+        notFound: [] as string[],
+      })),
       findWord: jest.fn(async () => undefined),
       findByTranslation: jest.fn(async () => []),
       findRelevantForPrompt: jest.fn(async () => []),
@@ -180,6 +184,197 @@ describe('TelegramUpdate bot mentions', () => {
       config,
     };
   };
+
+  it('stores the requested part of speech separately from the translation', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь:\nбêй — аванс (часть заработка, выдаваемая вперёд), добавить в раздел Часть речи словаря - существительное',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
+      word: 'бêй',
+      translation: 'аванс (часть заработка, выдаваемая вперёд)',
+      partOfSpeech: 'существительное',
+      addedBy: 'Elvardi',
+    });
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+  });
+
+  it('corrects a pair and its part of speech without attempting a rename', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправь:\nбêй — аванс (часть заработка, выдаваемая вперёд), добавить в раздел Часть речи словаря - существительное',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
+      oldWord: 'бêй',
+      newWord: null,
+      translation: 'аванс (часть заработка, выдаваемая вперёд)',
+      partOfSpeech: 'существительное',
+      updatedBy: 'Elvardi',
+    });
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing explicit correction without adding or asking AI to reinterpret it', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    dictionaryService.replaceTranslation.mockResolvedValueOnce({
+      status: 'not_found',
+      word: 'бêй',
+    } as any);
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправь: бêй — аванс',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
+      expect.objectContaining({ word: 'бêй', translation: 'аванс' }),
+    );
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('не нашёл в словаре: бêй'),
+      expect.anything(),
+    );
+  });
+
+  it.each(['Баласи, исправь:\nаванс — удалить', 'Баласи, удали:\nаванс'])(
+    'lets the actual Elvardi sender delete via %s',
+    async (text) => {
+      const { update, ctx, dictionaryService, openaiService } =
+        makeUpdate('eLvArDi');
+      await (update as any).handleBotMention(ctx, text, 'eLvArDi', 123, null);
+      expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
+      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+      expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('🗑 удалил:'),
+        expect.anything(),
+      );
+    },
+  );
+
+  it.each(['alice', 'joanofarc74'])(
+    'denies deleting for %s even if a supplied display username says Elvardi',
+    async (sender) => {
+      const { update, ctx, dictionaryService } = makeUpdate(sender);
+      Object.assign(ctx.telegram, {
+        getChatMember: jest.fn(async () => ({ status: 'member' })),
+      });
+      await (update as any).handleBotMention(
+        ctx,
+        'Баласи, исправь: аванс — удалить',
+        'Elvardi',
+        123,
+        null,
+      );
+      expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
+      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('🚫'),
+        expect.anything(),
+      );
+    },
+  );
+
+  it('retains deletion for Telegram administrators', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate('moderator');
+    Object.assign(ctx.telegram, {
+      getChatMember: jest.fn(async () => ({ status: 'administrator' })),
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, удали: аванс',
+      'moderator',
+      123,
+      null,
+    );
+    expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
+  });
+
+  it('does not grant deletion to an anonymous or bot identity', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
+    Object.assign(ctx.from, { is_bot: true });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, удали: аванс',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
+  });
+
+  it('handles an explicit correction and deletion in the same list', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, исправь:\nбêй — аванс, существительное\nаванс — удалить',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.updateWord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        oldWord: 'бêй',
+        translation: 'аванс',
+        partOfSpeech: 'существительное',
+      }),
+    );
+    expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+  });
+
+  it.each(['существительное', 'сущ.', 'часть речи — существительное'])(
+    'extracts a separate POS suffix: %s',
+    async (suffix) => {
+      const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
+      await (update as any).handleBotMention(
+        ctx,
+        `Баласи, добавь: бêй — аванс, ${suffix}`,
+        'Elvardi',
+        123,
+        null,
+      );
+      expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          word: 'бêй',
+          translation: 'аванс',
+          partOfSpeech: expect.stringMatching(/^(существительное|сущ\.?)$/),
+        }),
+      );
+    },
+  );
+
+  it('keeps удалить as a legitimate translation in an explicit addition', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь: сил — удалить',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
+      expect.objectContaining({ word: 'сил', translation: 'удалить' }),
+    );
+    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
+  });
 
   it.each([
     'onSummaryThreadStatus',
@@ -1999,7 +2194,9 @@ describe('TelegramUpdate bot mentions', () => {
         entries,
       } as any);
       const text = `Баласи, внеси эти исправления в словарь:\n${entries
-        .map((entry) => `${entry.oldWord}: ${entry.newWord ?? entry.translation}`)
+        .map(
+          (entry) => `${entry.oldWord}: ${entry.newWord ?? entry.translation}`,
+        )
         .join('\n')}`;
 
       await (update as any).handleBotMention(
@@ -2122,31 +2319,25 @@ describe('TelegramUpdate bot mentions', () => {
     );
   });
 
-  it('adds a correction-like word pair that starts with топ instead of showing leaders', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    (ctx.from as any).username = undefined;
-
+  it('corrects a word pair starting with топ instead of adding or showing leaders', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
     await (update as any).handleBotMention(
       ctx,
       'Бот, исправь топ фысалди - мяч сдулся',
-      'anonymous',
+      'Elvardi',
       123,
       null,
     );
-
     expect(dictionaryService.getLeaderboard).not.toHaveBeenCalled();
     expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
-      word: 'топ фысалди',
-      translation: 'мяч сдулся',
-      partOfSpeech: null,
-      addedBy: 'anonymous',
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('✅ записал:'),
-      {
-        reply_parameters: { message_id: 123 },
-      },
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        word: 'топ фысалди',
+        translation: 'мяч сдулся',
+        username: 'Elvardi',
+      }),
     );
   });
 

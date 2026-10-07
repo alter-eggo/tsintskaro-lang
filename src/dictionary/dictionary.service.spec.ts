@@ -21,6 +21,24 @@ describe('DictionaryService relevant prompt entries', () => {
     return new DictionaryService(repo as any);
   };
 
+  it('finds decomposed Ê without confusing it with Е or dropping the letter', async () => {
+    const service = makeService([
+      { word: 'бêй', translation: 'аванс' },
+      { word: 'бей', translation: 'другое слово' },
+      { word: 'бй', translation: 'контроль' },
+    ]);
+    expect((await service.findWord('бêй'.normalize('NFD')))?.translation).toBe(
+      'аванс',
+    );
+    expect((await service.findWord('бей'))?.translation).toBe('другое слово');
+    expect((await service.findWord('бй'))?.translation).toBe('контроль');
+    expect(
+      (await service.findRelevantForPrompt(['бêй'.normalize('NFD')])).map(
+        (entry) => entry.word,
+      ),
+    ).toEqual(['бêй']);
+  });
+
   it('refreshes dictionary entries changed by another application within one minute', async () => {
     const rows = [{ word: 'ширин', translation: 'сладкий' }];
     const service = makeService(rows);

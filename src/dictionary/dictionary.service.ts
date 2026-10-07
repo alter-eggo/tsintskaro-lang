@@ -94,6 +94,7 @@ export class DictionaryService {
 
   private normalizeWordInput(word: string): string {
     return word
+      .normalize('NFC')
       .toLowerCase()
       .trim()
       .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
@@ -111,7 +112,7 @@ export class DictionaryService {
       .replace(/[x]/gi, 'х')
       .replace(/[yŷûúùüū]/gi, 'у')
       .replace(/ё/g, 'е')
-      .replace(/[^0-9а-я]+/gi, '');
+      .replace(/[^0-9а-яê]+/gi, '');
   }
 
   /**
@@ -351,7 +352,12 @@ export class DictionaryService {
   }
 
   private tokenizeLookupText(value: string): string[] {
-    return value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+    return (
+      value
+        .normalize('NFC')
+        .toLowerCase()
+        .match(/[\p{L}\p{N}]+/gu) ?? []
+    );
   }
 
   private normalizePhraseForExactMatch(value: string): string {
@@ -452,7 +458,9 @@ export class DictionaryService {
   ): Promise<{ deleted: string[]; notFound: string[] }> {
     const normalized = Array.from(
       new Set(
-        words.map((w) => w.toLowerCase().trim()).filter((w) => w.length > 0),
+        words
+          .map((w) => this.normalizeWordInput(w))
+          .filter((w) => w.length > 0),
       ),
     );
     if (normalized.length === 0) {

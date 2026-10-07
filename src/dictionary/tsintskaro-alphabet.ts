@@ -8,6 +8,7 @@ export const TSINTSKARO_ALPHABET = [
   'Д',
   'Дж',
   'Е',
+  'Ê',
   'Ё',
   'Ж',
   'З',
@@ -33,7 +34,6 @@ export const TSINTSKARO_ALPHABET = [
   'Ч',
   'Ш',
   'Щ',
-  'Ъ',
   'Ы',
   'Ь',
   'Э',
@@ -49,7 +49,7 @@ TSINTSKARO_ALPHABET.forEach((letter, index) =>
 );
 
 function tokenizeWord(word: string): string[] {
-  const upper = word.toUpperCase();
+  const upper = word.normalize('NFC').toUpperCase();
   const tokens: string[] = [];
   let i = 0;
   while (i < upper.length) {

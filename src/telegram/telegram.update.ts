@@ -53,6 +53,11 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
 import { formatBotDate, formatBotDateTime } from '../common/bot-time';
+import { extractPartOfSpeech } from '../dictionary/dictionary-input';
+import {
+  hasWordDeletionGrant,
+  WORD_DELETION_DENIED,
+} from '../dictionary/deletion-permissions';
 
 interface SpellingCorrectionByTranslation {
   newWord: string;
@@ -435,6 +440,40 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
+    const deletions = this.extractDirectDictionaryDeletions(text);
+    if (deletions) {
+      await this.handleDictionaryDeletions(
+        ctx,
+        chatId,
+        username,
+        messageId,
+        deletions,
+      );
+      return;
+    }
+    const explicitChanges = this.extractExplicitDictionaryChanges(text);
+    if (explicitChanges) {
+      if (explicitChanges.updates.length) {
+        await this.handleDictionaryUpdates(
+          ctx,
+          chatId,
+          username,
+          messageId,
+          explicitChanges.updates,
+        );
+      }
+      if (explicitChanges.deletions.length) {
+        await this.handleDictionaryDeletions(
+          ctx,
+          chatId,
+          username,
+          messageId,
+          explicitChanges.deletions,
+        );
+      }
+      return;
+    }
+
     const directDictionaryUpdate = this.extractDirectDictionaryUpdate(text);
     let useAiDictionaryCorrectionFallback = false;
     if (directDictionaryUpdate) {
@@ -590,78 +629,13 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     if (result.action === 'delete_words') {
-      if (!(await this.isAdmin(ctx, username))) {
-        this.logger.log(
-          `[Chat ${chatId}] Non-admin @${username} tried to delete: ${result.words.join(', ')}`,
-        );
-        if (messageId != null) {
-          await this.replyAndRemember(
-            ctx,
-            '🚫 Удалять слова из словаря могут только администраторы.',
-            {
-              reply_parameters: { message_id: messageId },
-            },
-          );
-        }
-        return;
-      }
-
-      if (result.words.length > TelegramUpdate.MAX_DELETE_BATCH) {
-        this.logger.warn(
-          `[Chat ${chatId}] @${username} delete batch too big: ${result.words.length} words — refused`,
-        );
-        if (messageId != null) {
-          await this.replyAndRemember(
-            ctx,
-            `🚫 Нельзя удалить больше ${TelegramUpdate.MAX_DELETE_BATCH} слов за один раз. Перечисли меньше слов или удаляй по частям.`,
-            { reply_parameters: { message_id: messageId } },
-          );
-        }
-        return;
-      }
-
-      try {
-        const { deleted, notFound } = await this.dictionaryService.deleteWords(
-          result.words,
-        );
-        this.logger.log(
-          `[Chat ${chatId}] Admin @${username} deleted: [${deleted.join(', ')}], notFound: [${notFound.join(', ')}]`,
-        );
-
-        if (messageId != null) {
-          const lines: string[] = [];
-          if (deleted.length > 0) {
-            lines.push(
-              deleted.length === 1
-                ? '🗑 удалил:'
-                : `🗑 удалил (${deleted.length}):`,
-            );
-            for (const w of deleted) lines.push(`• ${w}`);
-          }
-          if (notFound.length > 0) {
-            if (lines.length > 0) lines.push('');
-            lines.push(`⚠️ нет в словаре: ${notFound.join(', ')}`);
-          }
-          if (lines.length === 0) {
-            lines.push('Нечего удалять.');
-          }
-
-          await this.replyAndRemember(ctx, lines.join('\n'), {
-            reply_parameters: { message_id: messageId },
-          });
-        }
-      } catch (err) {
-        this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
-        if (messageId != null) {
-          await this.replyAndRemember(
-            ctx,
-            'Ошибка при удалении слов из словаря.',
-            {
-              reply_parameters: { message_id: messageId },
-            },
-          );
-        }
-      }
+      await this.handleDictionaryDeletions(
+        ctx,
+        chatId,
+        username,
+        messageId,
+        result.words,
+      );
       return;
     }
 
@@ -789,6 +763,166 @@ export class TelegramUpdate implements OnModuleInit {
         reply_parameters: { message_id: messageId! },
       });
     }
+  }
+
+  private async canDeleteDictionaryWords(ctx: Context): Promise<boolean> {
+    const sender = ctx.from;
+    const message = ctx.message as { sender_chat?: unknown } | undefined;
+    if (
+      !sender ||
+      !Number.isSafeInteger(sender.id) ||
+      sender.id <= 0 ||
+      sender.is_bot ||
+      message?.sender_chat
+    ) {
+      return false;
+    }
+    return (
+      hasWordDeletionGrant(this.dictionarySenderUsername(ctx)) ||
+      this.isAdmin(ctx, sender.username)
+    );
+  }
+
+  private async handleDictionaryDeletions(
+    ctx: Context,
+    chatId: number,
+    username: string,
+    messageId: number | undefined,
+    words: string[],
+  ): Promise<void> {
+    if (!(await this.canDeleteDictionaryWords(ctx))) {
+      this.logger.log(
+        `[Chat ${chatId}] Unauthorized @${username} tried to delete: ${words.join(', ')}`,
+      );
+      if (messageId != null) {
+        await this.replyAndRemember(ctx, `🚫 ${WORD_DELETION_DENIED}`, {
+          reply_parameters: { message_id: messageId },
+        });
+      }
+      return;
+    }
+
+    if (words.length > TelegramUpdate.MAX_DELETE_BATCH) {
+      this.logger.warn(
+        `[Chat ${chatId}] @${username} delete batch too big: ${words.length} words — refused`,
+      );
+      if (messageId != null) {
+        await this.replyAndRemember(
+          ctx,
+          `🚫 Нельзя удалить больше ${TelegramUpdate.MAX_DELETE_BATCH} слов за один раз. Перечисли меньше слов или удаляй по частям.`,
+          { reply_parameters: { message_id: messageId } },
+        );
+      }
+      return;
+    }
+
+    try {
+      const { deleted, notFound } =
+        await this.dictionaryService.deleteWords(words);
+      this.logger.log(
+        `[Chat ${chatId}] Dictionary editor @${username} deleted: [${deleted.join(', ')}], notFound: [${notFound.join(', ')}]`,
+      );
+
+      if (messageId != null) {
+        const lines: string[] = [];
+        if (deleted.length > 0) {
+          lines.push(
+            deleted.length === 1
+              ? '🗑 удалил:'
+              : `🗑 удалил (${deleted.length}):`,
+          );
+          for (const w of deleted) lines.push(`• ${w}`);
+        }
+        if (notFound.length > 0) {
+          if (lines.length > 0) lines.push('');
+          lines.push(`⚠️ нет в словаре: ${notFound.join(', ')}`);
+        }
+        if (lines.length === 0) {
+          lines.push('Нечего удалять.');
+        }
+
+        await this.replyAndRemember(ctx, lines.join('\n'), {
+          reply_parameters: { message_id: messageId },
+        });
+      }
+    } catch (err) {
+      this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
+      if (messageId != null) {
+        await this.replyAndRemember(
+          ctx,
+          'Ошибка при удалении слов из словаря.',
+          {
+            reply_parameters: { message_id: messageId },
+          },
+        );
+      }
+    }
+  }
+
+  /** Parse explicit pair lists before conversational rename heuristics. */
+  private extractExplicitDictionaryChanges(text: string): {
+    updates: DictionaryUpdateInput[];
+    deletions: string[];
+  } | null {
+    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
+    const command = body.match(
+      /^(?:исправь|исправьте|исправить|поправь|поправьте|обнови|измени)(?:\s*[:,]\s*|\s+)([\s\S]+)$/i,
+    );
+    if (!command) return null;
+    const updates: DictionaryUpdateInput[] = [];
+    const deletions: string[] = [];
+    const lines = command[1]
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      const entry = this.extractDictionaryEntryLine(line);
+      // These are conversational rename instructions, not literal headwords.
+      if (
+        !entry ||
+        /(?:^|\s)(?:на|в|не|вместо|перевод|заменить|поменять|нужно|надо)(?:\s|$)/i.test(
+          entry.word,
+        )
+      )
+        return null;
+      if (
+        /^(?:удали|удалить)(?:\s+из\s+словаря)?[.!]?$/i.test(entry.translation)
+      ) {
+        deletions.push(entry.word);
+      } else {
+        const sanitized = this.sanitizeDictionaryEntryForSave(entry);
+        if (!sanitized) return null;
+        updates.push({
+          oldWord: sanitized.word,
+          newWord: null,
+          translation: sanitized.translation,
+          ...(sanitized.partOfSpeech
+            ? { partOfSpeech: sanitized.partOfSpeech }
+            : {}),
+        });
+      }
+    }
+    return updates.length || deletions.length ? { updates, deletions } : null;
+  }
+
+  private extractDirectDictionaryDeletions(text: string): string[] | null {
+    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
+    // A colon or an explicit dictionary noun distinguishes a command from
+    // conversational requests such as “удали пятно”. Other wording uses AI.
+    const command = body.match(
+      /^(?:удали|удалить)(?:\s*:\s*|\s+(?:из\s+словаря|слово|слова)(?:\s*:\s*|\s+))([\s\S]+)$/i,
+    );
+    if (!command) return null;
+    const words = command[1]
+      .split(/[\r\n,;]+/)
+      .map((word) =>
+        this.cleanDictionaryWord(word.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')),
+      )
+      .filter(Boolean);
+    return words.length &&
+      words.every((word) => this.isLikelyDictionaryWord(word))
+      ? [...new Set(words)]
+      : null;
   }
 
   private async extractDirectDictionaryEntries(
@@ -1159,7 +1293,7 @@ export class TelegramUpdate implements OnModuleInit {
 
   private hasLooseDictionaryEntrySignals(text: string): boolean {
     return (
-      /[а-яёâãáàäāôóòöōûŷúùüū]/i.test(text) &&
+      /[а-яёêâãáàäāôóòöōûŷúùüū]/i.test(text) &&
       (/(?:[-—=:]|значит|означает|перевод|это)/i.test(text) ||
         text.split(/\s+/g).filter(Boolean).length >= 2)
     );
@@ -1306,7 +1440,7 @@ export class TelegramUpdate implements OnModuleInit {
   private isLikelyDictionaryWord(word: string): boolean {
     return (
       word.length <= 80 &&
-      /[а-яёâãáàäāôóòöōûŷúùüū]/i.test(word) &&
+      /[а-яёêâãáàäāôóòöōûŷúùüū]/i.test(word) &&
       !/[@#/:\\\d]/.test(word) &&
       !/(?:^|\s)(?:это|переводится|значит|означает|словарь|словаре|правописание|написание)(?:\s|$)/i.test(
         word,
@@ -1535,6 +1669,7 @@ export class TelegramUpdate implements OnModuleInit {
       /(?:^|[\s,.:;!?])(?:исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|измен[а-яё]*|поменя[а-яё]*|скорректир[а-яё]*)(?:$|[\s,.:;!?])/i.test(
         body,
       );
+    if (this.extractDictionaryCorrectionInstruction(text)) return true;
     if (!hasCorrectionVerb) {
       return false;
     }
@@ -1610,6 +1745,7 @@ export class TelegramUpdate implements OnModuleInit {
 
   private cleanDictionaryWord(value: string): string {
     const word = value
+      .normalize('NFC')
       .toLowerCase()
       .trim()
       .replace(/^[\s"'«»“”„`.,;:!?()[\]{}\-—]+/g, '')
@@ -1628,23 +1764,6 @@ export class TelegramUpdate implements OnModuleInit {
       .replace(/^[\s"'«»“”„`.,;:!?]+/g, '')
       .replace(/[\s"'«»“”„`.,;:!?]+$/g, '')
       .replace(/\s+/g, ' ');
-  }
-
-  private extractTrailingPartOfSpeech(translation: string): {
-    translation: string;
-    partOfSpeech: string | null;
-  } {
-    const match = translation.match(
-      /\s*\((сущ\.?|гл\.?|прил\.?|нар\.?|мест\.?|межд\.?|предл\.?|союз|числ\.?|част\.?)\)\s*$/i,
-    );
-    if (!match) {
-      return { translation, partOfSpeech: null };
-    }
-
-    return {
-      translation: translation.slice(0, match.index).trim(),
-      partOfSpeech: match[1].trim(),
-    };
   }
 
   private cleanDictionaryTranslationNoise(translation: string): string {
@@ -1669,7 +1788,7 @@ export class TelegramUpdate implements OnModuleInit {
     let translation = this.cleanDictionaryTranslation(entry.translation);
     let partOfSpeech = entry.partOfSpeech?.trim() || null;
 
-    const extracted = this.extractTrailingPartOfSpeech(translation);
+    const extracted = extractPartOfSpeech(translation);
     translation = this.cleanDictionaryTranslationNoise(extracted.translation);
     if (!partOfSpeech && extracted.partOfSpeech) {
       partOfSpeech = extracted.partOfSpeech;
