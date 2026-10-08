@@ -26,6 +26,7 @@ import { SummaryReport } from './telegram/entities/summary-report.entity';
 import { BotMemory } from './telegram/entities/bot-memory.entity';
 import { Word } from './dictionary/entities/word.entity';
 import { WordTranslationHistory } from './dictionary/entities/word-translation-history.entity';
+import { WordEditHistory } from './dictionary/entities/word-edit-history.entity';
 import configuration from './config/configuration';
 
 @Module({
@@ -59,6 +60,7 @@ import configuration from './config/configuration';
           OpenaiUsageReportConfig,
           Word,
           WordTranslationHistory,
+          WordEditHistory,
         ],
         synchronize: true,
       }),

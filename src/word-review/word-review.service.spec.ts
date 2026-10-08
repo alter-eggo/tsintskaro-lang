@@ -196,19 +196,24 @@ describe('WordReviewService discussion batches', () => {
     wordRepo.createQueryBuilder.mockImplementation(() => {
       let excluded: number[] = [];
       let cutoff: Date | undefined;
+      let activeOnly = false;
       const query = {
         where: jest.fn((_sql, values) => {
           cutoff = values?.cutoff;
           return query;
         }),
         andWhere: jest.fn((_sql, values) => {
-          excluded = values?.sentIds ?? [];
+          if (_sql === "word.status = 'active'") activeOnly = true;
+          if (values?.sentIds) excluded = values.sentIds;
           return query;
         }),
         getMany: jest.fn(async () =>
           words.filter(
             (word) =>
               !excluded.includes(word.id) &&
+              (!activeOnly ||
+                !(word as any).status ||
+                (word as any).status === 'active') &&
               (!cutoff || word.createdAt <= cutoff),
           ),
         ),
@@ -234,6 +239,23 @@ describe('WordReviewService discussion batches', () => {
       jest.useFakeTimers().setSystemTime(new Date('2026-09-13T06:30:00Z'));
     });
     afterEach(() => jest.useRealTimers());
+
+    it('excludes embedded, merged, deferred and deleted records from new batches', async () => {
+      const f = makeDelivery();
+      for (const [i, status] of [
+        'embedded',
+        'merged',
+        'deferred',
+        'deleted',
+      ].entries())
+        (f.words[i] as any).status = status;
+      await f.service.sendReviewBatch({ chatId: -100, threadId: 44 });
+      const excludedIds = f.words.slice(0, 4).map((word) => word.id);
+      expect(f.state().items.length).toBeGreaterThan(0);
+      expect(
+        f.state().items.every((item) => !excludedIds.includes(item.wordId)),
+      ).toBe(true);
+    });
 
     it('starts today with ten words and schedules September 16 at 09:00 Tbilisi', async () => {
       const f = makeDelivery();

@@ -6,6 +6,7 @@ import {
   UpdateDateColumn,
   CreateDateColumn,
 } from 'typeorm';
+import type { WordKind, WordSense, WordStatus } from '../dictionary-content';
 
 export type WordSource = 'etalon' | 'rabochy' | 'chat';
 
@@ -20,6 +21,24 @@ export class Word {
 
   @Column({ type: 'text' })
   translation: string;
+
+  @Column({ type: 'jsonb', nullable: true })
+  senses: WordSense[] | null;
+
+  @Column({ type: 'varchar', length: 16, default: 'word' })
+  kind: WordKind;
+
+  @Column({ type: 'text', nullable: true })
+  literalTranslation: string | null;
+
+  @Column({ type: 'varchar', length: 16, default: 'active' })
+  status: WordStatus;
+
+  @Column({ type: 'text', nullable: true })
+  statusReason: string | null;
+
+  @Column({ type: 'int', nullable: true })
+  relatedWordId: number | null;
 
   @Column({ type: 'varchar', length: 64, nullable: true })
   partOfSpeech: string | null;

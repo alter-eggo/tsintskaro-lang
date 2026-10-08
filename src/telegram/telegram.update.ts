@@ -55,6 +55,15 @@ import { Logger, OnModuleInit } from '@nestjs/common';
 import { formatBotDate, formatBotDateTime } from '../common/bot-time';
 import { extractPartOfSpeech } from '../dictionary/dictionary-input';
 import {
+  DictionaryContentError,
+  renderSenses,
+  WORD_KIND_LABELS,
+} from '../dictionary/dictionary-content';
+import {
+  DICTIONARY_EDIT_HELP,
+  parseDictionaryEdit,
+} from '../dictionary/dictionary-edit-input';
+import {
   hasWordDeletionGrant,
   WORD_DELETION_DENIED,
 } from '../dictionary/deletion-permissions';
@@ -315,6 +324,7 @@ export class TelegramUpdate implements OnModuleInit {
       TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
       (isReplyToBot &&
         (!isReplyToReview ||
+          parseDictionaryEdit(text) != null ||
           this.extractDictionaryCorrectionInstruction(text) != null ||
           (reviewReplyDecision != null &&
             reviewReplyDecision !== 'invalid'))) ||
@@ -413,6 +423,138 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     const replyToMessage = this.getReplyContext(ctx);
+
+    if (
+      /^(?:(?:бот|баласи)[\s,:!.—-]+)?покажи\s+отложенные\s+(?:записи|слова)[.!\s]*$/i.test(
+        text.trim(),
+      )
+    ) {
+      const entries = await this.dictionaryService.getDeferredRecords();
+      const answer = entries.length
+        ? [
+            'Отложенные записи:',
+            ...entries.map(
+              (e) =>
+                `${e.word} — ${e.translation}${e.statusReason ? `\nПричина: ${e.statusReason}` : ''}`,
+            ),
+          ].join('\n')
+        : 'Отложенных записей нет.';
+      for (const chunk of this.chunkString(answer, 3900))
+        await this.replyAndRemember(ctx, chunk);
+      return;
+    }
+
+    const recordEdit = parseDictionaryEdit(text);
+    if (recordEdit != null) {
+      const forwarded = ctx.message as {
+        forward_origin?: unknown;
+        forward_from?: unknown;
+        forward_from_chat?: unknown;
+      };
+      if (
+        forwarded?.forward_origin ||
+        forwarded?.forward_from ||
+        forwarded?.forward_from_chat
+      ) {
+        await this.replyAndRemember(
+          ctx,
+          'Пересланное сообщение не изменяет словарь. Отправь нужную команду своим сообщением.',
+        );
+        return;
+      }
+      if (recordEdit === 'invalid') {
+        await this.replyAndRemember(
+          ctx,
+          `Ничего не изменено. ${DICTIONARY_EDIT_HELP}`,
+        );
+        return;
+      }
+      let saved = false;
+      try {
+        assertCanEditTranslations(this.dictionarySenderUsername(ctx));
+        const result = await this.dictionaryService.editRecord(recordEdit, {
+          userId: ctx.from?.id,
+          username: this.dictionarySenderUsername(ctx),
+          chatId,
+          threadId,
+          messageId: messageId ?? null,
+          canRemoveEntry: await this.canDeleteDictionaryWords(ctx),
+        });
+        saved = true;
+        const word = result.word;
+        const lines = [
+          result.status === 'updated'
+            ? '✅ Запись обновлена.'
+            : 'Запись уже в таком виде.',
+        ];
+        if (result.movedWord)
+          lines.push(
+            `«${result.movedWord}» перенесено в «${word.word}» как пример. Отдельная запись убрана из списка; история сохранена.`,
+          );
+        if (word.status === 'deferred')
+          lines.push(
+            `«${word.word}» отложено${word.statusReason ? `: ${word.statusReason}` : ''}.`,
+          );
+        if (recordEdit.type === 'set_status' && word.status === 'active')
+          lines.push(`«${word.word}» возвращено в словарь.`);
+        lines.push(word.word);
+        if (word.kind && word.kind !== 'word')
+          lines.push(`Тип: ${WORD_KIND_LABELS[word.kind]}`);
+        if (word.literalTranslation)
+          lines.push(`Буквально: ${word.literalTranslation}`);
+        if (result.previousTranslation !== word.translation)
+          lines.push(`Было: ${result.previousTranslation}`);
+        lines.push(
+          `Перевод:\n${word.senses?.length ? renderSenses(word.senses, '\n') : word.translation}`,
+        );
+        const phrases = [
+          ...new Set(
+            (word.senses ?? []).flatMap((s) => s.examples.map((e) => e.phrase)),
+          ),
+        ].sort((a, b) => b.length - a.length);
+        for (const chunk of this.chunkBotAnswer(lines.join('\n'))) {
+          const entities: { type: 'bold'; offset: number; length: number }[] =
+            [];
+          for (const phrase of phrases) {
+            for (
+              let offset = chunk.indexOf(phrase);
+              offset >= 0;
+              offset = chunk.indexOf(phrase, offset + phrase.length)
+            ) {
+              if (
+                !entities.some(
+                  (e) =>
+                    offset < e.offset + e.length &&
+                    offset + phrase.length > e.offset,
+                )
+              )
+                entities.push({ type: 'bold', offset, length: phrase.length });
+            }
+          }
+          await this.replyAndRemember(ctx, chunk, {
+            entities: entities.sort((a, b) => a.offset - b.offset),
+            ...(messageId == null
+              ? {}
+              : { reply_parameters: { message_id: messageId } }),
+          });
+        }
+      } catch (error) {
+        const message =
+          error instanceof DictionaryContentError ||
+          error instanceof TranslationEditForbiddenError
+            ? error.message
+            : saved
+              ? 'Изменение сохранено, но не удалось отправить результат. Повтори команду, чтобы увидеть запись; дубликат не появится.'
+              : 'Не удалось сохранить изменение. Исходные записи сохранены; повтори команду.';
+        if (
+          !(error instanceof DictionaryContentError) &&
+          !(error instanceof TranslationEditForbiddenError)
+        )
+          this.logger.error('Dictionary record edit failed', error);
+        await this.replyAndRemember(ctx, message);
+      }
+      return;
+    }
 
     const directMemoryText = this.extractBotMemoryText(text);
     if (directMemoryText != null) {
@@ -1082,6 +1224,11 @@ export class TelegramUpdate implements OnModuleInit {
       partOfSpeech: entry.partOfSpeech,
       ...(entry.comments ? { comments: entry.comments } : {}),
       ...(entry.source ? { source: entry.source } : {}),
+      ...(entry.kind ? { kind: entry.kind } : {}),
+      ...(entry.literalTranslation
+        ? { literalTranslation: entry.literalTranslation }
+        : {}),
+      ...(entry.senses ? { senses: entry.senses } : {}),
     }));
   }
 
@@ -1861,6 +2008,7 @@ export class TelegramUpdate implements OnModuleInit {
           translation: entry.translation,
           partOfSpeech: entry.partOfSpeech,
           updatedBy: editorUsername,
+          userId: ctx.from?.id,
         });
 
         if (
@@ -1894,6 +2042,10 @@ export class TelegramUpdate implements OnModuleInit {
           continue;
         }
       } catch (err) {
+        if (err instanceof DictionaryContentError) {
+          failed.push(`${entry.oldWord}: ${err.message}`);
+          continue;
+        }
         if (err instanceof TranslationEditForbiddenError) {
           denied.push(entry.oldWord);
           continue;

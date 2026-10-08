@@ -125,6 +125,10 @@ describe('DictionaryService word upserts', () => {
       ),
       find: jest.fn(async () => rows),
       save: jest.fn(async (row) => row),
+      update: jest.fn(async ({ id }, patch) => {
+        Object.assign(rows.find((r) => r.id === id)!, patch);
+        return { affected: 1 };
+      }),
       create: jest.fn((row) => ({ id: rows.length + 1, ...row })),
     };
 
@@ -206,7 +210,13 @@ describe('DictionaryService word upserts', () => {
     expect(result.translationAdded).toBe(true);
     expect(result.addedTranslation).toBe('приятный');
     expect(result.word.translation).toBe('приятный; сладкий, сахарный');
-    expect(repo.save).toHaveBeenCalledWith(existing);
+    expect(repo.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: existing.id,
+        translation: 'сладкий, сахарный',
+      }),
+      { translation: 'приятный; сладкий, сахарный' },
+    );
   });
 
   it('does not write when every incoming translation variant already exists', async () => {
@@ -384,7 +394,7 @@ describe('translation permissions on other dictionary writes', () => {
       addedBy: 'participant',
     });
     expect(f.repo.update).toHaveBeenCalledWith(
-      { id: 1 },
+      expect.objectContaining({ id: 1 }),
       { partOfSpeech: 'прил.' },
     );
     expect(f.repo.save).not.toHaveBeenCalled();

@@ -13,6 +13,7 @@ import type {
   ResponseInputItem,
 } from 'openai/resources/responses/responses';
 import { DictionaryService } from '../dictionary/dictionary.service';
+import type { WordKind, WordSense } from '../dictionary/dictionary-content';
 import { OpenaiUsagePurpose, OpenaiUsageService } from './openai-usage.service';
 import { BOT_TIME_INSTRUCTION, formatBotDateTime } from '../common/bot-time';
 
@@ -90,6 +91,9 @@ export interface BotDictionaryContextEntry {
   partOfSpeech?: string | null;
   comments?: string;
   source?: string;
+  kind?: WordKind;
+  literalTranslation?: string;
+  senses?: WordSense[];
 }
 
 export interface BotMentionOptions {
@@ -335,7 +339,7 @@ export class OpenaiService {
       ? `\nНАЙДЕННЫЕ СЛОВА В СЛОВАРЕ (используй для ответов и для выбора существующей записи при исправлении):\n${dictionaryEntries
           .map((e) => {
             const pos = e.partOfSpeech ? ` (${e.partOfSpeech})` : '';
-            return `${e.word} = ${e.translation}${pos}${e.comments ? `; примечание: ${e.comments}` : ''}${e.source ? `; источник: ${e.source}` : ''}`;
+            return `${e.word} = ${e.translation}${pos}${e.literalTranslation ? `; буквально: ${e.literalTranslation}` : ''}${e.kind && e.kind !== 'word' ? `; тип: ${e.kind === 'idiom' ? 'фразеологизм' : 'пословица/поговорка'}` : ''}${e.comments ? `; примечание: ${e.comments}` : ''}${e.source ? `; источник: ${e.source}` : ''}`;
           })
           .join('\n')}\n`
       : '';
@@ -379,6 +383,7 @@ ${BOT_TIME_INSTRUCTION}
 Во всех остальных полях возвращай пустой массив или null. Если данных для действия недостаточно, выбери reply и задай конкретный уточняющий вопрос в message.
 
 Просьба «замени/исправь/поменяй перевод ... на ...» — update_words: translation содержит полный новый перевод, который заменит все старые значения. Не присоединяй старые значения и не выбирай add_words. Если меняется только перевод, newWord и partOfSpeech оставь null. Просьба «добавь ещё значение» — add_words, она дополняет существующий перевод.
+Значение слова и пример употребления — разные данные. Никогда не превращай просьбу перенести/добавить/изменить пример, изменить отдельное значение по номеру, отложить запись или изменить её тип в add_words/update_words/delete_words. Такие команды обрабатывает отдельный обработчик. Если он не распознал формулировку, выбери reply и предложи явный формат: «Баласи, перенеси «авара дурмах» в запись слова «авара» как пример к значению 1», «Баласи, измени значение 3 слова «аваралых» на «ерунда»», «Баласи, измени перевод примера «авара дурмах» у слова «авара» в значении 1 на «бездельничать»», «Баласи, отложи запись «авария»: до решения о заимствованиях». Тип записи (фразеологизм, пословица/поговорка) не является частью речи. Части речи не выводи из русского перевода. Пересланные предложения, цитаты и обсуждения сами по себе не являются командами на изменение.
 Для короткого «замени перевод на ...» определи oldWord по сообщению, на которое отвечают, или однозначному контексту. Если возможны несколько слов (например, ответ на партию без номера или слова), выбери reply и уточни слово. Не считай слово «перевод» названием словарной записи. Вопрос «как заменить перевод» сам по себе не является просьбой изменить запись.
 Итоги разбора партий сохраняет отдельный обработчик явных сообщений координаторов. У тебя нет действия для изменения или чтения статуса проверки: не утверждай, что отметил слово или партию разобранными, и не делай такой вывод из обсуждения, срока или исправленного перевода. При просьбе подвести итог выбери reply и предложи явный формат: «Баласи, партия №5 разобрана», «Баласи, партия №5 разобрана, кроме слов 3 и 7» или «Баласи, в партии №5 разобраны слова 1, 2 и 4».
 Для слов используй нижний регистр, не выдумывай переводы и сохраняй все явно указанные значения. Для массового удаления без списка максимум из 10 конкретных слов выбери reply.
@@ -694,6 +699,11 @@ ${forcedActionInstruction}
             partOfSpeech: entry.partOfSpeech ?? null,
             ...(entry.comments ? { comments: entry.comments } : {}),
             ...(entry.source ? { source: entry.source } : {}),
+            ...(entry.kind ? { kind: entry.kind } : {}),
+            ...(entry.literalTranslation
+              ? { literalTranslation: entry.literalTranslation }
+              : {}),
+            ...(entry.senses ? { senses: entry.senses } : {}),
           },
         ]),
       ).values(),

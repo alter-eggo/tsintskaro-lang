@@ -752,6 +752,7 @@ export class WordReviewService {
   private reviewWordQuery(cutoff?: Date | null) {
     const query = this.wordRepo.createQueryBuilder('word');
     if (cutoff) query.where('word.createdAt <= :cutoff', { cutoff });
+    query.andWhere("word.status = 'active'");
     return query;
   }
 

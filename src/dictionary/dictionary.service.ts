@@ -1,8 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, IsNull, Repository } from 'typeorm';
 import { Word, type WordSource } from './entities/word.entity';
 import { WordTranslationHistory } from './entities/word-translation-history.entity';
+import {
+  assertEditableWord,
+  DictionaryContentError,
+  WordKind,
+  WordSense,
+} from './dictionary-content';
+import { DictionaryEdit } from './dictionary-edit-input';
+import { DictionaryActor, DictionaryEditor } from './dictionary-editor';
 import { compareTsintskaroWords } from './tsintskaro-alphabet';
 import { assertCanEditTranslations } from './translation-permissions';
 
@@ -12,6 +20,9 @@ export interface DictionaryEntry {
   partOfSpeech?: string;
   comments?: string;
   source?: WordSource;
+  senses?: WordSense[];
+  kind?: WordKind;
+  literalTranslation?: string;
 }
 
 export interface UpsertWordInput {
@@ -54,6 +65,7 @@ export interface UpdateWordInput {
   translation?: string | null;
   partOfSpeech?: string | null;
   updatedBy?: string | null;
+  userId?: number;
 }
 
 export interface DictionaryLeaderboardEntry {
@@ -84,6 +96,19 @@ export class DictionaryService {
     @InjectRepository(Word)
     private readonly wordRepo: Repository<Word>,
   ) {}
+
+  async editRecord(edit: DictionaryEdit, actor: DictionaryActor) {
+    const result = await new DictionaryEditor(this.wordRepo).apply(edit, actor);
+    this.invalidateCache();
+    return result;
+  }
+
+  async getDeferredRecords(): Promise<Word[]> {
+    return this.wordRepo.find({
+      where: { status: 'deferred' },
+      order: { word: 'ASC' },
+    });
+  }
 
   private invalidateCache() {
     this.cache = null;
@@ -249,30 +274,63 @@ export class DictionaryService {
     )
       return;
     const rows = await this.wordRepo.find();
-    const entries: DictionaryEntry[] = rows.map((r) => ({
+    const activeRows = rows.filter((r) => !r.status || r.status === 'active');
+    const entries: DictionaryEntry[] = activeRows.map((r) => ({
       word: r.word,
       translation: r.translation,
       partOfSpeech: r.partOfSpeech ?? undefined,
       comments: r.comments ?? undefined,
       source: r.source,
+      ...(r.senses?.length ? { senses: r.senses } : {}),
+      ...(r.kind && r.kind !== 'word' ? { kind: r.kind } : {}),
+      ...(r.literalTranslation
+        ? { literalTranslation: r.literalTranslation }
+        : {}),
     }));
     entries.sort((a, b) => compareTsintskaroWords(a.word, b.word));
     this.cache = entries;
     this.cacheById = new Map(entries.map((e) => [e.word, e]));
     this.cacheByFolded = new Map();
     this.maxDictionaryPhraseWords = 1;
-    for (const entry of entries) {
-      const folded = this.foldWordForLookup(entry.word);
+    const aliases = entries.flatMap((entry) => [
+      { phrase: entry.word, entry },
+      ...(entry.senses ?? []).flatMap((s) =>
+        s.examples.flatMap((e) =>
+          [e.phrase, ...(e.aliases ?? [])].map((phrase) => ({ phrase, entry })),
+        ),
+      ),
+    ]);
+    const byName = new Map(entries.map((entry) => [entry.word, entry]));
+    const byId = new Map(
+      activeRows.map((row) => [row.id, byName.get(row.word)!]),
+    );
+    for (const row of rows) {
+      if (
+        (row.status === 'embedded' || row.status === 'merged') &&
+        byId.has(row.relatedWordId)
+      )
+        aliases.push({ phrase: row.word, entry: byId.get(row.relatedWordId)! });
+    }
+    const exactAliases = new Map<string, Set<DictionaryEntry>>();
+    for (const { phrase, entry } of aliases) {
+      const normalized = this.normalizeWordInput(phrase);
+      const exactMatches = exactAliases.get(normalized) ?? new Set();
+      exactMatches.add(entry);
+      exactAliases.set(normalized, exactMatches);
+      const folded = this.foldWordForLookup(phrase);
       if (folded) {
-        this.cacheByFolded.set(folded, [
-          ...(this.cacheByFolded.get(folded) ?? []),
-          entry,
-        ]);
+        const matches = this.cacheByFolded.get(folded) ?? [];
+        if (!matches.includes(entry)) matches.push(entry);
+        this.cacheByFolded.set(folded, matches);
       }
       this.maxDictionaryPhraseWords = Math.max(
         this.maxDictionaryPhraseWords,
-        this.tokenizeLookupText(entry.word).length,
+        this.tokenizeLookupText(phrase).length,
       );
+    }
+    for (const [phrase, matches] of exactAliases) {
+      if (!this.cacheById.has(phrase) && matches.size === 1)
+        this.cacheById.set(phrase, [...matches][0]);
     }
     this.maxDictionaryPhraseWords = Math.min(this.maxDictionaryPhraseWords, 8);
     this.cacheLoadedAt = Date.now();
@@ -291,7 +349,12 @@ export class DictionaryService {
   }
 
   formatEntriesForPrompt(entries: DictionaryEntry[]): string {
-    return entries.map((e) => `${e.word} = ${e.translation}`).join('\n');
+    return entries
+      .map(
+        (e) =>
+          `${e.word} = ${e.translation}${e.literalTranslation ? `; буквально: ${e.literalTranslation}` : ''}`,
+      )
+      .join('\n');
   }
 
   async findRelevantForPrompt(
@@ -375,9 +438,7 @@ export class DictionaryService {
     const folded = this.foldWordForLookup(normalized);
     if (!folded) return undefined;
 
-    const candidates = this.cache!.filter(
-      (entry) => this.foldWordForLookup(entry.word) === folded,
-    );
+    const candidates = this.cacheByFolded!.get(folded) ?? [];
     return candidates.length === 1 ? candidates[0] : undefined;
   }
 
@@ -397,7 +458,9 @@ export class DictionaryService {
         entry.translation,
       );
 
-      const parts = entry.translation
+      const parts = [entry.translation, entry.literalTranslation]
+        .filter(Boolean)
+        .join('; ')
         .split(/\s*(?:;|,|\/|\n)\s*/g)
         .map((part) => this.normalizeTranslationForCompare(part))
         .filter((part) => part.length > 0);
@@ -467,21 +530,38 @@ export class DictionaryService {
       return { deleted: [], notFound: [] };
     }
 
-    const existing = await this.wordRepo.find({
-      where: { word: In(normalized) },
-      select: { word: true },
+    const result = await this.wordRepo.manager.transaction(async (manager) => {
+      await manager.query(
+        "SELECT pg_advisory_xact_lock(hashtext('tsintskaro.dictionary-edits'))",
+      );
+      const repo = manager.getRepository(Word);
+      const existing = await repo
+        .createQueryBuilder('word')
+        .where('word.word IN (:...names)', { names: normalized })
+        .orderBy('word.id', 'ASC')
+        .setLock('pessimistic_write')
+        .getMany();
+      if (
+        existing.some((e) => e.status === 'embedded' || e.status === 'merged')
+      )
+        throw new DictionaryContentError(
+          'Выражение уже перенесено. Изменяй пример в основной записи.',
+        );
+      const existingSet = new Set(
+        existing.filter((e) => e.status !== 'deleted').map((e) => e.word),
+      );
+
+      const deleted = normalized.filter((w) => existingSet.has(w));
+      const notFound = normalized.filter((w) => !existingSet.has(w));
+
+      if (deleted.length > 0) {
+        await repo.update({ word: In(deleted) }, { status: 'deleted' });
+      }
+
+      return { deleted, notFound };
     });
-    const existingSet = new Set(existing.map((e) => e.word));
-
-    const deleted = normalized.filter((w) => existingSet.has(w));
-    const notFound = normalized.filter((w) => !existingSet.has(w));
-
-    if (deleted.length > 0) {
-      await this.wordRepo.delete({ word: In(deleted) });
-      this.invalidateCache();
-    }
-
-    return { deleted, notFound };
+    this.invalidateCache();
+    return result;
   }
 
   async replaceTranslation(
@@ -508,6 +588,11 @@ export class DictionaryService {
             lock: { mode: 'pessimistic_write' },
           });
           if (!current) return { status: 'not_found', word };
+          assertEditableWord(current);
+          if (current.senses?.length)
+            throw new DictionaryContentError(
+              'В записи есть отдельные значения и примеры. Укажи номер значения: «Баласи, измени значение 3 слова «аваралых» на «ерунда»».',
+            );
           const previousTranslation = current.translation;
           if (previousTranslation === translation) {
             return {
@@ -573,6 +658,12 @@ export class DictionaryService {
     }
 
     const currentWord = resolvedOld.entity;
+    const previousTranslation = currentWord.translation;
+    assertEditableWord(currentWord);
+    if (translation && currentWord.senses?.length)
+      throw new DictionaryContentError(
+        'В записи есть отдельные значения и примеры. Измени нужное значение по номеру.',
+      );
     const targetWord = normalizedNewWord ?? currentWord.word;
     const resolvedOldWord = currentWord.word;
 
@@ -585,15 +676,13 @@ export class DictionaryService {
         const target = resolvedTarget.entity;
         // Merging removes an existing entry and can discard its meanings.
         assertCanEditTranslations(input.updatedBy);
-        if (translation) {
-          target.translation = translation;
-        }
-        if (input.partOfSpeech !== undefined) {
-          target.partOfSpeech = input.partOfSpeech;
-        }
-        target.source = 'chat';
-        const saved = await this.wordRepo.save(target);
-        await this.wordRepo.delete({ id: currentWord.id });
+        const saved = await new DictionaryEditor(this.wordRepo).merge(
+          currentWord.id,
+          target.id,
+          { username: input.updatedBy!, userId: input.userId },
+          translation ?? undefined,
+          input.partOfSpeech,
+        );
         this.invalidateCache();
         return {
           status: 'merged',
@@ -615,8 +704,14 @@ export class DictionaryService {
 
     // A spelling/POS edit must not write back a stale translation that another
     // participant read before an authorized editor changed it.
-    await this.wordRepo.update(
-      { id: currentWord.id },
+    const updated = await this.wordRepo.update(
+      {
+        id: currentWord.id,
+        status: In(['active', 'deferred']),
+        ...(translation
+          ? { translation: previousTranslation, senses: IsNull() }
+          : {}),
+      },
       {
         word: targetWord,
         source: 'chat',
@@ -626,6 +721,10 @@ export class DictionaryService {
           : {}),
       },
     );
+    if (updated.affected === 0)
+      throw new DictionaryContentError(
+        'Запись изменилась одновременно с этой командой. Перечитай её и повтори исправление.',
+      );
     this.invalidateCache();
 
     return {
@@ -641,11 +740,20 @@ export class DictionaryService {
     const existing = await this.resolveWordEntityForUpsert(normalizedWord);
 
     if (existing) {
+      assertEditableWord(existing);
+      if (
+        existing.senses?.length &&
+        input.translation.trim() !== existing.translation
+      )
+        throw new DictionaryContentError(
+          'У этой записи значения хранятся отдельно. Добавь значение с номером или пример к существующему значению.',
+        );
       const translationMerge = this.mergeTranslations(
         existing.translation,
         input.translation,
       );
       const translationAdded = translationMerge.added !== undefined;
+      const previousTranslation = existing.translation;
       if (translationAdded) {
         assertCanEditTranslations(input.addedBy);
         existing.translation = translationMerge.merged;
@@ -661,10 +769,28 @@ export class DictionaryService {
       }
 
       let saved = existing;
-      if (translationAdded) saved = await this.wordRepo.save(existing);
-      else
+      if (translationAdded) {
+        const updated = await this.wordRepo.update(
+          {
+            id: existing.id,
+            translation: previousTranslation,
+            senses: IsNull(),
+            status: In(['active', 'deferred']),
+          },
+          {
+            translation: existing.translation,
+            ...(partOfSpeechAdded
+              ? { partOfSpeech: existing.partOfSpeech }
+              : {}),
+          },
+        );
+        if (updated.affected === 0)
+          throw new DictionaryContentError(
+            'Запись изменилась одновременно с этой командой. Повтори добавление значения.',
+          );
+      } else
         await this.wordRepo.update(
-          { id: existing.id },
+          { id: existing.id, status: In(['active', 'deferred']) },
           { partOfSpeech: existing.partOfSpeech },
         );
       this.invalidateCache();
