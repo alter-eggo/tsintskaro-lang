@@ -42,7 +42,7 @@ export function sameText(a: string, b: string): boolean {
 export function parseLegacySenses(translation: string): WordSense[] {
   const text = translation.trim();
   const markers = [...text.matchAll(/(?:^|[;\n]\s*|\s+)(\d+)[).]\s+/g)];
-  if (!/^1[).]\s/.test(text))
+  if (!/^\d+[).]\s/.test(text))
     return [{ translation: text || null, examples: [] }];
   if (markers.some((m, i) => Number(m[1]) !== i + 1)) {
     throw new DictionaryContentError(

@@ -21,6 +21,9 @@ const {
 const { DictionaryService } = require('../src/dictionary/dictionary.service');
 const { DictionaryEditor } = require('../src/dictionary/dictionary-editor');
 const { renderSenses } = require('../src/dictionary/dictionary-content');
+const {
+  parseDictionaryEdit,
+} = require('../src/dictionary/dictionary-edit-input');
 
 async function main() {
   const env = { ...parseEnv(fs.readFileSync('.env', 'utf8')), ...process.env };
@@ -109,6 +112,31 @@ async function main() {
       root.id,
     );
     assert.equal((await editor.apply(move, actor)).status, 'unchanged');
+
+    await seed('проверка вариантов', '1) безделье; 2) перерыв');
+    const numberedVariant = parseDictionaryEdit(
+      'Баласи, добавь вариант перевода: проверка вариантов - 3) ерунда.',
+    );
+    await dictionary.editRecord(numberedVariant, { ...actor, messageId: 100 });
+    const ordered = await repo.findOneByOrFail({ word: 'проверка вариантов' });
+    assert.equal(ordered.translation, '1) безделье; 2) перерыв; 3) ерунда');
+    assert.deepEqual(
+      ordered.senses.map((s) => s.translation),
+      ['безделье', 'перерыв', 'ерунда'],
+    );
+    await assert.rejects(
+      editor.apply({ ...numberedVariant, sense: 5 }, actor),
+      /номера не пропускаются/,
+    );
+    await assert.rejects(
+      editor.apply({ ...numberedVariant, sense: 1 }, actor),
+      /уже заполнено/,
+    );
+    await dictionary.editRecord(numberedVariant, { ...actor, messageId: 100 });
+    assert.equal(
+      (await repo.findOneByOrFail({ id: ordered.id })).translation,
+      ordered.translation,
+    );
 
     await seed('аваралых', '1) безделье; 2) перерыв');
     await seed('аваралых этмах', 'бездельничать');

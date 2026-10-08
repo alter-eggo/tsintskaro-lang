@@ -2,6 +2,7 @@ import { TelegramUpdate } from './telegram.update';
 import { WordReviewDecisionError } from '../word-review/word-review-decision';
 import { DictionaryService } from '../dictionary/dictionary.service';
 import { TRANSLATION_EDIT_DENIED } from '../dictionary/translation-permissions';
+import { DictionaryContentError } from '../dictionary/dictionary-content';
 
 describe('TelegramUpdate bot mentions', () => {
   const makeUpdate = (senderUsername = 'AAlxnv') => {
@@ -196,6 +197,51 @@ describe('TelegramUpdate bot mentions', () => {
       config,
     };
   };
+
+  it('routes Edik’s numbered variant command to the meaning editor', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'add_words',
+      entries: [
+        { word: 'аваралых', translation: '3) ерунда', partOfSpeech: null },
+      ],
+    } as any);
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, добавь вариант перевода: Аваралых - 3) ерунда.',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.editRecord).toHaveBeenCalledWith(
+      {
+        type: 'set_sense',
+        word: 'Аваралых',
+        sense: 3,
+        translation: 'ерунда',
+        createSense: true,
+      },
+      expect.objectContaining({ username: 'Elvardi', userId: 42 }),
+    );
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
+  });
+
+  it('explains how to edit a numbered meaning rejected by the flat merge', async () => {
+    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
+    dictionaryService.upsertWord.mockRejectedValueOnce(
+      new DictionaryContentError('Укажи номер значения.'),
+    );
+    await (update as any).handleDictionaryAdditions(ctx, -100, 'Elvardi', 123, [
+      { word: 'аваралых', translation: '3) ерунда' },
+    ]);
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('аваралых: Укажи номер значения.'),
+      expect.anything(),
+    );
+  });
 
   it('stores the requested part of speech separately from the translation', async () => {
     const { update, ctx, dictionaryService, openaiService } =

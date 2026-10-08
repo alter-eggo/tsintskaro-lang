@@ -135,6 +135,32 @@ describe('DictionaryService word upserts', () => {
     return { service: new DictionaryService(repo as any), repo };
   };
 
+  it.each([
+    ['1) безделье; 2) перерыв', '3) ерунда'],
+    ['1) безделье; 2) перерыв', 'ерунда'],
+    ['безделье', '2) ерунда'],
+  ])(
+    'rejects numbered meanings in the flat translation merger: %s + %s',
+    async (existing, incoming) => {
+      const row = {
+        id: 1,
+        word: 'аваралых',
+        translation: existing,
+        partOfSpeech: null,
+      };
+      const { service, repo } = makeService([row]);
+      await expect(
+        service.upsertWord({
+          word: 'аваралых',
+          translation: incoming,
+          addedBy: 'Elvardi',
+        }),
+      ).rejects.toThrow('номер');
+      expect(repo.update).not.toHaveBeenCalled();
+      expect(row.translation).toBe(existing);
+    },
+  );
+
   it('recognizes an existing word with mixed Latin and Cyrillic letters', async () => {
     const existing = {
       id: 1,

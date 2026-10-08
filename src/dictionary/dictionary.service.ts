@@ -181,6 +181,14 @@ export class DictionaryService {
       return { merged: current };
     }
 
+    if (
+      [current, next].some((text) => /(?:^|[;\n]\s*|\s+)\d+[).]\s/.test(text))
+    ) {
+      throw new DictionaryContentError(
+        'Для нумерованных значений укажи номер отдельно. Например: «Баласи, добавь вариант перевода: аваралых — 3) ерунда». Существующие значения сохранены.',
+      );
+    }
+
     const existingParts = new Set(
       this.splitTranslationParts(current).map(({ normalized }) => normalized),
     );

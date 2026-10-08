@@ -1695,6 +1695,10 @@ export class TelegramUpdate implements OnModuleInit {
         lines.push(
           `⚠️ не получилось сохранить: ${failed.map((f) => f.word).join(', ')}`,
         );
+        for (const failure of failed) {
+          if (failure.err instanceof DictionaryContentError)
+            lines.push(`• ${failure.word}: ${failure.err.message}`);
+        }
       }
 
       if (denied.length > 0) {

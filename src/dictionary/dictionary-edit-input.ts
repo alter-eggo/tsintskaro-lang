@@ -60,6 +60,37 @@ export function parseDictionaryEdit(
     .replace(/^\s*(?:бот|баласи)[\s,:!.—-]+/i, '')
     .trim();
   let m: RegExpMatchArray | null;
+  // The familiar "add translation variant" wording may specify a numbered
+  // meaning. Keep its number out of the legacy, unstructured translation merge.
+  const variant = text.match(
+    /^добавь\s+(?:новый\s+)?вариант\s+перевода\s*:\s*([\s\S]+)$/i,
+  );
+  if (variant) {
+    m = variant[1].match(
+      new RegExp(
+        `^(?:${Q}|([^«»"“”\\n]+?))\\s*[-—–:]\\s*(\\d+)[).]\\s+([^\\n]+?)${END}`,
+        'i',
+      ),
+    );
+    if (m) {
+      const word = (m[1] ?? m[2]).trim();
+      const translation = m[4]
+        .trim()
+        .replace(/[.!]+$/, '')
+        .trim();
+      if (!word || !translation || /(?:^|[;\s])\d+[).]\s/.test(translation))
+        return 'invalid';
+      return {
+        type: 'set_sense',
+        word,
+        sense: Number(m[3]),
+        translation,
+        createSense: true,
+      };
+    }
+    // An incomplete or multi-meaning numbered request must not fall through to AI.
+    if (/\d+[).]/.test(variant[1])) return 'invalid';
+  }
   m = text.match(
     new RegExp(
       `^перенеси\\s+${Q}\\s+в\\s+(?:запись(?:\\s+слова)?|слово|статью)\\s+${Q}\\s+как\\s+пример\\s+к\\s+(новому\\s+)?значению\\s+(\\d+)([\\s\\S]*)$`,

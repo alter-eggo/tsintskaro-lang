@@ -3,6 +3,20 @@ import { getSenses, mergeSenses, renderSenses } from './dictionary-content';
 import { extractPartOfSpeech } from './dictionary-input';
 
 describe('dictionary record commands', () => {
+  it.each([
+    'Баласи, добавь вариант перевода: Аваралых - 3) ерунда.',
+    'Баласи, добавь вариант перевода:\nАваралых — 3) ерунда.',
+    'добавь новый вариант перевода: «Аваралых» – 3. ерунда',
+  ])('keeps the number in a familiar variant command: %s', (text) => {
+    expect(parseDictionaryEdit(text)).toEqual({
+      type: 'set_sense',
+      word: 'Аваралых',
+      sense: 3,
+      translation: 'ерунда',
+      createSense: true,
+    });
+  });
+
   it('parses Edik’s two transfers without inventing a gloss or part of speech', () => {
     expect(
       parseDictionaryEdit(
@@ -64,6 +78,9 @@ describe('dictionary record commands', () => {
     'Баласи, перенеси «авара дурмах» в запись «авара» как пример к значению 1. И удали всё.',
     'Баласи, измени значение 3 на ерунда',
     'Баласи, исправь: авара дурмах — перенести как пример слова авара',
+    'Баласи, добавь вариант перевода: Аваралых — 3)',
+    'Баласи, добавь вариант перевода: Аваралых — 3) ерунда; 4) другое',
+    'Баласи, добавь вариант перевода: Аваралых — 3) ерунда\nАвас — 2) восхищение',
   ])(
     'rejects incomplete or mixed commands rather than adding text: %s',
     (text) => expect(parseDictionaryEdit(text)).toBe('invalid'),
@@ -75,6 +92,8 @@ describe('dictionary record commands', () => {
     'Баласи, не переноси «авара дурмах»',
     'Эдик сказал: перенеси «авара дурмах» в запись «авара» как пример к значению 1',
     'агошка — окно, комментарий — нет',
+    'Эдик написал: Баласи, добавь вариант перевода: Аваралых - 3) ерунда.',
+    'Баласи, надо ли добавить вариант перевода: Аваралых — 3) ерунда?',
   ])('does not treat discussion as an edit: %s', (text) =>
     expect(parseDictionaryEdit(text)).toBeNull(),
   );
@@ -100,6 +119,9 @@ describe('meanings and examples', () => {
     expect(() => getSenses({ translation: '1) безделье; 3) перерыв' })).toThrow(
       'Нумерация',
     );
+    expect(() =>
+      getSenses({ translation: '3) ерунда; 1) безделье; 2) перерыв' }),
+    ).toThrow('Нумерация');
   });
   it('prints a blank meaning with its example and keeps POS at its own meaning', () => {
     expect(
