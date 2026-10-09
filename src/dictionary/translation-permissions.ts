@@ -2,10 +2,11 @@ const TRANSLATION_EDITORS = new Set([
   'joanofarc74',
   'ekaterina_karaasheva',
   'elvardi',
+  'aalxnv',
 ]);
 
 export const TRANSLATION_EDIT_DENIED =
-  'Изменять переводы существующих слов могут только @joanofarc74, @ekaterina_karaasheva и @Elvardi.';
+  'Изменять переводы существующих слов могут только @joanofarc74, @ekaterina_karaasheva, @Elvardi и @aalxnv.';
 
 /** The caller must supply the current sender's Telegram username, never message text. */
 export function canEditTranslations(

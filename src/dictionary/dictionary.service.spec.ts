@@ -311,7 +311,7 @@ describe('translation permissions on other dictionary writes', () => {
     return { service: new DictionaryService(repo as any), repo, rows };
   };
 
-  it.each(['AAlxnv', 'participant', undefined])(
+  it.each(['participant', undefined])(
     'blocks appending meanings through upsert for %s',
     async (addedBy) => {
       const f = makeWriter();
@@ -328,7 +328,7 @@ describe('translation permissions on other dictionary writes', () => {
     },
   );
 
-  it.each(['joanofarc74', 'ekaterina_karaasheva', 'Elvardi'])(
+  it.each(['joanofarc74', 'ekaterina_karaasheva', 'Elvardi', 'AAlxnv'])(
     'allows appending meanings for %s',
     async (addedBy) => {
       const f = makeWriter();
@@ -371,7 +371,7 @@ describe('translation permissions on other dictionary writes', () => {
         f.service.updateWord({
           oldWord: 'ширин',
           ...changes,
-          updatedBy: 'AAlxnv',
+          updatedBy: 'participant',
         }),
       ).rejects.toThrow(TranslationEditForbiddenError);
       expect(f.rows).toEqual(before);
@@ -527,6 +527,9 @@ describe('DictionaryService explicit translation replacement', () => {
     'EKATERINA_KARAASHEVA',
     'elvardi',
     'Elvardi',
+    'aalxnv',
+    'AAlxnv',
+    'AALXNV',
   ])('allows replacement by the named editor %s', async (username) => {
     const f = makeReplacement();
     expect(
@@ -537,13 +540,14 @@ describe('DictionaryService explicit translation replacement', () => {
 
   it.each([
     'participant',
-    'AAlxnv',
     'MEMazmanova',
     undefined,
     null,
     '',
     'joanofarc74_fake',
     '@joanofarc74',
+    'aalxnv_fake',
+    '@aalxnv',
     'ekaterina\\_karaasheva',
   ])(
     'rejects replacement by any other username, including existing admins: %s',
