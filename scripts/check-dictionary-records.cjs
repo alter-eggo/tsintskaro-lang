@@ -21,9 +21,7 @@ const {
 const { DictionaryService } = require('../src/dictionary/dictionary.service');
 const { DictionaryEditor } = require('../src/dictionary/dictionary-editor');
 const { renderSenses } = require('../src/dictionary/dictionary-content');
-const {
-  parseDictionaryEdit,
-} = require('../src/dictionary/dictionary-edit-input');
+const { actionWords } = require('../src/dictionary/dictionary-actions');
 
 async function main() {
   const env = { ...parseEnv(fs.readFileSync('.env', 'utf8')), ...process.env };
@@ -114,9 +112,13 @@ async function main() {
     assert.equal((await editor.apply(move, actor)).status, 'unchanged');
 
     await seed('проверка вариантов', '1) безделье; 2) перерыв');
-    const numberedVariant = parseDictionaryEdit(
-      'Баласи, добавь вариант перевода: проверка вариантов - 3) ерунда.',
-    );
+    const numberedVariant = {
+      type: 'set_sense',
+      word: 'проверка вариантов',
+      sense: 3,
+      translation: 'ерунда',
+      createSense: true,
+    };
     await dictionary.editRecord(numberedVariant, { ...actor, messageId: 100 });
     const ordered = await repo.findOneByOrFail({ word: 'проверка вариантов' });
     assert.equal(ordered.translation, '1) безделье; 2) перерыв; 3) ерунда');
@@ -350,6 +352,163 @@ async function main() {
       (await repo.findOneByOrFail({ word: 'ахгыран' })).senses[1].partOfSpeech,
       'прилагательное',
     );
+    // Model-generated plans execute atomically against the versions actually read.
+    const planRoot = await seed('план основа', 'значение');
+    const planA = await seed('план пример а', 'перевод а');
+    const planB = await seed('план пример б', 'перевод б');
+    const operations = [
+      {
+        type: 'move_example',
+        word: planA.word,
+        target: planRoot.word,
+        sense: 1,
+      },
+      {
+        type: 'move_example',
+        word: planB.word,
+        target: planRoot.word,
+        sense: 1,
+        translation: 'уточнённый перевод б',
+      },
+    ];
+    const snapshots = await dictionary.inspectRecords(actionWords(operations));
+    const priorHistory = await history.count();
+    await assert.rejects(
+      dictionary.applyActions(
+        [operations[0], { ...operations[1], sense: 99 }],
+        { ...actor, messageId: 2001 },
+        snapshots,
+      ),
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: planA.id })).status,
+      'active',
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: planRoot.id })).senses,
+      null,
+    );
+    assert.equal(await history.count(), priorHistory);
+    await assert.rejects(
+      dictionary.applyActions(
+        operations,
+        { ...actor, canRemoveEntry: false },
+        snapshots,
+      ),
+    );
+    await assert.rejects(
+      dictionary.applyActions(
+        operations,
+        { ...actor, username: 'participant' },
+        snapshots,
+      ),
+    );
+    await assert.rejects(
+      dictionary.applyActions(operations, actor, []),
+      /не проверена/,
+    );
+    await dictionary.applyActions(
+      operations,
+      { ...actor, messageId: 2001 },
+      snapshots,
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: planRoot.id })).senses[0].examples
+        .length,
+      2,
+    );
+    assert.equal((await dictionary.findWord(planA.word)).word, planRoot.word);
+    assert.equal((await dictionary.findWord(planB.word)).word, planRoot.word);
+    const replay = await dictionary.applyActions(
+      operations,
+      { ...actor, messageId: 2001 },
+      snapshots,
+    );
+    assert.equal(replay.unchanged, true);
+    assert.equal(
+      (await repo.findOneByOrFail({ id: planRoot.id })).senses[0].examples
+        .length,
+      2,
+    );
+    const stale = await dictionary.inspectRecords([planRoot.word]);
+    await repo.update(planRoot.id, { partOfSpeech: 'существительное' });
+    await assert.rejects(
+      dictionary.applyActions(
+        [
+          {
+            type: 'set_sense',
+            word: planRoot.word,
+            sense: 1,
+            translation: 'другой',
+          },
+        ],
+        actor,
+        stale,
+      ),
+      /изменилась/,
+    );
+    const mixed = [
+      { type: 'add_word', word: 'план новое', translation: 'первый перевод' },
+      {
+        type: 'set_sense',
+        word: 'план новое',
+        sense: 2,
+        createSense: true,
+        translation: 'второй перевод',
+      },
+      {
+        type: 'set_kind',
+        word: 'план новое',
+        kind: 'idiom',
+        literalTranslation: 'буквальное значение',
+      },
+      { type: 'update_word', word: 'план новое', newWord: 'план исправленное' },
+      {
+        type: 'set_status',
+        word: 'план исправленное',
+        status: 'deferred',
+        reason: 'обсуждается',
+      },
+    ];
+    await dictionary.applyActions(
+      mixed,
+      { ...actor, messageId: 2002 },
+      await dictionary.inspectRecords(actionWords(mixed)),
+    );
+    const mixedRow = await repo.findOneByOrFail({ word: 'план исправленное' });
+    assert.equal(mixedRow.status, 'deferred');
+    assert.equal(mixedRow.kind, 'idiom');
+    assert.equal(mixedRow.senses.length, 2);
+    const forbiddenAdd = [
+      {
+        type: 'add_word',
+        word: 'план новый участник',
+        translation: 'новое слово',
+      },
+      { type: 'add_word', word: 'аварийа', translation: 'чужое изменение' },
+    ];
+    await assert.rejects(
+      dictionary.applyActions(
+        forbiddenAdd,
+        { ...actor, username: 'participant' },
+        await dictionary.inspectRecords(actionWords(forbiddenAdd)),
+      ),
+    );
+    assert.equal(await repo.findOneBy({ word: 'план новый участник' }), null);
+    const deletion = [{ type: 'delete_word', word: mixedRow.word }];
+    await dictionary.applyActions(
+      deletion,
+      { ...actor, messageId: 2003 },
+      await dictionary.inspectRecords(actionWords(deletion)),
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: mixedRow.id })).status,
+      'deleted',
+    );
+    console.log(
+      'PASS model plans: multi-item rollback, permissions, required reads, stale-version rejection, replay, ordered mixed operations and preserved search.',
+    );
+
     // Execute the website's actual DB functions against this same disposable schema.
     const websiteFile = path.resolve(
       __dirname,

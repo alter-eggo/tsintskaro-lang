@@ -1,12 +1,23 @@
 import { TelegramUpdate } from './telegram.update';
 import { WordReviewDecisionError } from '../word-review/word-review-decision';
-import { DictionaryService } from '../dictionary/dictionary.service';
-import { TRANSLATION_EDIT_DENIED } from '../dictionary/translation-permissions';
 import { DictionaryContentError } from '../dictionary/dictionary-content';
 
 describe('TelegramUpdate bot mentions', () => {
   const makeUpdate = (senderUsername = 'AAlxnv') => {
     const dictionaryService = {
+      applyActions: jest.fn(async (operations, actor, snapshots) => {
+        void actor;
+        void snapshots;
+        return {
+          unchanged: false,
+          words: operations.map((op) => ({
+            word: op.target ?? op.word,
+            translation: '1) безделье; 2) перерыв; 3) ерунда',
+            status: 'active',
+            kind: 'word',
+          })),
+        };
+      }),
       editRecord: jest.fn(async (edit) => ({
         status: 'updated',
         movedWord: edit.type === 'move_example' ? edit.word : undefined,
@@ -198,897 +209,147 @@ describe('TelegramUpdate bot mentions', () => {
     };
   };
 
-  it('routes Edik’s numbered variant command to the meaning editor', async () => {
+  it.each([
+    'Баласи, исправь:\n1. аваралых этмах — бездельничать, комментарий - заниматься ерундой; не имеет самостоятельного значения, необходимо перенести как пример слова аваралых\n2. авара дурмах — бездельничать (гл.), комментарий - не имеет самостоятельного значения, необходимо перенести как пример слова авара',
+    'Баласи, перенеси «авара дурмах» в запись «авара» как пример к значению 1.',
+    'Баласи, добавь вариант перевода: Аваралых - 3) ерунда.',
+    'Баласи, авара дурмах пусть будет примером у авара, там где бездельник',
+    'Баласи, исправь: аванс — удалить',
+    'Баласи, слово «удалить» переведи как «позмах» и внеси в словарь',
+  ])('sends arbitrary dictionary wording to the model: %s', async (text) => {
     const { update, ctx, dictionaryService, openaiService } =
       makeUpdate('Elvardi');
+    await (update as any).handleBotMention(ctx, text, 'Elvardi', 123, null);
+    expect(
+      (openaiService.processBotMention as jest.Mock).mock.calls[0][0],
+    ).toBe(text);
+    expect(dictionaryService.applyActions).not.toHaveBeenCalled();
+    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
+    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
+    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
+  });
+
+  it('saves a multi-item model plan once with actual sender identity', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    const operations = [
+      {
+        type: 'move_example',
+        word: 'аваралых этмах',
+        target: 'аваралых',
+        sense: 3,
+        translation: 'заниматься ерундой',
+      },
+      { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+    ];
+    const snapshots = [{ word: 'авара', version: 'read-version' }];
     openaiService.processBotMention.mockResolvedValueOnce({
-      action: 'add_words',
-      entries: [
-        { word: 'аваралых', translation: '3) ерунда', partOfSpeech: null },
-      ],
+      action: 'dictionary_actions',
+      operations,
+      snapshots,
     } as any);
     await (update as any).handleBotMention(
       ctx,
-      'Баласи, добавь вариант перевода: Аваралых - 3) ерунда.',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.editRecord).toHaveBeenCalledWith(
-      {
-        type: 'set_sense',
-        word: 'Аваралых',
-        sense: 3,
-        translation: 'ерунда',
-        createSense: true,
-      },
-      expect.objectContaining({ username: 'Elvardi', userId: 42 }),
-    );
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
-  });
-
-  it('explains how to edit a numbered meaning rejected by the flat merge', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
-    dictionaryService.upsertWord.mockRejectedValueOnce(
-      new DictionaryContentError('Укажи номер значения.'),
-    );
-    await (update as any).handleDictionaryAdditions(ctx, -100, 'Elvardi', 123, [
-      { word: 'аваралых', translation: '3) ерунда' },
-    ]);
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('аваралых: Укажи номер значения.'),
-      expect.anything(),
-    );
-  });
-
-  it('stores the requested part of speech separately from the translation', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, добавь:\nбêй — аванс (часть заработка, выдаваемая вперёд), добавить в раздел Часть речи словаря - существительное',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
-      word: 'бêй',
-      translation: 'аванс (часть заработка, выдаваемая вперёд)',
-      partOfSpeech: 'существительное',
-      addedBy: 'Elvardi',
-    });
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-  });
-
-  it('routes a transfer to the atomic editor with the actual sender and deletion permission', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, перенеси «авара дурмах» в запись слова «авара» как пример к значению 1.',
-      'forwarded-display-name',
+      'Баласи, исправь оба пункта',
+      'spoofed-editor',
       123,
       77,
     );
-    expect(dictionaryService.editRecord).toHaveBeenCalledWith(
+    expect(dictionaryService.applyActions).toHaveBeenCalledTimes(1);
+    expect(dictionaryService.applyActions).toHaveBeenCalledWith(
+      operations,
       expect.objectContaining({
-        type: 'move_example',
-        target: 'авара',
-        word: 'авара дурмах',
-        sense: 1,
-      }),
-      {
         userId: 42,
         username: 'Elvardi',
         chatId: -100,
-        threadId: 77,
         messageId: 123,
+        threadId: 77,
         canRemoveEntry: true,
-      },
-    );
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('история сохранена'),
-      expect.anything(),
-    );
-  });
-
-  it.each(['participant', 'AAlxnv'])(
-    'rejects record editing by %s before mutation',
-    async (sender) => {
-      const { update, ctx, dictionaryService } = makeUpdate(sender);
-      await (update as any).handleBotMention(
-        ctx,
-        'Баласи, измени значение 3 слова «аваралых» на «ерунда».',
-        'Elvardi',
-        123,
-        null,
-      );
-      expect(dictionaryService.editRecord).not.toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining(TRANSLATION_EDIT_DENIED),
-      );
-    },
-  );
-
-  it('rejects a forwarded command and an incomplete transfer without AI fallback', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    (ctx.message as any).forward_origin = { type: 'user' };
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, перенеси «авара дурмах» в запись «авара» как пример к значению 1.',
-      'Elvardi',
-      123,
-      null,
-    );
-    delete (ctx.message as any).forward_origin;
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, перенеси «авара дурмах» в «авара».',
-      'Elvardi',
-      124,
-      null,
-    );
-    expect(dictionaryService.editRecord).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-  });
-
-  it('shows deferred records without inventing a dictionary result', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, покажи отложенные записи.',
-      'AAlxnv',
-      123,
-      null,
-    );
-    expect(dictionaryService.getDeferredRecords).toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-  });
-
-  it('corrects a pair and its part of speech without attempting a rename', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправь:\nбêй — аванс (часть заработка, выдаваемая вперёд), добавить в раздел Часть речи словаря - существительное',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
-      oldWord: 'бêй',
-      newWord: null,
-      translation: 'аванс (часть заработка, выдаваемая вперёд)',
-      partOfSpeech: 'существительное',
-      updatedBy: 'Elvardi',
-      userId: 42,
-    });
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-  });
-
-  it('reports a missing explicit correction without adding or asking AI to reinterpret it', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    dictionaryService.replaceTranslation.mockResolvedValueOnce({
-      status: 'not_found',
-      word: 'бêй',
-    } as any);
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправь: бêй — аванс',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
-      expect.objectContaining({ word: 'бêй', translation: 'аванс' }),
-    );
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('не нашёл в словаре: бêй'),
-      expect.anything(),
-    );
-  });
-
-  it.each(['Баласи, исправь:\nаванс — удалить', 'Баласи, удали:\nаванс'])(
-    'lets the actual Elvardi sender delete via %s',
-    async (text) => {
-      const { update, ctx, dictionaryService, openaiService } =
-        makeUpdate('eLvArDi');
-      await (update as any).handleBotMention(ctx, text, 'eLvArDi', 123, null);
-      expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
-      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-      expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-      expect(openaiService.processBotMention).not.toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining('🗑 удалил:'),
-        expect.anything(),
-      );
-    },
-  );
-
-  it.each(['alice', 'joanofarc74'])(
-    'denies deleting for %s even if a supplied display username says Elvardi',
-    async (sender) => {
-      const { update, ctx, dictionaryService } = makeUpdate(sender);
-      Object.assign(ctx.telegram, {
-        getChatMember: jest.fn(async () => ({ status: 'member' })),
-      });
-      await (update as any).handleBotMention(
-        ctx,
-        'Баласи, исправь: аванс — удалить',
-        'Elvardi',
-        123,
-        null,
-      );
-      expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
-      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining('🚫'),
-        expect.anything(),
-      );
-    },
-  );
-
-  it('retains deletion for Telegram administrators', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate('moderator');
-    Object.assign(ctx.telegram, {
-      getChatMember: jest.fn(async () => ({ status: 'administrator' })),
-    });
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, удали: аванс',
-      'moderator',
-      123,
-      null,
-    );
-    expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
-  });
-
-  it('does not grant deletion to an anonymous or bot identity', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
-    Object.assign(ctx.from, { is_bot: true });
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, удали: аванс',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
-  });
-
-  it('handles an explicit correction and deletion in the same list', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправь:\nбêй — аванс, существительное\nаванс — удалить',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.updateWord).toHaveBeenCalledWith(
-      expect.objectContaining({
-        oldWord: 'бêй',
-        translation: 'аванс',
-        partOfSpeech: 'существительное',
       }),
+      snapshots,
     );
-    expect(dictionaryService.deleteWords).toHaveBeenCalledWith(['аванс']);
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Изменения сохранены'),
+      expect.anything(),
+    );
   });
 
-  it.each(['существительное', 'сущ.', 'часть речи — существительное'])(
-    'extracts a separate POS suffix: %s',
-    async (suffix) => {
-      const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
+  it.each([
+    { message: { forward_origin: { type: 'user' } } },
+    { message: { forward_from: { username: 'Elvardi' } } },
+    { message: { sender_chat: { id: -100 } } },
+    { from: { id: 42, username: 'Elvardi', is_bot: true } },
+  ])(
+    'prevents model-proposed mutations from forwarded or anonymous messages: %j',
+    async (overrides) => {
+      const { update, ctx, dictionaryService, openaiService } =
+        makeUpdate('Elvardi');
+      Object.assign(ctx, overrides);
+      openaiService.processBotMention.mockResolvedValueOnce({
+        action: 'dictionary_actions',
+        operations: [{ type: 'delete_word', word: 'авария' }],
+        snapshots: [],
+      } as any);
       await (update as any).handleBotMention(
         ctx,
-        `Баласи, добавь: бêй — аванс, ${suffix}`,
+        'Баласи, удали аварию',
         'Elvardi',
         123,
         null,
       );
-      expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
-        expect.objectContaining({
-          word: 'бêй',
-          translation: 'аванс',
-          partOfSpeech: expect.stringMatching(/^(существительное|сущ\.?)$/),
-        }),
+      expect(dictionaryService.applyActions).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ readOnly: true }),
       );
     },
   );
 
-  it('keeps удалить as a legitimate translation in an explicit addition', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, добавь: сил — удалить',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
-      expect.objectContaining({ word: 'сил', translation: 'удалить' }),
-    );
-    expect(dictionaryService.deleteWords).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    'onSummaryThreadStatus',
-    'onPollStatus',
-    'onReviewStatus',
-    'onFactDayStatus',
-  ] as const)(
-    '%s displays stored timestamps in Moscow time across midnight',
-    async (command) => {
-      const {
-        update,
-        ctx,
-        telegramService,
-        pollConfigService,
-        factDayConfigService,
-        wordReviewService,
-      } = makeUpdate();
-      const target = {
-        chatId: -100,
-        threadId: 44,
-        setBy: 'AAlxnv',
-        setAt: '2026-09-14T21:30:00Z',
-        nextFactIndex: 0,
-        enabled: true,
-        batchSize: 10,
-        nextRunAt: new Date('2026-09-16T05:00:00Z'),
-      };
-      telegramService.getSummaryTarget.mockResolvedValueOnce(target as any);
-      pollConfigService.get.mockResolvedValueOnce(target);
-      factDayConfigService.get.mockResolvedValueOnce(target);
-      wordReviewService.getStatus.mockResolvedValueOnce({
-        target,
-        lastSentAt: new Date('2026-09-14T20:30:00Z'),
-      } as any);
-
-      await update[command](ctx as any);
-
-      const reply = ctx.reply.mock.calls[0][0];
-      expect(reply).toContain('когда: 15.09.2026, 00:30 МСК');
-      expect(reply).not.toMatch(/Asia\/Tbilisi|по Тбилиси|T21:30/);
-      if (command === 'onReviewStatus') {
-        expect(reply).toContain('Последняя отправка: 14.09.2026, 23:30 МСК');
-        expect(reply).toContain('Ближайшая отправка: 16.09.2026, 08:00 МСК');
-        expect(reply).toContain('каждые 3 дня в 08:00 МСК');
-      }
-      if (command === 'onFactDayStatus') {
-        expect(reply).toContain('07:00, 09:00, 17:00, 19:00 и 21:00 МСК');
-      }
-    },
-  );
-
-  it.each([
-    ['onSetSummaryThread', '/setsummarythread'],
-    ['onClearSummaryThread', '/clearsummarythread'],
-    ['onSetPollChat', '/setpollchat'],
-    ['onClearPollChat', '/clearpollchat'],
-    ['onPollNow', '/pollnow'],
-    ['onSetTokenReport', '/settokenreport'],
-    ['onClearTokenReport', '/cleartokenreport'],
-    ['onStartFactDay', '/startfactday'],
-    ['onStopFactDay', '/stopfactday'],
-    ['onClear', '/clear'],
-    ['onMemoryAdd', '/memoryadd правило'],
-    ['onMemoryEdit', '/memoryedit 1 новое правило'],
-    ['onMemoryDelete', '/memorydel 1'],
-  ] as const)(
-    'runs %s without service announcements',
-    async (command, text) => {
-      const {
-        update,
-        ctx,
-        telegramService,
-        pollConfigService,
-        pollScheduler,
-        openaiUsageService,
-        factDayConfigService,
-      } = makeUpdate();
-      ctx.message = { text, message_thread_id: 44 };
-      pollConfigService.get.mockResolvedValue({ chatId: -100, threadId: 44 });
-      const actions = {
-        onSetSummaryThread: telegramService.setSummaryTarget,
-        onClearSummaryThread: telegramService.clearSummaryTarget,
-        onSetPollChat: pollConfigService.set,
-        onClearPollChat: pollConfigService.clear,
-        onPollNow: pollScheduler.sendBoth,
-        onSetTokenReport: openaiUsageService.setReportTarget,
-        onClearTokenReport: openaiUsageService.clearReportTarget,
-        onStartFactDay: factDayConfigService.set,
-        onStopFactDay: factDayConfigService.disable,
-        onClear: telegramService.clearBuffer,
-        onMemoryAdd: telegramService.addBotMemory,
-        onMemoryEdit: telegramService.updateBotMemory,
-        onMemoryDelete: telegramService.deleteBotMemory,
-      };
-      await update[command](ctx as any);
-      expect(actions[command]).toHaveBeenCalledTimes(1);
-      expect(ctx.reply).not.toHaveBeenCalled();
-    },
-  );
-
-  it('remembers a direct request without a service reply', async () => {
-    const { update, ctx, telegramService, openaiService } = makeUpdate();
-    ctx.message = {
-      text: 'Баласи, запомни правило',
-      from: ctx.from,
-      message_id: 42,
-      message_thread_id: 44,
-    };
-    await update.onText(ctx as any);
-    expect(telegramService.addBotMemory).toHaveBeenCalledWith(
-      -100,
-      44,
-      'правило',
-      'AAlxnv',
-    );
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).not.toHaveBeenCalled();
-  });
-
-  it.each(['2026-09-15-00', '2026-09-15-24'])(
-    'shows the Moscow date for a history quiz sent in Tbilisi slot %s',
-    async (lastSentSlot) => {
-      const { update, ctx, factDayConfigService } = makeUpdate();
-      factDayConfigService.get.mockResolvedValueOnce({
-        setAt: new Date('2026-09-14T20:30:00Z'),
-        nextFactIndex: 0,
-        lastSentDate: '2026-09-15',
-        lastSentSlot,
-      });
-      await update.onFactDayStatus(ctx as any);
-      expect(ctx.reply.mock.calls[0][0]).toContain(
-        'последняя отправка: 14.09.2026 МСК',
-      );
-    },
-  );
-
-  it('adds a direct word list before considering leaderboard mentions', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    const text = `Баласи, не присылай список лидеров, он пока не нужен, только добавь эти слова:
-Хабâрь джâтûрмах - принести известие;
-Хам адам - посторонний человек;
-Сыхтырма бâни - не прижимай ( не души) меня;
-Хатâ - проблема; неприятность;
-Башûмâ хатâ олди - свалилась проблема на голову;
-Дамджûламах - капать;
-Ягхыш дамджûлûûрь - капает дождь;
-Ягхыш джûдûûрь - идёт дождь;
-Бâннâн отŷри - насчёт меня;
-Сâннâн отŷри - насчёт тебя ;
-Тâрсû - всё наоборот;
-Тâрс джûдûûр - не по плану;
-Олдугхи джŷн  гхурия - негативное пожелание;
-Дырмыхламах - собирать вилами стог сена;
-Фысыламах - сдуться; выпустить воздух;
-Топум фысыланди  - мой мяч сдулся;
-Джŷвâдж - глиняный кувшин;
-Урум - грек;
-Ширин - сладкий; сахарный;
-Дûрâч - столб в основании дома ;
-Догхмах - роды у животных;
-Эрчâч - бычок;
-Мыных - котёнок;
-Мыныхлар - котята;
-Гудич - щенок;
-Тоспагха - черепаха;
-Мûсûр - индюк;
-Шûла-пûлав - поминальное блюдо;
-Хашлама - варёная баранина;
-Хашламах - обварить;
-Спанах - шпинат;
-Шамар - оплеуха; шлепок;
-Шамар иâджâхсын - получишь взбучку;
-Кордŷджŷм - узелок;
-
-🏆 Топ добавивших слова:
-1. @anonymous — 410 слов`;
-
-    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-    expect(dictionaryService.getLeaderboard).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(34);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'хабâрь джâтûрмах',
-      translation: 'принести известие',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(34, {
-      word: 'кордŷджŷм',
-      translation: 'узелок',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
-      word: 'шûла-пûлав',
-      translation: 'поминальное блюдо',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('✅ записал (34):'),
-      { reply_parameters: { message_id: 123 } },
-    );
-    expect(ctx.telegram.setMessageReaction).not.toHaveBeenCalled();
-  });
-
-  it('adds a direct word list when the dash touches the word', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    const text = `Бот, проанализируй и добавь слова:
-Âйсûч- меньше,  нехватка,
-Артых - лишнее,
-Артых âйсûч сôйлâмâ- лишнего не болтай,
-Ŷшŷч- простуда,
-Вурух- ушиб,
-Сахглам- здоровый,
-Джŷмâнни- в положении, ( беременная),
-Ушах этмах- рожать,
-Мeшâт этмах- помешать кому- то,
-Дамламах- капать,
-Урâч гхарышмах- тошнота, тошнить,
-Аяхланмах- встать на ноги,(выздороветь),
-Гхолтух- подмышка,
-Гхолтухгун алти- под  мышкой,
-Гыгарт - клюв,
-Чâнджâ- челюсть,
-Бурнун дâлиджи- ноздря,
-Дирсâч- локоть,
-Гхабурхга- ребро`;
-
-    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(19);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'âйсûч',
-      translation: 'меньше, нехватка',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
-      word: 'артых âйсûч сôйлâмâ',
-      translation: 'лишнего не болтай',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(7, {
-      word: 'джŷмâнни',
-      translation: 'в положении, ( беременная)',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(12, {
-      word: 'аяхланмах',
-      translation: 'встать на ноги,(выздороветь)',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(19, {
-      word: 'гхабурхга',
-      translation: 'ребро',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('✅ записал (19):'),
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('keeps a comma-separated expression as one entry after "добавь:"', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, добавь: Артын, âйсилмâин, дашын ,тôчŷлмâин!- Плодитесь, размножайтесь и наполняйте Землю!',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(1);
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
-      word: 'артын, âйсилмâин, дашын, тôчŷлмâин',
-      translation: 'Плодитесь, размножайтесь и наполняйте Землю',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '✅ записал:\n• артын, âйсилмâин, дашын, тôчŷлмâин — Плодитесь, размножайтесь и наполняйте Землю',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('preserves the exact headword from the reported regression', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, добавь сёир ётмах - смотреть, наблюдать.',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith({
-      word: 'сёир ётмах',
-      translation: 'смотреть, наблюдать',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '✅ записал:\n• сёир ётмах — смотреть, наблюдать',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('parses common Unicode dash variants without AI', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    for (const separator of ['–', '−', '‑']) {
-      await (update as any).handleBotMention(
-        ctx,
-        `Баласи, добавь сёир ётмах ${separator} смотреть, наблюдать.`,
-        'AAlxnv',
-        123,
-        null,
-      );
-    }
-
-    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(3);
-    for (const call of dictionaryService.upsertWord.mock.calls) {
-      expect(call[0]).toEqual({
-        word: 'сёир ётмах',
-        translation: 'смотреть, наблюдать',
-        partOfSpeech: null,
-        addedBy: 'AAlxnv',
-      });
-    }
-  });
-
-  it('rejects an AI action that substitutes a different headword', async () => {
+  it('asks the model’s specific clarification without applying half a list', async () => {
     const { update, ctx, dictionaryService, openaiService } = makeUpdate();
     openaiService.processBotMention.mockResolvedValueOnce({
-      action: 'add_words',
-      entries: [
-        {
-          word: 'сŷртмах',
-          translation: 'смотреть, наблюдать',
-          partOfSpeech: null,
-        },
-      ],
+      action: 'reply',
+      message:
+        'К какому значению «авара» привязать пример: 1) бездельник или 2) лентяй?',
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, перенеси оба выражения в примеры',
+      'AAlxnv',
+      123,
+      null,
+    );
+    expect(dictionaryService.applyActions).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('К какому значению'),
+      expect.anything(),
+    );
+  });
+
+  it('reports a rejected batch without claiming that some changes were saved', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'dictionary_actions',
+      operations: [{ type: 'delete_word', word: 'авария' }],
+      snapshots: [],
     } as any);
-
+    dictionaryService.applyActions.mockRejectedValueOnce(
+      new DictionaryContentError('Запись изменилась после чтения.'),
+    );
     await (update as any).handleBotMention(
       ctx,
-      'Баласи, добавь запись сёир ётмах / смотреть, наблюдать.',
-      'AAlxnv',
+      'Баласи, исправь',
+      'Elvardi',
       123,
       null,
     );
-
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
     expect(ctx.reply).toHaveBeenCalledWith(
-      '⚠️ Не стал сохранять запись: распознанные слово и перевод не совпали с текстом сообщения. Напиши в формате «слово — перевод».',
-      { reply_parameters: { message_id: 123 } },
+      'Ничего не изменено. Запись изменилась после чтения.',
     );
-  });
-
-  it('does not save an AI placeholder as a dictionary translation', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate();
-
-    await (update as any).handleDictionaryAdditions(ctx, -100, 'AAlxnv', 123, [
-      {
-        word: 'артын',
-        translation: '(не найдено цинцкарское слово с явным переводом)',
-        partOfSpeech: null,
-      },
-    ]);
-
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '⚠️ не получилось сохранить: артын',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('uses AI normalization when a direct word list is not fully parseable', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    openaiService.normalizeDictionaryEntries.mockResolvedValueOnce([
-      {
-        word: 'âйсûч',
-        translation: 'меньше, нехватка',
-        partOfSpeech: null,
-      },
-      { word: 'артых', translation: 'лишнее', partOfSpeech: null },
-    ]);
-
-    await (update as any).handleBotMention(
-      ctx,
-      `Бот, проверь и добавь слова:
-Âйсûч меньше, нехватка
-Артых - лишнее`,
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.normalizeDictionaryEntries).toHaveBeenCalledWith(
-      `проверь и добавь слова:
-Âйсûч меньше, нехватка
-Артых - лишнее`,
-    );
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(2);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'âйсûч',
-      translation: 'меньше, нехватка',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
-      word: 'артых',
-      translation: 'лишнее',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-  });
-
-  it('adds several direct word pairs from one semicolon-separated line', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Бот, добавь Хатâ - проблема; неприятность; Артых - лишнее; Ширин - сладкий; сахарный',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(3);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'хатâ',
-      translation: 'проблема; неприятность',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
-      word: 'артых',
-      translation: 'лишнее',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
-      word: 'ширин',
-      translation: 'сладкий; сахарный',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-  });
-
-  it('reports only the translation variant that was actually added', async () => {
-    const { update, ctx, dictionaryService } = makeUpdate();
-    dictionaryService.upsertWord.mockResolvedValueOnce({
-      created: false,
-      translationAdded: true,
-      addedTranslation: 'приятный',
-      word: {
-        word: 'ширин',
-        translation: 'приятный; сладкий, сахарный',
-        partOfSpeech: null,
-      },
-    });
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Бот, добавь Ширин - сахарный; приятный',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '➕ добавил перевод к слову:\n• ширин — приятный',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('adds direct word pairs written with colons', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      `Бот, добавь слова:
-Хатâ: проблема
-Артых: лишнее`,
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(2);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'хатâ',
-      translation: 'проблема',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
-      word: 'артых',
-      translation: 'лишнее',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-  });
-
-  it('sanitizes dictionary command noise before saving words', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      `Бот, добавь слова:
-в словарь аслан - лев
-- бышхи - мелкозубчатая пила
-юва - гнездо (нет в словаре) (сущ.)
-сŷпŷpджâ - веник`,
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).toHaveBeenCalledTimes(4);
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(1, {
-      word: 'аслан',
-      translation: 'лев',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(2, {
-      word: 'бышхи',
-      translation: 'мелкозубчатая пила',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(3, {
-      word: 'юва',
-      translation: 'гнездо',
-      partOfSpeech: 'сущ.',
-      addedBy: 'AAlxnv',
-    });
-    expect(dictionaryService.upsertWord).toHaveBeenNthCalledWith(4, {
-      word: 'сŷпŷрджâ',
-      translation: 'веник',
-      partOfSpeech: null,
-      addedBy: 'AAlxnv',
-    });
   });
 
   it('lets the model handle a conversational leaderboard request', async () => {
@@ -1254,312 +515,6 @@ describe('TelegramUpdate bot mentions', () => {
     expect(wordReviewService.setBatchSize).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['Баласи, замени перевод слова ширин на сладкий', 'ширин', 'сладкий'],
-    [
-      'Бот, замени перевод сахгкал оти на укроп; растение',
-      'сахгкал оти',
-      'укроп; растение',
-    ],
-    ['Баласи, поменяй перевод ширин на — сладкий', 'ширин', 'сладкий'],
-    [
-      'Баласи, пожалуйста, исправь перевод у слова ширин на сладкий',
-      'ширин',
-      'сладкий',
-    ],
-  ])(
-    'replaces the full translation through ordinary wording: %s',
-    async (text, word, translation) => {
-      const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-      (ctx as any).from = { id: 42, username: 'joanofarc74' };
-      (ctx as any).message = { text, message_id: 777, message_thread_id: 44 };
-      await (update as any).handleBotMention(ctx, text, 'joanofarc74', 777, 44);
-      expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith({
-        word,
-        translation,
-        userId: 42,
-        username: 'joanofarc74',
-        chatId: -100,
-        threadId: 44,
-        messageId: 777,
-      });
-      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-      expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-      expect(openaiService.processBotMention).not.toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining('Было: старый перевод'),
-        { reply_parameters: { message_id: 777 } },
-      );
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining(`Стало: ${translation}`),
-        { reply_parameters: { message_id: 777 } },
-      );
-    },
-  );
-
-  it('resolves a short translation replacement from the replied-to message', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('joanofarc74');
-    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
-    (ctx as any).message = {
-      message_id: 500,
-      text: 'замени перевод на сладкий',
-      message_thread_id: 44,
-      from: { id: 42, username: 'participant' },
-      reply_to_message: {
-        message_id: 777,
-        text: 'ширин — сахарный',
-        date: 1789286400,
-        from: { id: 900, is_bot: true, username: 'ourbot' },
-      },
-    };
-    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
-      action: 'update_words',
-      entries: [{ oldWord: 'ширин', newWord: null, translation: 'сладкий' }],
-    });
-    await update.onText(ctx as any);
-    expect(openaiService.processBotMention).toHaveBeenCalledWith(
-      'замени перевод на сладкий',
-      expect.any(Array),
-      expect.any(Array),
-      expect.any(Array),
-      expect.objectContaining({
-        forceAction: true,
-        replyToMessage: expect.objectContaining({ text: 'ширин — сахарный' }),
-      }),
-    );
-    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
-      expect.objectContaining({ word: 'ширин', translation: 'сладкий' }),
-    );
-    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-  });
-
-  it('asks which word when a short replacement refers to an entire batch', async () => {
-    const { update, ctx, dictionaryService, openaiService, wordReviewService } =
-      makeUpdate();
-    (ctx as any).botInfo = { id: 900, username: 'ourbot' };
-    (ctx as any).message = {
-      message_id: 500,
-      text: 'замени перевод на сладкий',
-      message_thread_id: 44,
-      from: { id: 42, username: 'participant' },
-      reply_to_message: {
-        message_id: 777,
-        text: '1. ширин — сахарный\n2. хатâ — проблема',
-        date: 1789286400,
-        from: { id: 900, is_bot: true },
-      },
-    };
-    wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
-    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
-      action: 'reply',
-      message: 'У какого слова заменить перевод?',
-    });
-    await update.onText(ctx as any);
-    expect(openaiService.processBotMention).toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'У какого слова заменить перевод?',
-      expect.any(Object),
-    );
-    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-  });
-
-  it('never turns a correction request into an appended translation if the model picks the wrong action', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
-      action: 'add_words',
-      entries: [{ word: 'ширин', translation: 'сладкий', partOfSpeech: null }],
-    });
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, можешь заменить перевод ширин на сладкий?',
-      'AAlxnv',
-      123,
-      null,
-    );
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('Какое слово'),
-    );
-  });
-
-  it('continues to append a meaning when explicitly asked to add it', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
-      action: 'add_words',
-      entries: [{ word: 'ширин', translation: 'приятный', partOfSpeech: null }],
-    });
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, добавь ещё значение: ширин — приятный',
-      'AAlxnv',
-      123,
-      null,
-    );
-    expect(dictionaryService.upsertWord).toHaveBeenCalledWith(
-      expect.objectContaining({ word: 'ширин', translation: 'приятный' }),
-    );
-    expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-  });
-
-  describe('translation editor access', () => {
-    it.each(['joanofarc74', 'ekaterina_karaasheva', 'JoanOfArc74', 'Elvardi'])(
-      'allows %s without requiring administrator rights',
-      async (username) => {
-        const { update, ctx, dictionaryService } = makeUpdate(username);
-        (ctx.telegram as any).getChatMember = jest.fn(async () => ({
-          status: 'member',
-        }));
-        await (update as any).handleBotMention(
-          ctx,
-          'Баласи, замени перевод слова ширин на приятный',
-          username,
-          700,
-          44,
-        );
-        expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
-          expect.objectContaining({
-            username,
-            userId: 42,
-            word: 'ширин',
-            translation: 'приятный',
-          }),
-        );
-        expect((ctx.telegram as any).getChatMember).not.toHaveBeenCalled();
-      },
-    );
-
-    it.each(['participant', 'AAlxnv', 'MEMazmanova', 'joanofarc74_fake'])(
-      'denies %s even when they are an administrator or claim an editor username in text',
-      async (username) => {
-        const { update, ctx, dictionaryService, openaiService } =
-          makeUpdate(username);
-        (ctx.telegram as any).getChatMember = jest.fn(async () => ({
-          status: 'administrator',
-        }));
-        await (update as any).handleBotMention(
-          ctx,
-          'Баласи, замени перевод слова ширин на приятный',
-          'joanofarc74',
-          700,
-          44,
-        );
-        expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-        expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-        expect(openaiService.processBotMention).not.toHaveBeenCalled();
-        expect(ctx.reply).toHaveBeenCalledWith(
-          expect.stringContaining(TRANSLATION_EDIT_DENIED),
-          expect.anything(),
-        );
-      },
-    );
-
-    it.each([
-      { from: { id: 42, first_name: 'joanofarc74' } },
-      { from: { id: 42, username: 'joanofarc74', is_bot: true } },
-      {
-        from: { id: 42, username: 'joanofarc74' },
-        message: { sender_chat: { id: -100 } },
-      },
-    ])(
-      'does not grant editor access from a display name, bot or anonymous sender',
-      async (overrides) => {
-        const { update, ctx, dictionaryService } = makeUpdate();
-        Object.assign(ctx, overrides);
-        await (update as any).handleBotMention(
-          ctx,
-          'Баласи, замени перевод слова ширин на приятный',
-          'joanofarc74',
-          700,
-          44,
-        );
-        expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-        expect(ctx.reply).toHaveBeenCalledWith(
-          expect.stringContaining(TRANSLATION_EDIT_DENIED),
-          expect.anything(),
-        );
-      },
-    );
-
-    it('rejects a translation edit extracted by AI, including a simultaneous rename', async () => {
-      const { update, ctx, dictionaryService, openaiService } =
-        makeUpdate('participant');
-      (openaiService.processBotMention as jest.Mock).mockResolvedValueOnce({
-        action: 'update_words',
-        entries: [
-          { oldWord: 'ширин', newWord: 'шырин', translation: 'приятный' },
-        ],
-      });
-      await (update as any).handleBotMention(
-        ctx,
-        'Баласи, можно поправить эту запись по нашему обсуждению?',
-        'participant',
-        700,
-        44,
-      );
-      expect(openaiService.processBotMention).toHaveBeenCalled();
-      expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-      expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining(TRANSLATION_EDIT_DENIED),
-        expect.anything(),
-      );
-    });
-
-    it('adds new words but refuses changed meanings in a mixed word list from another participant', async () => {
-      const { update, ctx, dictionaryService } = makeUpdate('participant');
-      const existing = {
-        id: 1,
-        word: 'ширин',
-        translation: 'сладкий',
-        partOfSpeech: null,
-      };
-      const repo = {
-        findOne: jest.fn(async ({ where }) =>
-          where.word === existing.word ? { ...existing } : null,
-        ),
-        find: jest.fn(async () => [{ ...existing }]),
-        create: jest.fn((value) => ({ id: 2, ...value })),
-        save: jest.fn(async (value) => value),
-      };
-      const service = new DictionaryService(repo as any);
-      (dictionaryService.upsertWord as jest.Mock).mockImplementation((value) =>
-        service.upsertWord(value),
-      );
-      await (update as any).handleDictionaryAdditions(
-        ctx,
-        -100,
-        'joanofarc74',
-        700,
-        [
-          { word: 'ширин', translation: 'приятный' },
-          { word: 'хатâ', translation: 'проблема' },
-        ],
-      );
-      expect(repo.save).toHaveBeenCalledTimes(1);
-      expect(repo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ word: 'хатâ', addedBy: 'participant' }),
-      );
-      expect(existing.translation).toBe('сладкий');
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining(TRANSLATION_EDIT_DENIED),
-        expect.anything(),
-      );
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining('✅ записал:'),
-        expect.anything(),
-      );
-      expect(ctx.reply).not.toHaveBeenCalledWith(
-        expect.stringContaining('➕ добавил'),
-        expect.anything(),
-      );
-    });
-  });
-
   it('omits the removed translation slash command from the menu', async () => {
     const { update, bot } = makeUpdate();
     await update.onModuleInit();
@@ -1569,7 +524,7 @@ describe('TelegramUpdate bot mentions', () => {
     ).toBe(false);
   });
 
-  it('keeps replies to review lists as participant discussion rather than bot actions', async () => {
+  it('lets the model understand discussion in replies without mutating records', async () => {
     const {
       update,
       ctx,
@@ -1588,9 +543,9 @@ describe('TelegramUpdate bot mentions', () => {
     };
     wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
     await update.onText(ctx as any);
-    expect(wordReviewService.isReviewMessage).toHaveBeenCalledWith(-100, 777);
-    expect(telegramService.addMessage).toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(telegramService.saveContextMessage).toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(dictionaryService.applyActions).not.toHaveBeenCalled();
     expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
     expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
   });
@@ -1708,9 +663,9 @@ describe('TelegramUpdate bot mentions', () => {
       wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
       await update.onText(ctx as any);
       expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
-      expect(openaiService.processBotMention).not.toHaveBeenCalled();
-      expect(telegramService.addMessage).toHaveBeenCalled();
-      expect(ctx.reply).not.toHaveBeenCalled();
+      expect(openaiService.processBotMention).toHaveBeenCalled();
+      expect(telegramService.saveContextMessage).toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalled();
     });
 
     it('does not let a participant close a batch', async () => {
@@ -1772,15 +727,13 @@ describe('TelegramUpdate bot mentions', () => {
       'Баласи, партия №5 не разобрана',
       'Баласи, партия №5 разобрана, но слово 3 ещё спорное',
     ])(
-      'asks for an explicit outcome without sending unclear instructions to AI: %s',
+      'lets the model clarify an uncertain review comment without recording an outcome: %s',
       async (text) => {
         const { update, ctx, wordReviewService, openaiService } = makeUpdate();
         await (update as any).handleBotMention(ctx, text, 'AAlxnv', 500, 44);
         expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
-        expect(openaiService.processBotMention).not.toHaveBeenCalled();
-        expect(ctx.reply).toHaveBeenCalledWith(
-          expect.stringContaining('Итог не изменён.'),
-        );
+        expect(openaiService.processBotMention).toHaveBeenCalled();
+        expect(ctx.reply).toHaveBeenCalledWith('ok', expect.anything());
       },
     );
 
@@ -2139,359 +1092,6 @@ describe('TelegramUpdate bot mentions', () => {
       [],
       [],
       [{ word: 'сахгкал оти', translation: 'укроп', partOfSpeech: null }],
-    );
-  });
-
-  it('corrects spelling by translation instead of adding a bad word', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('joanofarc74');
-    dictionaryService.findByTranslation.mockResolvedValueOnce([
-      {
-        word: 'сагхал оти',
-        translation: 'укроп',
-        partOfSpeech: null,
-      },
-    ]);
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправь правописание слова сахгкал оти - укроп',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
-      oldWord: 'сагхал оти',
-      newWord: 'сахгкал оти',
-      translation: 'укроп',
-      partOfSpeech: undefined,
-      updatedBy: 'joanofarc74',
-      userId: 42,
-    });
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('✅ поправил:'),
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('does not create a word when spelling correction cannot be matched', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправь правописание слова сахгкал оти - укроп',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(ctx.reply).toHaveBeenCalledWith(
-      '⚠️ не нашёл в словаре слово с переводом «укроп». Не стал создавать новую запись.',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it.each([
-    [
-      'Баласи, исправь словосочетание яначчынын дâ шââтӱ на яланчынын дâ шââтӱ - говорилось после чихания собеседника, как подтверждение правильности слов',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      'говорилось после чихания собеседника, как подтверждение правильности слов',
-    ],
-    [
-      'Баласи, пожалуйста, замените фразу яначчынын дâ шââтӱ на яланчынын дâ шââтӱ, перевод: подтверждение правильности слов',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      'подтверждение правильности слов',
-    ],
-    [
-      'Бот, поправьте, пожалуйста, в словосочетании яначчынын дâ шââтӱ: должно быть яланчынын дâ шââтӱ — подтверждение правильности слов',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      'подтверждение правильности слов',
-    ],
-    [
-      'Баласи, поменяй: не яначчынын дâ шââтӱ, а правильно яланчынын дâ шââтӱ',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      null,
-    ],
-    [
-      'Баласи, исправьте пожалуйста написание словосочетания яначчынын дâ шââтӱ на яланчынын дâ шââтӱ',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      null,
-    ],
-    [
-      'Бот, скорректируйте выражение яначчынын дâ шââтӱ нужно заменить на яланчынын дâ шââтӱ - подтверждение правильности слов',
-      'яначчынын дâ шââтӱ',
-      'яланчынын дâ шââтӱ',
-      'подтверждение правильности слов',
-    ],
-  ])(
-    'understands conversational dictionary corrections: %s',
-    async (text, oldWord, newWord, translation) => {
-      const { update, ctx, dictionaryService, openaiService } =
-        makeUpdate('joanofarc74');
-
-      await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-      expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-      expect(openaiService.processBotMention).not.toHaveBeenCalled();
-      expect(dictionaryService.updateWord).toHaveBeenCalledWith({
-        oldWord,
-        newWord,
-        translation,
-        partOfSpeech: undefined,
-        updatedBy: 'joanofarc74',
-        userId: 42,
-      });
-      expect(ctx.reply).toHaveBeenCalledWith(
-        expect.stringContaining('✅ поправил:'),
-        { reply_parameters: { message_id: 123 } },
-      );
-    },
-  );
-
-  it('understands a natural command that only changes a translation', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('joanofarc74');
-
-    await (update as any).handleBotMention(
-      ctx,
-      'Баласи, исправьте перевод словосочетания яланчынын дâ шââтӱ на подтверждение правильности слов',
-      'AAlxnv',
-      123,
-      null,
-    );
-
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith({
-      word: 'яланчынын дâ шââтӱ',
-      translation: 'подтверждение правильности слов',
-      userId: 42,
-      username: 'joanofarc74',
-      chatId: -100,
-      threadId: null,
-      messageId: 123,
-    });
-  });
-
-  it('falls back to the AI action agent for an unparsed dictionary correction', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    const text =
-      'Баласи, можно, пожалуйста, поправить ошибку в записи: раньше было яначчынын дâ шââтӱ, а теперь здесь должно стоять яланчынын дâ шââтӱ';
-    const dictionaryEntry = {
-      word: 'яначчынын дâ шââтӱ',
-      translation: 'подтверждение правильности слов',
-      partOfSpeech: 'словосочетание',
-    };
-    dictionaryService.findRelevantForPrompt.mockResolvedValueOnce([
-      dictionaryEntry,
-    ]);
-    openaiService.processBotMention.mockResolvedValueOnce({
-      action: 'update_words',
-      entries: [
-        {
-          oldWord: 'яначчынын дâ шââтӱ',
-          newWord: 'яланчынын дâ шââтӱ',
-          translation: null,
-        },
-      ],
-    } as any);
-
-    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-    expect(openaiService.normalizeDictionaryEntries).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.findRelevantForPrompt).toHaveBeenCalledWith(
-      [text],
-      30,
-    );
-    expect(openaiService.processBotMention).toHaveBeenCalledWith(
-      text,
-      [],
-      [],
-      [dictionaryEntry],
-      { forceAction: true },
-    );
-    expect(dictionaryService.updateWord).toHaveBeenCalledWith({
-      oldWord: 'яначчынын дâ шââтӱ',
-      newWord: 'яланчынын дâ шââтӱ',
-      translation: null,
-      partOfSpeech: undefined,
-      updatedBy: 'AAlxnv',
-      userId: 42,
-    });
-  });
-
-  it.each([6, 100])(
-    'applies all %i dictionary corrections from one message',
-    async (count) => {
-      const { update, ctx, dictionaryService, openaiService } =
-        makeUpdate('joanofarc74');
-      const entries = Array.from({ length: count }, (_, index) => ({
-        oldWord: `слово ${index + 1}`,
-        newWord: index % 2 === 0 ? `исправленное слово ${index + 1}` : null,
-        translation: index % 2 === 0 ? null : `новый перевод ${index + 1}`,
-      }));
-      openaiService.processBotMention.mockResolvedValueOnce({
-        action: 'update_words',
-        entries,
-      } as any);
-      const text = `Баласи, внеси эти исправления в словарь:\n${entries
-        .map(
-          (entry) => `${entry.oldWord}: ${entry.newWord ?? entry.translation}`,
-        )
-        .join('\n')}`;
-
-      await (update as any).handleBotMention(
-        ctx,
-        text,
-        'joanofarc74',
-        123,
-        null,
-      );
-
-      expect(dictionaryService.updateWord).toHaveBeenCalledTimes(count / 2);
-      expect(dictionaryService.replaceTranslation).toHaveBeenCalledTimes(
-        count / 2,
-      );
-      const replies = ctx.reply.mock.calls.map(([reply]) => reply as string);
-      expect(replies.length).toBeGreaterThan(0);
-      expect(replies.every((reply) => reply.length <= 3900)).toBe(true);
-      if (count === 100) expect(replies.length).toBeGreaterThan(1);
-      const response = replies.join('\n');
-      expect(response).toContain('✅ поправил:');
-      for (const entry of entries) {
-        const serviceCall = entry.newWord
-          ? dictionaryService.updateWord
-          : dictionaryService.replaceTranslation;
-        expect(serviceCall).toHaveBeenCalledWith(
-          expect.objectContaining(
-            entry.newWord
-              ? { oldWord: entry.oldWord, newWord: entry.newWord }
-              : { word: entry.oldWord, translation: entry.translation },
-          ),
-        );
-        expect(response).toContain(entry.newWord ?? entry.translation);
-      }
-    },
-  );
-
-  it('falls back to AI when a locally parsed old word is not found', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    const text =
-      'Баласи, исправь термин яначчынын дâ шââтӱ на яланчынын дâ шââтӱ';
-    const dictionaryEntry = {
-      word: 'яначчынын дâ шââтӱ',
-      translation: 'подтверждение правильности слов',
-      partOfSpeech: 'словосочетание',
-    };
-    dictionaryService.updateWord.mockResolvedValueOnce({
-      status: 'not_found',
-      requestedOldWord: 'термин яначчынын дâ шââтӱ',
-    } as any);
-    dictionaryService.findRelevantForPrompt.mockResolvedValueOnce([
-      dictionaryEntry,
-    ]);
-    openaiService.processBotMention.mockResolvedValueOnce({
-      action: 'update_words',
-      entries: [
-        {
-          oldWord: 'яначчынын дâ шââтӱ',
-          newWord: 'яланчынын дâ шââтӱ',
-          translation: null,
-        },
-      ],
-    } as any);
-
-    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-    expect(dictionaryService.updateWord).toHaveBeenNthCalledWith(1, {
-      userId: 42,
-      oldWord: 'термин яначчынын дâ шââтӱ',
-      newWord: 'яланчынын дâ шââтӱ',
-      translation: null,
-      partOfSpeech: undefined,
-      updatedBy: 'AAlxnv',
-    });
-    expect(openaiService.processBotMention).toHaveBeenCalledWith(
-      text,
-      [],
-      [],
-      [dictionaryEntry],
-      { forceAction: true },
-    );
-    expect(dictionaryService.updateWord).toHaveBeenNthCalledWith(2, {
-      userId: 42,
-      oldWord: 'яначчынын дâ шââтӱ',
-      newWord: 'яланчынын дâ шââтӱ',
-      translation: null,
-      partOfSpeech: undefined,
-      updatedBy: 'AAlxnv',
-    });
-    expect(ctx.reply).not.toHaveBeenCalledWith(
-      expect.stringContaining('не нашёл в словаре'),
-      expect.anything(),
-    );
-    expect(ctx.reply).toHaveBeenCalledWith(
-      expect.stringContaining('✅ поправил:'),
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('lets the AI fallback ask for clarification instead of guessing', async () => {
-    const { update, ctx, dictionaryService, openaiService } = makeUpdate();
-    const text =
-      'Баласи, можешь исправить ошибку в словарной записи, пожалуйста?';
-    openaiService.processBotMention.mockResolvedValueOnce({
-      action: 'reply',
-      message: 'Напишите, пожалуйста, старое и правильное новое значение.',
-    });
-
-    await (update as any).handleBotMention(ctx, text, 'AAlxnv', 123, null);
-
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.updateWord).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).toHaveBeenCalledWith(
-      text,
-      [],
-      [],
-      [],
-      { forceAction: true },
-    );
-    expect(ctx.reply).toHaveBeenCalledWith(
-      'Напишите, пожалуйста, старое и правильное новое значение.',
-      { reply_parameters: { message_id: 123 } },
-    );
-  });
-
-  it('corrects a word pair starting with топ instead of adding or showing leaders', async () => {
-    const { update, ctx, dictionaryService, openaiService } =
-      makeUpdate('Elvardi');
-    await (update as any).handleBotMention(
-      ctx,
-      'Бот, исправь топ фысалди - мяч сдулся',
-      'Elvardi',
-      123,
-      null,
-    );
-    expect(dictionaryService.getLeaderboard).not.toHaveBeenCalled();
-    expect(openaiService.processBotMention).not.toHaveBeenCalled();
-    expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
-    expect(dictionaryService.replaceTranslation).toHaveBeenCalledWith(
-      expect.objectContaining({
-        word: 'топ фысалди',
-        translation: 'мяч сдулся',
-        username: 'Elvardi',
-      }),
     );
   });
 

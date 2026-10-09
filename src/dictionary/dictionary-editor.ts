@@ -1,7 +1,7 @@
 import { Repository } from 'typeorm';
 import { Word } from './entities/word.entity';
 import { WordEditHistory } from './entities/word-edit-history.entity';
-import { DictionaryEdit } from './dictionary-edit-input';
+import { DictionaryEdit } from './dictionary-edit';
 import { assertCanEditTranslations } from './translation-permissions';
 import { WORD_DELETION_DENIED } from './deletion-permissions';
 import {
@@ -21,6 +21,7 @@ export interface DictionaryActor {
   threadId?: number | null;
   messageId?: number | null;
   canRemoveEntry: boolean;
+  operationIndex?: number;
 }
 
 export interface DictionaryEditResult {
@@ -59,7 +60,7 @@ export class DictionaryEditor {
       const history = manager.getRepository(WordEditHistory);
       const requestKey =
         actor.chatId != null && actor.messageId != null
-          ? `${actor.chatId}:${actor.messageId}`
+          ? `${actor.chatId}:${actor.messageId}${actor.operationIndex == null ? '' : `:actions:${actor.operationIndex}`}`
           : null;
       const replay = requestKey
         ? await history.findOne({ where: { requestKey } })

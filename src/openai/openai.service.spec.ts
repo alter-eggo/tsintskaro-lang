@@ -68,6 +68,14 @@ describe('OpenaiService requests', () => {
       openaiReportMaxCompletionTokens: 16000,
     };
     const dictionaryService = {
+      inspectRecords: jest.fn(async (words: string[]) =>
+        words.map((word) => ({
+          word,
+          version: 'checked-version',
+          record: { word, translation: '1) безделье; 2) перерыв' },
+        })),
+      ),
+      getDeferredRecords: jest.fn(async () => []),
       findRelevantForPrompt: jest.fn(async () => [
         { word: 'ширин', translation: 'сладкий', partOfSpeech: 'прил.' },
       ]),
@@ -233,7 +241,7 @@ describe('OpenaiService requests', () => {
     expect(respond).toHaveBeenCalledTimes(1);
     const request = respond.mock.calls[0][0] as any;
     expect(request.text.format.name).toBe('bot_mention_action');
-    expect(request.prompt_cache_key).toBe('tsintskaro:bot_mention:v7');
+    expect(request.prompt_cache_key).toBe('tsintskaro:bot_mention:v8');
     expect(request.tool_choice).toBe('auto');
     expect(request.reasoning).toEqual({ effort: 'medium' });
     expect(request.max_output_tokens).toBe(8000);
@@ -251,7 +259,7 @@ describe('OpenaiService requests', () => {
         additionalProperties: false,
       }),
     );
-    expect(request.input[0].content).toContain('add_words');
+    expect(request.input[0].content).toContain('dictionary_actions');
     expect(usageService.record).toHaveBeenCalledWith(
       expect.objectContaining({
         usage: {
@@ -503,117 +511,132 @@ describe('OpenaiService requests', () => {
     });
   });
 
-  it('forces the action agent for a dictionary correction fallback', async () => {
-    const { service, create, respond, usageService } = makeService();
-    respond.mockResolvedValueOnce(
-      response(
-        JSON.stringify({
-          action: 'update_words',
-          entries: [
-            {
-              word: null,
-              translation: null,
-              partOfSpeech: null,
-              oldWord: 'яначчынын дâ шââтӱ',
-              newWord: 'яланчынын дâ шââтӱ',
-            },
-          ],
-          words: [],
-          text: null,
-          message: null,
-        }),
-      ),
+  it('reads every source and target before returning a mixed dictionary plan', async () => {
+    const { service, respond, dictionaryService } = makeService();
+    const operations = [
+      {
+        type: 'move_example',
+        word: 'аваралых этмах',
+        target: 'аваралых',
+        sense: 3,
+        translation: 'заниматься ерундой',
+        createSense: false,
+      },
+      { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+    ];
+    const words = ['аваралых этмах', 'аваралых', 'авара дурмах', 'авара'];
+    const plan = response(
+      JSON.stringify({ action: 'dictionary_actions', operations }),
     );
-
+    // Even a schema-valid model response cannot bypass the required actual reads.
+    respond
+      .mockResolvedValueOnce(plan)
+      .mockResolvedValueOnce({
+        ...response(''),
+        output: [
+          {
+            type: 'function_call',
+            name: 'inspect_dictionary_records',
+            call_id: 'inspect',
+            arguments: JSON.stringify({ words }),
+          },
+        ],
+      })
+      .mockResolvedValueOnce(plan);
     const result = await service.processBotMention(
-      'Баласи, можешь исправить ошибку в словарной записи?',
-      [],
-      [],
-      [
-        {
-          word: 'яначчынын дâ шââтӱ',
-          translation: 'подтверждение правильности слов',
-        },
-      ],
-      { forceAction: true },
+      'Баласи, исправь оба пункта с переносом в примеры',
     );
-
+    expect(dictionaryService.inspectRecords).toHaveBeenCalledWith(words);
     expect(result).toEqual({
-      action: 'update_words',
-      entries: [
-        {
-          oldWord: 'яначчынын дâ шââтӱ',
-          newWord: 'яланчынын дâ шââтӱ',
-          translation: null,
-          partOfSpeech: undefined,
-        },
-      ],
+      action: 'dictionary_actions',
+      operations,
+      snapshots: words.map((word) => ({ word, version: 'checked-version' })),
     });
-    expect(create).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledTimes(1);
-    const request = respond.mock.calls[0][0] as any;
-    expect(request.text.format.name).toBe('bot_mention_action');
-    expect(request.input[0].content).toContain(
-      'Локальный обработчик определил',
-    );
-    expect(usageService.record).toHaveBeenCalledWith(
-      expect.objectContaining({
-        metadata: expect.objectContaining({ forceAction: true }),
-      }),
+    expect(respond).toHaveBeenCalledTimes(3);
+    expect((respond.mock.calls[1][0] as any).input.at(-1).content).toContain(
+      'не проверены все записи',
     );
   });
 
-  it.each([
-    {
-      question: 'Баласи, внеси ширин — сладкий',
-      action: 'add_words',
-      payload: {
-        entries: [
-          { word: 'Ширин', translation: 'сладкий', partOfSpeech: null },
-        ],
-      },
-      expected: {
-        action: 'add_words',
-        entries: [
-          { word: 'ширин', translation: 'сладкий', partOfSpeech: null },
-        ],
-      },
-    },
-    {
-      question: 'Баласи, убери слово дом из словаря',
-      action: 'delete_words',
-      payload: { words: ['Дом'] },
-      expected: { action: 'delete_words', words: ['дом'] },
-    },
-    {
-      question: 'Баласи, сохрани в памяти: встреча в воскресенье',
-      action: 'add_memory',
-      payload: { text: 'Встреча в воскресенье.' },
-      expected: { action: 'add_memory', text: 'Встреча в воскресенье.' },
-    },
-  ])(
-    'returns $action in the first model response',
-    async ({ question, action, payload, expected }) => {
-      const { service, create, respond } = makeService();
-      respond.mockResolvedValueOnce(
+  it('does not execute a valid subset when one model operation is malformed', async () => {
+    const { service, respond } = makeService();
+    respond
+      .mockResolvedValueOnce(
         response(
           JSON.stringify({
-            action,
-            entries: [],
-            words: [],
-            text: null,
-            message: null,
-            ...payload,
+            action: 'dictionary_actions',
+            operations: [
+              { type: 'delete_word', word: 'авария' },
+              {
+                type: 'set_sense',
+                word: 'авара',
+                sense: 0,
+                translation: 'test',
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        response(
+          JSON.stringify({
+            action: 'reply',
+            message: 'К какому значению добавить пример?',
           }),
         ),
       );
-      await expect(service.processBotMention(question)).resolves.toEqual(
-        expected,
+    expect(
+      await service.processBotMention('Баласи, внеси исправления'),
+    ).toEqual({
+      action: 'reply',
+      message: 'К какому значению добавить пример?',
+    });
+  });
+
+  it('provides a read-only tool for a natural request for deferred words', async () => {
+    const { service, respond, dictionaryService } = makeService();
+    respond
+      .mockResolvedValueOnce({
+        ...response(''),
+        output: [
+          {
+            type: 'function_call',
+            name: 'list_deferred_records',
+            call_id: 'deferred',
+            arguments: '{}',
+          },
+        ],
+      })
+      .mockResolvedValueOnce(
+        response(
+          JSON.stringify({
+            action: 'reply',
+            message: 'Отложенных записей нет.',
+          }),
+        ),
       );
-      expect(respond).toHaveBeenCalledTimes(1);
-      expect(create).not.toHaveBeenCalled();
-    },
-  );
+    expect(
+      await service.processBotMention('Баласи, какие слова мы пока отложили?'),
+    ).toEqual({ action: 'reply', message: 'Отложенных записей нет.' });
+    expect(dictionaryService.getDeferredRecords).toHaveBeenCalledTimes(1);
+  });
+
+  it('can save memory through the model without a command template', async () => {
+    const { service, respond } = makeService();
+    respond.mockResolvedValueOnce(
+      response(
+        JSON.stringify({
+          action: 'add_memory',
+          text: 'Встреча в воскресенье.',
+        }),
+      ),
+    );
+    expect(
+      await service.processBotMention(
+        'Баласи, пусть у тебя останется в памяти: встреча в воскресенье',
+      ),
+    ).toEqual({ action: 'add_memory', text: 'Встреча в воскресенье.' });
+  });
 
   it('answers a writing request in the same call that chooses the action', async () => {
     const { service, create, respond } = makeService();

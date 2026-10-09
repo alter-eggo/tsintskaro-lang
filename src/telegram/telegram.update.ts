@@ -13,15 +13,9 @@ import {
   DictionaryEntry,
   DictionaryService,
 } from '../dictionary/dictionary.service';
-import {
-  assertCanEditTranslations,
-  TRANSLATION_EDIT_DENIED,
-  TranslationEditForbiddenError,
-} from '../dictionary/translation-permissions';
+import { TranslationEditForbiddenError } from '../dictionary/translation-permissions';
 import {
   BotDictionaryContextEntry,
-  DictionaryEntryInput,
-  DictionaryUpdateInput,
   OpenaiService,
 } from '../openai/openai.service';
 import {
@@ -37,7 +31,6 @@ import {
 } from '../word-review/word-review.service';
 import {
   parseReviewDecision,
-  REVIEW_DECISION_HELP,
   ReviewDecisionRequest,
   WordReviewDecisionError,
 } from '../word-review/word-review-decision';
@@ -53,33 +46,12 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnModuleInit } from '@nestjs/common';
 import { formatBotDate, formatBotDateTime } from '../common/bot-time';
-import { extractPartOfSpeech } from '../dictionary/dictionary-input';
 import {
   DictionaryContentError,
   renderSenses,
   WORD_KIND_LABELS,
 } from '../dictionary/dictionary-content';
-import {
-  DICTIONARY_EDIT_HELP,
-  parseDictionaryEdit,
-} from '../dictionary/dictionary-edit-input';
-import {
-  hasWordDeletionGrant,
-  WORD_DELETION_DENIED,
-} from '../dictionary/deletion-permissions';
-
-interface SpellingCorrectionByTranslation {
-  newWord: string;
-  translation: string;
-}
-
-interface DictionaryUpdateHandlingResult {
-  needsAiFallback: boolean;
-}
-
-interface DictionaryUpdateHandlingOptions {
-  deferUnresolvedReply?: boolean;
-}
+import { hasWordDeletionGrant } from '../dictionary/deletion-permissions';
 
 type ReportGenerationStage =
   | 'load_messages'
@@ -306,28 +278,15 @@ export class TelegramUpdate implements OnModuleInit {
     const threadId = message.message_thread_id;
     const username = message.from?.username || 'anonymous';
 
-    const replyToMessageId = message.reply_to_message?.message_id;
     const isReplyToBot =
       ctx.botInfo?.id != null &&
       message.reply_to_message?.from?.id === ctx.botInfo.id;
-    const isReplyToReview =
-      isReplyToBot && replyToMessageId != null
-        ? await this.wordReviewService.isReviewMessage(chatId, replyToMessageId)
-        : false;
     const isUsernameMention =
       ctx.botInfo?.username &&
       text.toLowerCase().includes(`@${ctx.botInfo.username.toLowerCase()}`);
-    const reviewReplyDecision = isReplyToReview
-      ? parseReviewDecision(text)
-      : null;
     if (
       TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
-      (isReplyToBot &&
-        (!isReplyToReview ||
-          parseDictionaryEdit(text) != null ||
-          this.extractDictionaryCorrectionInstruction(text) != null ||
-          (reviewReplyDecision != null &&
-            reviewReplyDecision !== 'invalid'))) ||
+      isReplyToBot ||
       isUsernameMention
     ) {
       await this.rememberContextMessage({
@@ -406,256 +365,26 @@ export class TelegramUpdate implements OnModuleInit {
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] @${username} addressed bot: "${text}"`);
     const reviewDecision = parseReviewDecision(text);
-    if (reviewDecision != null) {
-      if (reviewDecision === 'invalid') {
-        await this.replyAndRemember(
-          ctx,
-          'Итог не изменён. ' + REVIEW_DECISION_HELP,
-        );
-      } else {
-        await this.handleReviewDecision(
-          ctx,
-          reviewDecision,
-          messageId,
-          threadId,
-        );
-      }
+    if (reviewDecision != null && reviewDecision !== 'invalid') {
+      await this.handleReviewDecision(ctx, reviewDecision, messageId, threadId);
       return;
     }
     const replyToMessage = this.getReplyContext(ctx);
 
-    if (
-      /^(?:(?:бот|баласи)[\s,:!.—-]+)?покажи\s+отложенные\s+(?:записи|слова)[.!\s]*$/i.test(
-        text.trim(),
-      )
-    ) {
-      const entries = await this.dictionaryService.getDeferredRecords();
-      const answer = entries.length
-        ? [
-            'Отложенные записи:',
-            ...entries.map(
-              (e) =>
-                `${e.word} — ${e.translation}${e.statusReason ? `\nПричина: ${e.statusReason}` : ''}`,
-            ),
-          ].join('\n')
-        : 'Отложенных записей нет.';
-      for (const chunk of this.chunkString(answer, 3900))
-        await this.replyAndRemember(ctx, chunk);
-      return;
-    }
-
-    const recordEdit = parseDictionaryEdit(text);
-    if (recordEdit != null) {
-      const forwarded = ctx.message as {
-        forward_origin?: unknown;
-        forward_from?: unknown;
-        forward_from_chat?: unknown;
-      };
-      if (
-        forwarded?.forward_origin ||
-        forwarded?.forward_from ||
-        forwarded?.forward_from_chat
-      ) {
-        await this.replyAndRemember(
-          ctx,
-          'Пересланное сообщение не изменяет словарь. Отправь нужную команду своим сообщением.',
-        );
-        return;
-      }
-      if (recordEdit === 'invalid') {
-        await this.replyAndRemember(
-          ctx,
-          `Ничего не изменено. ${DICTIONARY_EDIT_HELP}`,
-        );
-        return;
-      }
-      let saved = false;
-      try {
-        assertCanEditTranslations(this.dictionarySenderUsername(ctx));
-        const result = await this.dictionaryService.editRecord(recordEdit, {
-          userId: ctx.from?.id,
-          username: this.dictionarySenderUsername(ctx),
-          chatId,
-          threadId,
-          messageId: messageId ?? null,
-          canRemoveEntry: await this.canDeleteDictionaryWords(ctx),
-        });
-        saved = true;
-        const word = result.word;
-        const lines = [
-          result.status === 'updated'
-            ? '✅ Запись обновлена.'
-            : 'Запись уже в таком виде.',
-        ];
-        if (result.movedWord)
-          lines.push(
-            `«${result.movedWord}» перенесено в «${word.word}» как пример. Отдельная запись убрана из списка; история сохранена.`,
-          );
-        if (word.status === 'deferred')
-          lines.push(
-            `«${word.word}» отложено${word.statusReason ? `: ${word.statusReason}` : ''}.`,
-          );
-        if (recordEdit.type === 'set_status' && word.status === 'active')
-          lines.push(`«${word.word}» возвращено в словарь.`);
-        lines.push(word.word);
-        if (word.kind && word.kind !== 'word')
-          lines.push(`Тип: ${WORD_KIND_LABELS[word.kind]}`);
-        if (word.literalTranslation)
-          lines.push(`Буквально: ${word.literalTranslation}`);
-        if (result.previousTranslation !== word.translation)
-          lines.push(`Было: ${result.previousTranslation}`);
-        lines.push(
-          `Перевод:\n${word.senses?.length ? renderSenses(word.senses, '\n') : word.translation}`,
-        );
-        const phrases = [
-          ...new Set(
-            (word.senses ?? []).flatMap((s) => s.examples.map((e) => e.phrase)),
-          ),
-        ].sort((a, b) => b.length - a.length);
-        for (const chunk of this.chunkBotAnswer(lines.join('\n'))) {
-          const entities: { type: 'bold'; offset: number; length: number }[] =
-            [];
-          for (const phrase of phrases) {
-            for (
-              let offset = chunk.indexOf(phrase);
-              offset >= 0;
-              offset = chunk.indexOf(phrase, offset + phrase.length)
-            ) {
-              if (
-                !entities.some(
-                  (e) =>
-                    offset < e.offset + e.length &&
-                    offset + phrase.length > e.offset,
-                )
-              )
-                entities.push({ type: 'bold', offset, length: phrase.length });
-            }
-          }
-          await this.replyAndRemember(ctx, chunk, {
-            entities: entities.sort((a, b) => a.offset - b.offset),
-            ...(messageId == null
-              ? {}
-              : { reply_parameters: { message_id: messageId } }),
-          });
-        }
-      } catch (error) {
-        const message =
-          error instanceof DictionaryContentError ||
-          error instanceof TranslationEditForbiddenError
-            ? error.message
-            : saved
-              ? 'Изменение сохранено, но не удалось отправить результат. Повтори команду, чтобы увидеть запись; дубликат не появится.'
-              : 'Не удалось сохранить изменение. Исходные записи сохранены; повтори команду.';
-        if (
-          !(error instanceof DictionaryContentError) &&
-          !(error instanceof TranslationEditForbiddenError)
-        )
-          this.logger.error('Dictionary record edit failed', error);
-        await this.replyAndRemember(ctx, message);
-      }
-      return;
-    }
-
-    const directMemoryText = this.extractBotMemoryText(text);
-    if (directMemoryText != null) {
-      await this.saveBotMemory(
-        ctx,
-        chatId,
-        threadId,
-        username,
-        messageId,
-        directMemoryText,
-      );
-      return;
-    }
-
-    const spellingCorrection =
-      await this.extractSpellingCorrectionByTranslation(text);
-    if (spellingCorrection) {
-      await this.handleSpellingCorrectionByTranslation(
-        ctx,
-        chatId,
-        username,
-        messageId,
-        spellingCorrection,
-      );
-      return;
-    }
-
-    const deletions = this.extractDirectDictionaryDeletions(text);
-    if (deletions) {
-      await this.handleDictionaryDeletions(
-        ctx,
-        chatId,
-        username,
-        messageId,
-        deletions,
-      );
-      return;
-    }
-    const explicitChanges = this.extractExplicitDictionaryChanges(text);
-    if (explicitChanges) {
-      if (explicitChanges.updates.length) {
-        await this.handleDictionaryUpdates(
-          ctx,
-          chatId,
-          username,
-          messageId,
-          explicitChanges.updates,
-        );
-      }
-      if (explicitChanges.deletions.length) {
-        await this.handleDictionaryDeletions(
-          ctx,
-          chatId,
-          username,
-          messageId,
-          explicitChanges.deletions,
-        );
-      }
-      return;
-    }
-
-    const directDictionaryUpdate = this.extractDirectDictionaryUpdate(text);
-    let useAiDictionaryCorrectionFallback = false;
-    if (directDictionaryUpdate) {
-      const localUpdate = await this.handleDictionaryUpdates(
-        ctx,
-        chatId,
-        username,
-        messageId,
-        [directDictionaryUpdate],
-        { deferUnresolvedReply: true },
-      );
-      if (!localUpdate.needsAiFallback) {
-        return;
-      }
-      useAiDictionaryCorrectionFallback = true;
-    } else {
-      useAiDictionaryCorrectionFallback =
-        this.shouldUseAiDictionaryCorrectionFallback(text);
-    }
-
-    if (useAiDictionaryCorrectionFallback) {
-      this.logger.log(
-        `[Chat ${chatId}] Local dictionary correction parser was not confident; routing to AI action fallback`,
-      );
-    } else {
-      const directDictionaryEntries = await this.extractDirectDictionaryEntries(
-        text,
-        chatId,
-      );
-      if (directDictionaryEntries.length > 0) {
-        await this.handleDictionaryAdditions(
-          ctx,
-          chatId,
-          username,
-          messageId,
-          directDictionaryEntries,
-        );
-        return;
-      }
-    }
+    const message = ctx.message as {
+      forward_origin?: unknown;
+      forward_from?: unknown;
+      forward_from_chat?: unknown;
+      sender_chat?: unknown;
+    };
+    const readOnly = Boolean(
+      message?.forward_origin ||
+      message?.forward_from ||
+      message?.forward_from_chat ||
+      message?.sender_chat ||
+      ctx.from?.is_bot ||
+      !ctx.from?.id,
+    );
 
     const [loadedRecentMessages, botMemory] = await Promise.all([
       this.telegramService.getRecentMessages(
@@ -695,17 +424,15 @@ export class TelegramUpdate implements OnModuleInit {
     let result;
     try {
       result =
-        useAiDictionaryCorrectionFallback || replyToMessage
+        replyToMessage || readOnly
           ? await this.openaiService.processBotMention(
               text,
               recentMessages,
               botMemory,
               dictionaryEntries,
               {
-                ...(useAiDictionaryCorrectionFallback
-                  ? { forceAction: true }
-                  : {}),
                 ...(replyToMessage ? { replyToMessage } : {}),
+                ...(readOnly ? { readOnly: true } : {}),
               },
             )
           : await this.openaiService.processBotMention(
@@ -747,6 +474,13 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
+    if (readOnly) {
+      await this.replyAndRemember(
+        ctx,
+        'Это сообщение не изменяет словарь. Напиши просьбу от своего имени; пересланный текст можно приложить как контекст.',
+      );
+      return;
+    }
     if (result.action === 'add_memory') {
       await this.saveBotMemory(
         ctx,
@@ -759,61 +493,104 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    if (result.action === 'update_words') {
-      await this.handleDictionaryUpdates(
-        ctx,
-        chatId,
-        username,
-        messageId,
-        result.entries,
+    let saved = false;
+    try {
+      const batch = await this.dictionaryService.applyActions(
+        result.operations,
+        {
+          userId: ctx.from!.id,
+          username: this.dictionarySenderUsername(ctx),
+          chatId,
+          threadId,
+          messageId: messageId ?? null,
+          canRemoveEntry: await this.canDeleteDictionaryWords(ctx),
+        },
+        result.snapshots,
       );
-      return;
-    }
-
-    if (result.action === 'delete_words') {
-      await this.handleDictionaryDeletions(
-        ctx,
-        chatId,
-        username,
-        messageId,
-        result.words,
-      );
-      return;
-    }
-
-    if (useAiDictionaryCorrectionFallback) {
-      await this.replyAndRemember(
-        ctx,
-        'Какое слово и на какой перевод нужно заменить? Укажите оба значения.',
-      );
-      return;
-    }
-
-    // action === 'add_words'
-    const groundedEntries = this.filterGroundedDictionaryEntries(
-      text,
-      result.entries,
-      chatId,
-      'AI action',
-    );
-    if (groundedEntries.length === 0) {
-      if (messageId != null) {
-        await this.replyAndRemember(
-          ctx,
-          '⚠️ Не стал сохранять запись: распознанные слово и перевод не совпали с текстом сообщения. Напиши в формате «слово — перевод».',
-          { reply_parameters: { message_id: messageId } },
+      saved = true;
+      const lines = [
+        batch.unchanged
+          ? 'Эта команда уже выполнена.'
+          : '✅ Изменения сохранены.',
+      ];
+      for (const action of result.operations) {
+        if (action.type === 'move_example')
+          lines.push(
+            `«${action.word}» перенесено в «${action.target}» как пример к значению ${action.sense}. История сохранена.`,
+          );
+      }
+      for (const word of batch.words) {
+        if (word.status === 'embedded' || word.status === 'merged') continue;
+        if (word.status === 'deleted') {
+          lines.push(`«${word.word}» убрано из словаря. История сохранена.`);
+          continue;
+        }
+        lines.push('', word.word);
+        if (word.status === 'deferred')
+          lines.push(
+            `Отложено${word.statusReason ? `: ${word.statusReason}` : ''}.`,
+          );
+        if (word.kind && word.kind !== 'word')
+          lines.push(`Тип: ${WORD_KIND_LABELS[word.kind]}`);
+        if (word.partOfSpeech) lines.push(`Часть речи: ${word.partOfSpeech}`);
+        if (word.literalTranslation)
+          lines.push(`Буквально: ${word.literalTranslation}`);
+        lines.push(
+          word.senses?.length
+            ? renderSenses(word.senses, '\n')
+            : word.translation,
         );
       }
-      return;
+      const phrases = [
+        ...new Set(
+          batch.words.flatMap((word) =>
+            (word.senses ?? []).flatMap((sense) =>
+              sense.examples.map((example) => example.phrase),
+            ),
+          ),
+        ),
+      ].sort((a, b) => b.length - a.length);
+      for (const chunk of this.chunkBotAnswer(lines.join('\n'))) {
+        const entities: { type: 'bold'; offset: number; length: number }[] = [];
+        for (const phrase of phrases) {
+          for (
+            let offset = chunk.indexOf(phrase);
+            offset >= 0;
+            offset = chunk.indexOf(phrase, offset + phrase.length)
+          ) {
+            if (
+              !entities.some(
+                (entity) =>
+                  offset < entity.offset + entity.length &&
+                  offset + phrase.length > entity.offset,
+              )
+            )
+              entities.push({ type: 'bold', offset, length: phrase.length });
+          }
+        }
+        await this.replyAndRemember(ctx, chunk, {
+          ...(entities.length
+            ? { entities: entities.sort((a, b) => a.offset - b.offset) }
+            : {}),
+          ...(messageId == null
+            ? {}
+            : { reply_parameters: { message_id: messageId } }),
+        });
+      }
+    } catch (error) {
+      const message = saved
+        ? 'Изменения сохранены, но не удалось отправить результат. Повтори команду: дубликат не появится.'
+        : error instanceof DictionaryContentError ||
+            error instanceof TranslationEditForbiddenError
+          ? `Ничего не изменено. ${error.message}`
+          : 'Не удалось сохранить изменения. Все изменения из этой команды отменены; повтори просьбу.';
+      if (
+        !(error instanceof DictionaryContentError) &&
+        !(error instanceof TranslationEditForbiddenError)
+      )
+        this.logger.error('Dictionary action batch failed', error);
+      await this.replyAndRemember(ctx, message);
     }
-
-    await this.handleDictionaryAdditions(
-      ctx,
-      chatId,
-      username,
-      messageId,
-      groundedEntries,
-    );
   }
 
   private async handleReviewDecision(
@@ -922,270 +699,6 @@ export class TelegramUpdate implements OnModuleInit {
     return (
       hasWordDeletionGrant(this.dictionarySenderUsername(ctx)) ||
       this.isAdmin(ctx, sender.username)
-    );
-  }
-
-  private async handleDictionaryDeletions(
-    ctx: Context,
-    chatId: number,
-    username: string,
-    messageId: number | undefined,
-    words: string[],
-  ): Promise<void> {
-    if (!(await this.canDeleteDictionaryWords(ctx))) {
-      this.logger.log(
-        `[Chat ${chatId}] Unauthorized @${username} tried to delete: ${words.join(', ')}`,
-      );
-      if (messageId != null) {
-        await this.replyAndRemember(ctx, `🚫 ${WORD_DELETION_DENIED}`, {
-          reply_parameters: { message_id: messageId },
-        });
-      }
-      return;
-    }
-
-    if (words.length > TelegramUpdate.MAX_DELETE_BATCH) {
-      this.logger.warn(
-        `[Chat ${chatId}] @${username} delete batch too big: ${words.length} words — refused`,
-      );
-      if (messageId != null) {
-        await this.replyAndRemember(
-          ctx,
-          `🚫 Нельзя удалить больше ${TelegramUpdate.MAX_DELETE_BATCH} слов за один раз. Перечисли меньше слов или удаляй по частям.`,
-          { reply_parameters: { message_id: messageId } },
-        );
-      }
-      return;
-    }
-
-    try {
-      const { deleted, notFound } =
-        await this.dictionaryService.deleteWords(words);
-      this.logger.log(
-        `[Chat ${chatId}] Dictionary editor @${username} deleted: [${deleted.join(', ')}], notFound: [${notFound.join(', ')}]`,
-      );
-
-      if (messageId != null) {
-        const lines: string[] = [];
-        if (deleted.length > 0) {
-          lines.push(
-            deleted.length === 1
-              ? '🗑 удалил:'
-              : `🗑 удалил (${deleted.length}):`,
-          );
-          for (const w of deleted) lines.push(`• ${w}`);
-        }
-        if (notFound.length > 0) {
-          if (lines.length > 0) lines.push('');
-          lines.push(`⚠️ нет в словаре: ${notFound.join(', ')}`);
-        }
-        if (lines.length === 0) {
-          lines.push('Нечего удалять.');
-        }
-
-        await this.replyAndRemember(ctx, lines.join('\n'), {
-          reply_parameters: { message_id: messageId },
-        });
-      }
-    } catch (err) {
-      this.logger.error(`[Chat ${chatId}] deleteWords failed:`, err);
-      if (messageId != null) {
-        await this.replyAndRemember(
-          ctx,
-          'Ошибка при удалении слов из словаря.',
-          {
-            reply_parameters: { message_id: messageId },
-          },
-        );
-      }
-    }
-  }
-
-  /** Parse explicit pair lists before conversational rename heuristics. */
-  private extractExplicitDictionaryChanges(text: string): {
-    updates: DictionaryUpdateInput[];
-    deletions: string[];
-  } | null {
-    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
-    const command = body.match(
-      /^(?:исправь|исправьте|исправить|поправь|поправьте|обнови|измени)(?:\s*[:,]\s*|\s+)([\s\S]+)$/i,
-    );
-    if (!command) return null;
-    const updates: DictionaryUpdateInput[] = [];
-    const deletions: string[] = [];
-    const lines = command[1]
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    for (const line of lines) {
-      const entry = this.extractDictionaryEntryLine(line);
-      // These are conversational rename instructions, not literal headwords.
-      if (
-        !entry ||
-        /(?:^|\s)(?:на|в|не|вместо|перевод|заменить|поменять|нужно|надо)(?:\s|$)/i.test(
-          entry.word,
-        )
-      )
-        return null;
-      if (
-        /^(?:удали|удалить)(?:\s+из\s+словаря)?[.!]?$/i.test(entry.translation)
-      ) {
-        deletions.push(entry.word);
-      } else {
-        const sanitized = this.sanitizeDictionaryEntryForSave(entry);
-        if (!sanitized) return null;
-        updates.push({
-          oldWord: sanitized.word,
-          newWord: null,
-          translation: sanitized.translation,
-          ...(sanitized.partOfSpeech
-            ? { partOfSpeech: sanitized.partOfSpeech }
-            : {}),
-        });
-      }
-    }
-    return updates.length || deletions.length ? { updates, deletions } : null;
-  }
-
-  private extractDirectDictionaryDeletions(text: string): string[] | null {
-    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
-    // A colon or an explicit dictionary noun distinguishes a command from
-    // conversational requests such as “удали пятно”. Other wording uses AI.
-    const command = body.match(
-      /^(?:удали|удалить)(?:\s*:\s*|\s+(?:из\s+словаря|слово|слова)(?:\s*:\s*|\s+))([\s\S]+)$/i,
-    );
-    if (!command) return null;
-    const words = command[1]
-      .split(/[\r\n,;]+/)
-      .map((word) =>
-        this.cleanDictionaryWord(word.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')),
-      )
-      .filter(Boolean);
-    return words.length &&
-      words.every((word) => this.isLikelyDictionaryWord(word))
-      ? [...new Set(words)]
-      : null;
-  }
-
-  private async extractDirectDictionaryEntries(
-    text: string,
-    chatId: number,
-  ): Promise<DictionaryEntryInput[]> {
-    const body = text.replace(TelegramUpdate.BOT_MENTION_REGEX, '').trim();
-    const localEntries = this.extractDirectDictionaryEntriesLocally(body);
-
-    if (!this.shouldUseAiDictionaryParser(body, localEntries)) {
-      return localEntries;
-    }
-
-    try {
-      const aiEntries =
-        await this.openaiService.normalizeDictionaryEntries(body);
-      const groundedAiEntries = this.filterGroundedDictionaryEntries(
-        body,
-        aiEntries,
-        chatId,
-        'AI normalizer',
-      );
-      if (groundedAiEntries.length > localEntries.length) {
-        this.logger.log(
-          `[Chat ${chatId}] AI dictionary parser extracted ${groundedAiEntries.length} grounded entries instead of ${localEntries.length}`,
-        );
-        return this.deduplicateDictionaryEntries(groundedAiEntries);
-      }
-    } catch (err) {
-      this.logger.warn(
-        `[Chat ${chatId}] AI dictionary parser failed, using local parser result: ${err}`,
-      );
-    }
-
-    return localEntries;
-  }
-
-  private extractDirectDictionaryEntriesLocally(
-    body: string,
-  ): DictionaryEntryInput[] {
-    const entries: DictionaryEntryInput[] = [];
-    const seen = new Set<string>();
-
-    for (const line of this.splitDictionaryEntryLines(body)) {
-      const entry = this.extractDictionaryEntryLine(line);
-      if (!entry) continue;
-
-      const key = `${entry.word}\u0000${entry.translation}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      entries.push(entry);
-    }
-
-    if (!this.hasDictionaryAddIntent(body) && entries.length < 3) {
-      return [];
-    }
-
-    return entries;
-  }
-
-  private async extractSpellingCorrectionByTranslation(
-    text: string,
-  ): Promise<SpellingCorrectionByTranslation | null> {
-    const instruction = this.extractDictionaryCorrectionInstruction(text);
-    if (!instruction) return null;
-
-    const match = instruction.match(
-      /^(?:правописани[ея]|написани[ея]|орфографи[юя])\s+(?:(?:слова?|словосочетани[ея]|фраз[ыа]|выражени[ея])\s+)?(.+?)\s*(?:=|—|-|:)\s*(.+?)[.!?]*$/i,
-    );
-    if (!match) return null;
-
-    const newWord = this.cleanDictionaryWord(match[1]);
-    const translation = this.cleanDictionaryTranslation(match[2]);
-    if (!newWord || !translation || !this.isLikelyDictionaryWord(newWord)) {
-      return null;
-    }
-
-    return { newWord, translation };
-  }
-
-  private async handleSpellingCorrectionByTranslation(
-    ctx: Context,
-    chatId: number,
-    username: string,
-    messageId: number | undefined,
-    correction: SpellingCorrectionByTranslation,
-  ): Promise<void> {
-    const matches = await this.dictionaryService.findByTranslation(
-      correction.translation,
-    );
-
-    if (matches.length === 1) {
-      await this.handleDictionaryUpdates(ctx, chatId, username, messageId, [
-        {
-          oldWord: matches[0].word,
-          newWord: correction.newWord,
-          translation: correction.translation,
-        },
-      ]);
-      return;
-    }
-
-    if (messageId == null) return;
-
-    if (matches.length === 0) {
-      await this.replyAndRemember(
-        ctx,
-        `⚠️ не нашёл в словаре слово с переводом «${correction.translation}». Не стал создавать новую запись.`,
-        { reply_parameters: { message_id: messageId } },
-      );
-      return;
-    }
-
-    const candidates = matches
-      .slice(0, 5)
-      .map((entry) => entry.word)
-      .join(', ');
-    await this.replyAndRemember(
-      ctx,
-      `⚠️ нашёл несколько слов с переводом «${correction.translation}»: ${candidates}. Напиши старое слово явно: «Баласи, исправь старое_слово на ${correction.newWord}».`,
-      { reply_parameters: { message_id: messageId } },
     );
   }
 
@@ -1351,162 +864,6 @@ export class TelegramUpdate implements OnModuleInit {
       .trim();
   }
 
-  private splitDictionaryEntryLines(body: string): string[] {
-    const lines: string[] = [];
-
-    for (const rawLine of body.split(/\r?\n/g)) {
-      const segments = rawLine.split(';');
-      let current = '';
-
-      for (const segment of segments) {
-        const trimmed = segment.trim();
-        if (!trimmed) continue;
-
-        if (current && this.extractDictionaryEntryLine(trimmed)) {
-          lines.push(current);
-          current = trimmed;
-          continue;
-        }
-
-        current = current ? `${current}; ${trimmed}` : trimmed;
-      }
-
-      if (current) lines.push(current);
-    }
-
-    return lines;
-  }
-
-  private shouldUseAiDictionaryParser(
-    body: string,
-    localEntries: DictionaryEntryInput[],
-  ): boolean {
-    if (!this.hasDictionaryAddIntent(body)) {
-      return false;
-    }
-
-    const candidateLineCount = this.countLikelyDictionaryCandidateLines(body);
-    if (candidateLineCount > 0 && localEntries.length < candidateLineCount) {
-      return true;
-    }
-
-    return (
-      localEntries.length === 0 && this.hasLooseDictionaryEntrySignals(body)
-    );
-  }
-
-  private countLikelyDictionaryCandidateLines(body: string): number {
-    return body
-      .split(/\r?\n/g)
-      .filter((line) => this.isLikelyDictionaryCandidateLine(line)).length;
-  }
-
-  private isLikelyDictionaryCandidateLine(line: string): boolean {
-    const trimmed = line.trim().replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '');
-    if (!trimmed) return false;
-    if (this.isDictionaryInstructionLine(trimmed)) return false;
-    if (this.isNonDictionaryListLine(trimmed)) return false;
-    if (this.extractDictionaryEntryLine(trimmed)) return true;
-
-    const normalized = this.stripDictionaryPairIntent(trimmed);
-    if (!this.hasLooseDictionaryEntrySignals(normalized)) return false;
-
-    const tokens = normalized.split(/\s+/g).filter(Boolean);
-    return tokens.length >= 2 && tokens.length <= 16;
-  }
-
-  private isDictionaryInstructionLine(line: string): boolean {
-    if (
-      this.hasDictionaryAddIntent(line) &&
-      /(?:^|[\s,.:;!?])слова?:?\s*$/i.test(line)
-    ) {
-      return true;
-    }
-
-    return /^(?:проанализируй|проверь|посмотри|разбери|добавь|добавить|запиши|записать|нов(?:ое|ые|ых)\s+)?(?:эти\s+)?слова?:?\s*$/i.test(
-      line,
-    );
-  }
-
-  private isNonDictionaryListLine(line: string): boolean {
-    return (
-      /^🏆/.test(line) ||
-      /топ\s+добавивш/i.test(line) ||
-      line.startsWith('@') ||
-      /(?:^|\s)@\w+/.test(line) ||
-      /^\d+\s+слов[ао]?$/i.test(line)
-    );
-  }
-
-  private hasLooseDictionaryEntrySignals(text: string): boolean {
-    return (
-      /[а-яёêâãáàäāôóòöōûŷúùüū]/i.test(text) &&
-      (/(?:[-—=:]|значит|означает|перевод|это)/i.test(text) ||
-        text.split(/\s+/g).filter(Boolean).length >= 2)
-    );
-  }
-
-  private deduplicateDictionaryEntries(
-    entries: DictionaryEntryInput[],
-  ): DictionaryEntryInput[] {
-    const deduplicated: DictionaryEntryInput[] = [];
-    const seen = new Set<string>();
-    for (const entry of entries) {
-      const key = `${entry.word}\u0000${entry.translation}\u0000${entry.partOfSpeech ?? ''}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      deduplicated.push(entry);
-    }
-    return deduplicated;
-  }
-
-  private filterGroundedDictionaryEntries(
-    sourceText: string,
-    entries: DictionaryEntryInput[],
-    chatId: number,
-    source: string,
-  ): DictionaryEntryInput[] {
-    const grounded = entries.filter((entry) =>
-      this.isDictionaryEntryGroundedInText(sourceText, entry),
-    );
-    if (grounded.length !== entries.length) {
-      const rejected = entries
-        .filter((entry) => !grounded.includes(entry))
-        .map((entry) => `${entry.word} = ${entry.translation}`)
-        .join('; ');
-      this.logger.warn(
-        `[Chat ${chatId}] Rejected ungrounded ${source} dictionary entries: ${rejected}`,
-      );
-    }
-    return grounded;
-  }
-
-  private isDictionaryEntryGroundedInText(
-    sourceText: string,
-    entry: DictionaryEntryInput,
-  ): boolean {
-    const source = this.normalizeDictionaryGroundingText(sourceText);
-    const word = this.normalizeDictionaryGroundingText(entry.word);
-    const translation = this.normalizeDictionaryGroundingText(
-      entry.translation,
-    );
-    return (
-      word.length > 0 &&
-      translation.length > 0 &&
-      source.includes(word) &&
-      source.includes(translation)
-    );
-  }
-
-  private normalizeDictionaryGroundingText(value: string): string {
-    return this.normalizeCyrillicLookalikes(
-      value.normalize('NFC').toLowerCase(),
-    )
-      .replace(/[\p{P}\p{S}]+/gu, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
   private normalizeCyrillicLookalikes(value: string): string {
     return value
       .replace(/a/g, 'а')
@@ -1539,51 +896,6 @@ export class TelegramUpdate implements OnModuleInit {
     return word;
   }
 
-  private extractDictionaryEntryLine(
-    line: string,
-  ): DictionaryEntryInput | null {
-    const trimmed = this.stripDictionaryPairIntent(
-      this.normalizeDictionarySeparatorCharacters(line)
-        .trim()
-        .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ''),
-    );
-    const match =
-      trimmed.match(/^(.+?)\s+(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
-      trimmed.match(/^(.+?)(?:[-—=])\s+(.+?)\s*;?\s*$/) ??
-      trimmed.match(/^(.+?)\s*:\s+(.+?)\s*;?\s*$/);
-    if (!match) return null;
-
-    const word = this.cleanDictionaryWord(match[1]);
-    const translation = this.cleanDictionaryTranslation(match[2]);
-    if (
-      !word ||
-      !translation ||
-      !this.isLikelyDictionaryWord(word) ||
-      this.isLikelyLeaderboardLine(word, translation)
-    ) {
-      return null;
-    }
-
-    return { word, translation, partOfSpeech: null };
-  }
-
-  private normalizeDictionarySeparatorCharacters(value: string): string {
-    return value.replace(/[\u2010-\u2015\u2212]/g, '-');
-  }
-
-  private hasDictionaryAddIntent(text: string): boolean {
-    return /(?:^|[\s,.:;!?])(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить|нов(?:ое|ые|ых)\s+слов\w*|слова\s+в\s+словарь|в\s+словарь)(?:$|[\s,.:;!?])/i.test(
-      text,
-    );
-  }
-
-  private stripDictionaryPairIntent(line: string): string {
-    return line.replace(
-      /^(?:добавь|добавить|запиши|записать|пиши|исправь|исправить|поправь|поправить|обнови|обновить|измени|изменить)(?:\s*[,.:;!?]\s*|\s+)(?:(?:это|слово|перевод|запись)(?:\s*[,.:;!?]\s*|\s+))?/i,
-      '',
-    );
-  }
-
   private isLikelyDictionaryWord(word: string): boolean {
     return (
       word.length <= 80 &&
@@ -1593,305 +905,6 @@ export class TelegramUpdate implements OnModuleInit {
         word,
       )
     );
-  }
-
-  private isLikelyLeaderboardLine(word: string, translation: string): boolean {
-    return (
-      word.startsWith('@') ||
-      /(?:^|\s)@\w+/.test(word) ||
-      /^\d+\s+слов[ао]?$/i.test(translation)
-    );
-  }
-
-  private async handleDictionaryAdditions(
-    ctx: Context,
-    chatId: number,
-    username: string,
-    messageId: number | undefined,
-    entries: DictionaryEntryInput[],
-  ): Promise<void> {
-    const created: string[] = [];
-    const expanded: string[] = [];
-    const unchanged: string[] = [];
-    const denied: string[] = [];
-    const failed: { word: string; err: unknown }[] = [];
-
-    for (const rawEntry of entries) {
-      const entry = this.sanitizeDictionaryEntryForSave(rawEntry);
-      if (!entry) {
-        this.logger.warn(
-          `[Chat ${chatId}] Skipped suspicious dictionary entry by @${username}: ${rawEntry.word} = ${rawEntry.translation}`,
-        );
-        failed.push({ word: rawEntry.word, err: 'suspicious_entry' });
-        continue;
-      }
-
-      try {
-        const upserted = await this.dictionaryService.upsertWord({
-          word: entry.word,
-          translation: entry.translation,
-          partOfSpeech: entry.partOfSpeech,
-          addedBy: this.dictionarySenderUsername(ctx) ?? 'anonymous',
-        });
-        const posTag = entry.partOfSpeech ? ` (${entry.partOfSpeech})` : '';
-        const displayedTranslation =
-          !upserted.created && upserted.translationAdded
-            ? upserted.addedTranslation || entry.translation
-            : entry.translation;
-        const line = `${upserted.word.word} — ${displayedTranslation}${posTag}`;
-        if (upserted.created) {
-          created.push(line);
-        } else if (upserted.translationAdded) {
-          expanded.push(line);
-        } else {
-          unchanged.push(line);
-        }
-        this.logger.log(
-          `[Chat ${chatId}] Dictionary ${upserted.created ? 'created' : upserted.translationAdded ? 'expanded' : 'unchanged'} by @${username}: ${entry.word} = ${entry.translation}${posTag}`,
-        );
-      } catch (err) {
-        if (err instanceof TranslationEditForbiddenError) {
-          denied.push(entry.word);
-          continue;
-        }
-        this.logger.error(
-          `[Chat ${chatId}] upsertWord failed for "${entry.word}":`,
-          err,
-        );
-        failed.push({ word: entry.word, err });
-      }
-    }
-
-    if (messageId != null) {
-      const lines: string[] = [];
-      if (created.length > 0) {
-        lines.push(
-          created.length === 1
-            ? `✅ записал:`
-            : `✅ записал (${created.length}):`,
-        );
-        for (const l of created) lines.push(`• ${l}`);
-      }
-      if (expanded.length > 0) {
-        if (lines.length > 0) lines.push('');
-        lines.push(
-          expanded.length === 1
-            ? `➕ добавил перевод к слову:`
-            : `➕ добавил переводы к словам (${expanded.length}):`,
-        );
-        for (const l of expanded) lines.push(`• ${l}`);
-      }
-      if (unchanged.length > 0) {
-        if (lines.length > 0) lines.push('');
-        lines.push(
-          unchanged.length === 1
-            ? `ℹ️ такой перевод уже был:`
-            : `ℹ️ такие переводы уже были (${unchanged.length}):`,
-        );
-        for (const l of unchanged) lines.push(`• ${l}`);
-      }
-      if (failed.length > 0) {
-        if (lines.length > 0) lines.push('');
-        lines.push(
-          `⚠️ не получилось сохранить: ${failed.map((f) => f.word).join(', ')}`,
-        );
-        for (const failure of failed) {
-          if (failure.err instanceof DictionaryContentError)
-            lines.push(`• ${failure.word}: ${failure.err.message}`);
-        }
-      }
-
-      if (denied.length > 0) {
-        lines.push(
-          '',
-          `🚫 ${TRANSLATION_EDIT_DENIED}`,
-          `Перевод не изменён: ${denied.join(', ')}.`,
-        );
-      }
-
-      if (lines.length === 0) {
-        await this.replyAndRemember(ctx, 'Не получилось ничего сохранить.', {
-          reply_parameters: { message_id: messageId },
-        });
-        return;
-      }
-
-      await this.replyAndRemember(ctx, lines.join('\n'), {
-        reply_parameters: { message_id: messageId },
-      });
-    }
-  }
-
-  private extractDirectDictionaryUpdate(
-    text: string,
-  ): DictionaryUpdateInput | null {
-    const instruction = this.extractDictionaryCorrectionInstruction(text);
-    if (!instruction) return null;
-
-    const correction = instruction.match(
-      /^(.+?)\s+(?:это|будет|=|—|-)\s+(.+?)\s*,?\s+а\s+не\s+(.+?)[.!?]*$/i,
-    );
-    if (correction) {
-      const translation = this.cleanDictionaryTranslation(correction[1]);
-      const newWord = this.cleanDictionaryUpdateWord(correction[2]);
-      const oldWord = this.cleanDictionaryUpdateWord(correction[3]);
-      if (oldWord && newWord && translation) {
-        return { oldWord, newWord, translation };
-      }
-    }
-
-    // A short reply such as “замени перевод на сладкий” needs the quoted
-    // word or conversation context. Never treat “перевод” as a word to rename.
-    if (
-      /^(?:(?:его|её|этот|текущий)\s+)?перевод\s+(?:на|в|будет|=|—|-)(?:\s|$)/i.test(
-        instruction,
-      )
-    ) {
-      return null;
-    }
-
-    const translationOnly = instruction.match(
-      /^перевод\s+(?:(?:у|для|в)\s+)?(?:(?:словосочетани[еяи]|выражени[еяи]|слова?|фраз[ыае]|запис[ьи])\s+)?(.+?)\s+(?:на|в|будет|=|—|-)\s+(?:[—-]\s+)?(.+?)[.!?]*$/i,
-    );
-    if (translationOnly) {
-      const oldWord = this.cleanDictionaryUpdateWord(translationOnly[1]);
-      const translation = this.cleanDictionaryTranslation(translationOnly[2]);
-      if (oldWord && translation) {
-        return { oldWord, newWord: null, translation };
-      }
-    }
-
-    if (/^(?:(?:его|её|этот|текущий)\s+)?перевод(?:\s|$)/i.test(instruction))
-      return null;
-
-    const renameInstruction =
-      this.stripLeadingDictionaryUpdateLabel(instruction);
-    const rename =
-      renameInstruction.match(
-        /^не\s+(.+?)\s*,?\s+а\s+(?:(?:правильно|нужно|надо)\s+)?(.+?)[.!?]*$/i,
-      ) ??
-      renameInstruction.match(
-        /^(?:вместо\s+)?(.+?)\s+(?:(?:нужно|надо)\s+)?(?:заменить|поменять|исправить|написать)\s+(?:на\s+)?(.+?)[.!?]*$/i,
-      ) ??
-      renameInstruction.match(
-        /^вместо\s+(.+?)\s+(?:напиши(?:те)?|поставь(?:те)?|должно\s+быть|нужно|надо)\s+(.+?)[.!?]*$/i,
-      ) ??
-      renameInstruction.match(
-        /^(.+?)\s+(?:(?:замени(?:ть)?|поменя(?:ть)?)\s+)?(?:на|в)\s+(.+?)[.!?]*$/i,
-      ) ??
-      renameInstruction.match(/^(.+?)\s*(?:→|->|=>)\s*(.+?)[.!?]*$/i) ??
-      renameInstruction.match(
-        /^(.+?)\s*[,;:]\s*(?:а\s+)?(?:правильно|должно\s+быть|нужно|надо)\s+(.+?)[.!?]*$/i,
-      );
-    if (rename) {
-      const oldWord = this.cleanDictionaryUpdateWord(rename[1]);
-      const target = this.splitDictionaryRenameTarget(rename[2]);
-      const newWord = this.cleanDictionaryUpdateWord(target.newWord);
-      const translation = target.translation
-        ? this.cleanDictionaryTranslation(target.translation)
-        : null;
-      if (oldWord && newWord) {
-        return { oldWord, newWord, translation };
-      }
-    }
-
-    const legacyTranslationOnly = instruction.match(
-      /^(?:перевод\s+)?(.+?)\s+(?:перевод|значит|означает)\s+(.+?)[.!?]*$/i,
-    );
-    if (legacyTranslationOnly) {
-      const oldWord = this.cleanDictionaryUpdateWord(legacyTranslationOnly[1]);
-      const translation = this.cleanDictionaryTranslation(
-        legacyTranslationOnly[2],
-      );
-      if (oldWord && translation) {
-        return { oldWord, newWord: null, translation };
-      }
-    }
-
-    return null;
-  }
-
-  private shouldUseAiDictionaryCorrectionFallback(text: string): boolean {
-    const body = text
-      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
-      .trim()
-      .replace(/\s+/g, ' ');
-    const hasCorrectionVerb =
-      /(?:^|[\s,.:;!?])(?:исправ[а-яё]*|поправ[а-яё]*|обнов[а-яё]*|замен[а-яё]*|переимен[а-яё]*|измен[а-яё]*|поменя[а-яё]*|скорректир[а-яё]*)(?:$|[\s,.:;!?])/i.test(
-        body,
-      );
-    if (this.extractDictionaryCorrectionInstruction(text)) return true;
-    if (!hasCorrectionVerb) {
-      return false;
-    }
-
-    return /(?:словар|словосочет|выражени|фраз|запис|слов[оае](?:$|[\s,.:;!?])|перевод|правопис|написани|орфограф|ошибк|опечатк|неправильн|вместо|а\s+не|правильн|должн[а-яё]*\s+быть|раньше\s+был|теперь\s+(?:будет|должн)|заменить\s+на|поменять\s+на|→|->|=>)/i.test(
-      body,
-    );
-  }
-
-  private extractDictionaryCorrectionInstruction(text: string): string | null {
-    const body = text
-      .replace(TelegramUpdate.BOT_MENTION_REGEX, '')
-      .trim()
-      .replace(/\s+/g, ' ')
-      .replace(/^пожалуйста\s*[,;:]?\s*/i, '');
-    const command = body.match(
-      /^(?:измени|измените|изменить|исправь|исправьте|исправить|поправь|поправьте|поправить|обнови|обновите|обновить|замени|замените|заменить|поменяй|поменяйте|поменять|скорректируй|скорректируйте|скорректировать)(?:\s*,?\s*пожалуйста\s*,?\s*|\s*[:,]\s*|\s+)(.+)$/i,
-    );
-    return command?.[1]?.trim() || null;
-  }
-
-  private stripLeadingDictionaryUpdateLabel(value: string): string {
-    let result = value.trim();
-    let previous = '';
-
-    while (result !== previous) {
-      previous = result;
-      result = result
-        .replace(
-          /^(?:ошибк[уа]\s+)?в\s+(?:словосочетании|выражении|слове|фразе|записи)(?:\s*[:,]\s*|\s+)/i,
-          '',
-        )
-        .replace(
-          /^(?:(?:это|эту|само|саму)\s+)?(?:(?:правописание|написание|орфографию)\s+)?(?:словосочетани[еяи]|выражени[еяи]|слов[оае]|фраз[уаые]|запис[ьи])(?:\s*[:,]\s*|\s+)/i,
-          '',
-        )
-        .trim();
-    }
-
-    return result;
-  }
-
-  private cleanDictionaryUpdateWord(value: string): string {
-    return this.cleanDictionaryWord(
-      this.stripLeadingDictionaryUpdateLabel(value),
-    );
-  }
-
-  private splitDictionaryRenameTarget(value: string): {
-    newWord: string;
-    translation: string | null;
-  } {
-    const explicitTranslation = value.match(
-      /^(.+?)(?:\s*[,;]\s*|\s+)(?:перевод(?:ится)?|значит|означает)\s*[:=—-]?\s+(.+?)$/i,
-    );
-    if (explicitTranslation) {
-      return {
-        newWord: explicitTranslation[1],
-        translation: explicitTranslation[2],
-      };
-    }
-
-    const dashTranslation = value.match(/^(.+?)\s+(?:—|-|=)\s+(.+?)$/);
-    if (dashTranslation) {
-      return {
-        newWord: dashTranslation[1],
-        translation: dashTranslation[2],
-      };
-    }
-
-    return { newWord: value, translation: null };
   }
 
   private cleanDictionaryWord(value: string): string {
@@ -1909,215 +922,6 @@ export class TelegramUpdate implements OnModuleInit {
     );
   }
 
-  private cleanDictionaryTranslation(value: string): string {
-    return value
-      .trim()
-      .replace(/^[\s"'«»“”„`.,;:!?]+/g, '')
-      .replace(/[\s"'«»“”„`.,;:!?]+$/g, '')
-      .replace(/\s+/g, ' ');
-  }
-
-  private cleanDictionaryTranslationNoise(translation: string): string {
-    return this.cleanDictionaryTranslation(
-      translation.replace(
-        /\s*\((?:есть|нет)\s+в\s+(?:эталонном\s+)?словар[еьи][^)]*\)\s*/gi,
-        ' ',
-      ),
-    );
-  }
-
-  private isPlaceholderDictionaryTranslation(translation: string): boolean {
-    return /^\(?\s*(?:не\s+найден[оа]?|перевод\s+не\s+найден|нет\s+(?:явного\s+)?перевода|не\s+удалось\s+(?:найти|определить)).*перевод/i.test(
-      translation,
-    );
-  }
-
-  private sanitizeDictionaryEntryForSave(
-    entry: DictionaryEntryInput,
-  ): DictionaryEntryInput | null {
-    const word = this.cleanDictionaryWord(entry.word);
-    let translation = this.cleanDictionaryTranslation(entry.translation);
-    let partOfSpeech = entry.partOfSpeech?.trim() || null;
-
-    const extracted = extractPartOfSpeech(translation);
-    translation = this.cleanDictionaryTranslationNoise(extracted.translation);
-    if (!partOfSpeech && extracted.partOfSpeech) {
-      partOfSpeech = extracted.partOfSpeech;
-    }
-
-    if (
-      !word ||
-      !translation ||
-      this.isPlaceholderDictionaryTranslation(translation) ||
-      !this.isLikelyDictionaryWord(word) ||
-      this.isLikelyLeaderboardLine(word, translation)
-    ) {
-      return null;
-    }
-
-    return { word, translation, partOfSpeech };
-  }
-
-  private async handleDictionaryUpdates(
-    ctx: Context,
-    chatId: number,
-    username: string,
-    messageId: number | undefined,
-    entries: DictionaryUpdateInput[],
-    options: DictionaryUpdateHandlingOptions = {},
-  ): Promise<DictionaryUpdateHandlingResult> {
-    const updated: string[] = [];
-    const notFound: string[] = [];
-    const ambiguous: string[] = [];
-    const failed: string[] = [];
-    const denied: string[] = [];
-    const editorUsername = this.dictionarySenderUsername(ctx);
-
-    for (const entry of entries) {
-      try {
-        if (entry.translation?.trim())
-          assertCanEditTranslations(editorUsername);
-        const translationOnly =
-          entry.translation &&
-          (!entry.newWord || entry.newWord === entry.oldWord) &&
-          entry.partOfSpeech == null;
-        if (translationOnly) {
-          const result = await this.dictionaryService.replaceTranslation({
-            word: entry.oldWord,
-            translation: entry.translation!,
-            userId: ctx.from?.id,
-            username: editorUsername,
-            chatId,
-            threadId:
-              (ctx.message as { message_thread_id?: number })
-                ?.message_thread_id ?? null,
-            messageId: messageId ?? null,
-          });
-          if (result.status === 'updated' || result.status === 'unchanged') {
-            updated.push(
-              result.status === 'updated'
-                ? `${result.word}\nБыло: ${result.previousTranslation || '(пусто)'}\nСтало: ${result.translation}`
-                : `${result.word} — ${result.translation} (перевод уже такой)`,
-            );
-          } else if (result.status === 'not_found') {
-            notFound.push(entry.oldWord);
-          } else {
-            failed.push(entry.oldWord);
-          }
-          continue;
-        }
-        const result = await this.dictionaryService.updateWord({
-          oldWord: entry.oldWord,
-          newWord: entry.newWord,
-          translation: entry.translation,
-          partOfSpeech: entry.partOfSpeech,
-          updatedBy: editorUsername,
-          userId: ctx.from?.id,
-        });
-
-        if (
-          (result.status === 'updated' || result.status === 'merged') &&
-          result.word
-        ) {
-          const posTag = result.word.partOfSpeech
-            ? ` (${result.word.partOfSpeech})`
-            : '';
-          const wordLabel =
-            result.resolvedOldWord &&
-            result.resolvedOldWord !== result.word.word
-              ? `${result.resolvedOldWord} → ${result.word.word}`
-              : result.word.word;
-          updated.push(`${wordLabel} — ${result.word.translation}${posTag}`);
-          this.logger.log(
-            `[Chat ${chatId}] Dictionary updated by @${username}: ${wordLabel} = ${result.word.translation}${posTag}`,
-          );
-          continue;
-        }
-
-        if (result.status === 'ambiguous' && result.candidates?.length) {
-          ambiguous.push(
-            `${entry.oldWord}: ${result.candidates.slice(0, 5).join(', ')}`,
-          );
-          continue;
-        }
-
-        if (result.status === 'not_found') {
-          notFound.push(entry.oldWord);
-          continue;
-        }
-      } catch (err) {
-        if (err instanceof DictionaryContentError) {
-          failed.push(`${entry.oldWord}: ${err.message}`);
-          continue;
-        }
-        if (err instanceof TranslationEditForbiddenError) {
-          denied.push(entry.oldWord);
-          continue;
-        }
-        this.logger.error(
-          `[Chat ${chatId}] updateWord failed for "${entry.oldWord}":`,
-          err,
-        );
-        failed.push(entry.oldWord);
-      }
-    }
-
-    const needsAiFallback =
-      denied.length === 0 &&
-      updated.length === 0 &&
-      (notFound.length > 0 || ambiguous.length > 0);
-    const result = { needsAiFallback };
-
-    if (messageId == null) return result;
-
-    const lines: string[] = [];
-    if (updated.length > 0) {
-      lines.push('✅ поправил:');
-      for (const line of updated) lines.push(`• ${line}`);
-    }
-    if (!options.deferUnresolvedReply && notFound.length > 0) {
-      if (lines.length > 0) lines.push('');
-      lines.push(`⚠️ не нашёл в словаре: ${notFound.join(', ')}`);
-    }
-    if (!options.deferUnresolvedReply && ambiguous.length > 0) {
-      if (lines.length > 0) lines.push('');
-      lines.push('⚠️ нашёл несколько похожих, уточни:');
-      for (const line of ambiguous) lines.push(`• ${line}`);
-    }
-    if (failed.length > 0) {
-      if (lines.length > 0) lines.push('');
-      lines.push(`⚠️ не получилось поправить: ${failed.join(', ')}`);
-    }
-    if (denied.length > 0) {
-      lines.push(
-        '',
-        `🚫 ${TRANSLATION_EDIT_DENIED}`,
-        `Перевод не изменён: ${denied.join(', ')}.`,
-      );
-    }
-
-    if (lines.length === 0) {
-      if (options.deferUnresolvedReply && needsAiFallback) {
-        return result;
-      }
-      await this.replyAndRemember(
-        ctx,
-        'Не понял, что именно нужно поправить.',
-        {
-          reply_parameters: { message_id: messageId },
-        },
-      );
-      return result;
-    }
-
-    for (const chunk of this.chunkString(lines.join('\n'), 3900)) {
-      await this.replyAndRemember(ctx, chunk, {
-        reply_parameters: { message_id: messageId },
-      });
-    }
-    return result;
-  }
-
   private dictionarySenderUsername(ctx: Context): string | null {
     const sender = ctx.from;
     const message = ctx.message as { sender_chat?: unknown } | undefined;
@@ -2128,14 +932,6 @@ export class TelegramUpdate implements OnModuleInit {
       !message?.sender_chat
       ? (sender.username ?? null)
       : null;
-  }
-
-  private extractBotMemoryText(text: string): string | null {
-    const match = text.match(
-      /^\s*(?:бот|баласи)[\s,:!.\-—]+(?:добавь\s+в\s+память|запомни|сохрани\s+в\s+памят[ьи])[\s,:!.\-—]*([\s\S]*)$/i,
-    );
-    if (!match) return null;
-    return match[1].trim();
   }
 
   private async saveBotMemory(

@@ -9,8 +9,19 @@ import {
   WordKind,
   WordSense,
 } from './dictionary-content';
-import { DictionaryEdit } from './dictionary-edit-input';
+import { DictionaryEdit } from './dictionary-edit';
 import { DictionaryActor, DictionaryEditor } from './dictionary-editor';
+import { WordEditHistory } from './entities/word-edit-history.entity';
+import { WORD_DELETION_DENIED } from './deletion-permissions';
+import {
+  actionWords,
+  DictionaryAction,
+  DictionarySnapshot,
+  dictionarySnapshot,
+  inspectDictionaryRecord,
+  dictionaryWord,
+  parseDictionaryActions,
+} from './dictionary-actions';
 import { compareTsintskaroWords } from './tsintskaro-alphabet';
 import { assertCanEditTranslations } from './translation-permissions';
 
@@ -108,6 +119,143 @@ export class DictionaryService {
       where: { status: 'deferred' },
       order: { word: 'ASC' },
     });
+  }
+
+  async inspectRecords(words: string[]) {
+    const names = [...new Set(words.map(dictionaryWord))];
+    const rows = names.length
+      ? await this.wordRepo.find({ where: { word: In(names) } })
+      : [];
+    return names.map((word) => {
+      const row = rows.find((row) => row.word === word);
+      return inspectDictionaryRecord(word, row);
+    });
+  }
+
+  /** One authorized message is one transaction, including mixed operations. */
+  async applyActions(
+    raw: DictionaryAction[],
+    actor: DictionaryActor,
+    snapshots: DictionarySnapshot[],
+  ) {
+    const actions = parseDictionaryActions(raw);
+    if (!actions || !Number.isSafeInteger(actor.userId) || actor.userId <= 0)
+      throw new DictionaryContentError(
+        'Не удалось проверить команду. Ничего не изменено.',
+      );
+    for (const action of actions) {
+      if (
+        action.type !== 'add_word' &&
+        action.type !== 'delete_word' &&
+        !(action.type === 'update_word' && !action.translation)
+      )
+        assertCanEditTranslations(actor.username);
+      if (
+        (action.type === 'delete_word' ||
+          action.type === 'move_example' ||
+          (action.type === 'set_status' && action.status === 'deferred')) &&
+        !actor.canRemoveEntry
+      )
+        throw new DictionaryContentError(WORD_DELETION_DENIED);
+    }
+    const names = actionWords(actions);
+    const result = await this.wordRepo.manager.transaction(async (manager) => {
+      await manager.query(
+        "SELECT pg_advisory_xact_lock(hashtext('tsintskaro.dictionary-edits'))",
+      );
+      const repo = manager.getRepository(Word);
+      const history = manager.getRepository(WordEditHistory);
+      const requestKey =
+        actor.chatId != null && actor.messageId != null
+          ? `${actor.chatId}:${actor.messageId}:actions`
+          : null;
+      const replay = requestKey
+        ? await history.findOneBy({ requestKey })
+        : null;
+      if (replay) {
+        const ids = (replay.after as Word[]).map((row) => row.id);
+        return {
+          unchanged: true,
+          words: ids.length ? await repo.findBy({ id: In(ids) }) : [],
+        };
+      }
+      const before = await repo.find({
+        where: { word: In(names) },
+        lock: { mode: 'pessimistic_write' },
+      });
+      for (const word of names) {
+        const snapshot = snapshots.find((item) => item.word === word);
+        if (
+          !snapshot ||
+          snapshot.version !==
+            dictionarySnapshot(
+              word,
+              before.find((row) => row.word === word),
+            ).version
+        )
+          throw new DictionaryContentError(
+            `Запись «${word}» не проверена или изменилась после чтения. Ничего не изменено; повтори просьбу, чтобы я перечитал словарь.`,
+          );
+      }
+      const service = new DictionaryService(repo);
+      for (let index = 0; index < actions.length; index++) {
+        const action = actions[index];
+        const row = await repo.findOneBy({ word: action.word });
+        if (action.type !== 'add_word' && !row)
+          throw new DictionaryContentError(
+            `Не нашёл запись «${action.word}». Ничего не изменено.`,
+          );
+        if (action.type === 'add_word') {
+          const saved = await service.upsertWord({
+            ...action,
+            addedBy: actor.username,
+          });
+          if (saved.word.word !== action.word)
+            throw new DictionaryContentError(
+              `Уточни написание: «${action.word}» совпадает с другой записью. Ничего не изменено.`,
+            );
+        } else if (action.type === 'update_word') {
+          const updated = await service.updateWord({
+            oldWord: action.word,
+            newWord: action.newWord,
+            translation: action.translation,
+            partOfSpeech: action.partOfSpeech,
+            updatedBy: actor.username,
+            userId: actor.userId,
+          });
+          if (
+            !updated.word ||
+            !['updated', 'merged'].includes(updated.status) ||
+            updated.word.word !== (action.newWord ?? action.word)
+          )
+            throw new DictionaryContentError(
+              `Не удалось однозначно исправить «${action.word}». Ничего не изменено.`,
+            );
+        } else if (action.type === 'delete_word') {
+          await service.deleteWords([action.word]);
+        } else {
+          await new DictionaryEditor(repo).apply(action, {
+            ...actor,
+            operationIndex: index,
+          });
+        }
+      }
+      const after = await repo.find({
+        where: [{ word: In(names) }, { id: In(before.map((row) => row.id)) }],
+      });
+      await history.save(
+        history.create({
+          operation: 'dictionary_actions',
+          requestKey,
+          before,
+          after,
+          actor,
+        }),
+      );
+      return { unchanged: false, words: after };
+    });
+    this.invalidateCache();
+    return result;
   }
 
   private invalidateCache() {
@@ -776,7 +924,7 @@ export class DictionaryService {
         return { created: false, word: existing, translationAdded: false };
       }
 
-      let saved = existing;
+      const saved = existing;
       if (translationAdded) {
         const updated = await this.wordRepo.update(
           {
