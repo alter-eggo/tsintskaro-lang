@@ -508,17 +508,32 @@ export class TelegramUpdate implements OnModuleInit {
         result.snapshots,
       );
       saved = true;
+      const transfers = result.operations
+        .filter((action) => action.type === 'move_example')
+        .map(
+          (action) =>
+            `• «${action.word}» → «${action.target}», значение ${action.sense}.`,
+        );
+      if (transfers.length && !batch.unchanged) {
+        const notice = [
+          '↪️ Перенос в примеры выполнен:',
+          ...transfers,
+          '',
+          'Перенесённые выражения больше не показываются отдельными строками в словаре. История сохранена.',
+        ].join('\n');
+        for (const chunk of this.chunkBotAnswer(notice)) {
+          await this.replyAndRemember(ctx, chunk, {
+            ...(messageId == null
+              ? {}
+              : { reply_parameters: { message_id: messageId } }),
+          });
+        }
+      }
       const lines = [
         batch.unchanged
           ? 'Эта команда уже выполнена.'
           : '✅ Изменения сохранены.',
       ];
-      for (const action of result.operations) {
-        if (action.type === 'move_example')
-          lines.push(
-            `«${action.word}» перенесено в «${action.target}» как пример к значению ${action.sense}. История сохранена.`,
-          );
-      }
       for (const word of batch.words) {
         if (word.status === 'embedded' || word.status === 'merged') continue;
         if (word.status === 'deleted') {

@@ -272,6 +272,57 @@ describe('TelegramUpdate bot mentions', () => {
       expect.stringContaining('Изменения сохранены'),
       expect.anything(),
     );
+    expect(ctx.reply).toHaveBeenCalledTimes(2);
+    expect(ctx.reply).toHaveBeenNthCalledWith(
+      1,
+      [
+        '↪️ Перенос в примеры выполнен:',
+        '• «аваралых этмах» → «аваралых», значение 3.',
+        '• «авара дурмах» → «авара», значение 1.',
+        '',
+        'Перенесённые выражения больше не показываются отдельными строками в словаре. История сохранена.',
+      ].join('\n'),
+      { reply_parameters: { message_id: 123 } },
+    );
+    expect(ctx.reply.mock.calls[1][0]).not.toContain('Перенос');
+    expect(ctx.reply.mock.calls[1][0]).toContain('аваралых');
+    expect(ctx.reply.mock.calls[1][0]).toContain('авара');
+  });
+
+  it('does not announce a new transfer when replaying a completed command', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'dictionary_actions',
+      operations: [
+        { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+      ],
+      snapshots: [],
+    } as any);
+    dictionaryService.applyActions.mockResolvedValueOnce({
+      unchanged: true,
+      words: [
+        {
+          word: 'авара',
+          translation: 'бездельник',
+          status: 'active',
+          kind: 'word',
+        },
+      ],
+    });
+    await (update as any).handleBotMention(
+      ctx,
+      'Баласи, перенеси выражение',
+      'Elvardi',
+      123,
+      null,
+    );
+    expect(ctx.reply).toHaveBeenCalledTimes(1);
+    expect(ctx.reply).toHaveBeenCalledWith(
+      expect.stringContaining('Эта команда уже выполнена.'),
+      { reply_parameters: { message_id: 123 } },
+    );
+    expect(ctx.reply.mock.calls[0][0]).not.toContain('Перенос');
   });
 
   it.each([
@@ -334,7 +385,9 @@ describe('TelegramUpdate bot mentions', () => {
       makeUpdate('Elvardi');
     openaiService.processBotMention.mockResolvedValueOnce({
       action: 'dictionary_actions',
-      operations: [{ type: 'delete_word', word: 'авария' }],
+      operations: [
+        { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+      ],
       snapshots: [],
     } as any);
     dictionaryService.applyActions.mockRejectedValueOnce(
@@ -350,6 +403,7 @@ describe('TelegramUpdate bot mentions', () => {
     expect(ctx.reply).toHaveBeenCalledWith(
       'Ничего не изменено. Запись изменилась после чтения.',
     );
+    expect(ctx.reply).toHaveBeenCalledTimes(1);
   });
 
   it('lets the model handle a conversational leaderboard request', async () => {
