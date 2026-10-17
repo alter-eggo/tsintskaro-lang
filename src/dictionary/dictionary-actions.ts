@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { DictionaryEdit } from './dictionary-edit';
 import type { Word } from './entities/word.entity';
-import { getSenses } from './dictionary-content';
+import { getSenses, DictionaryContentError } from './dictionary-content';
 
-export type DictionaryAction =
+export type DictionaryAction = (
   | DictionaryEdit
   | {
       type: 'add_word';
@@ -18,7 +18,9 @@ export type DictionaryAction =
       translation?: string;
       partOfSpeech?: string;
     }
-  | { type: 'delete_word'; word: string };
+  | { type: 'delete_word'; word: string }
+  | { type: 'keep_word'; word: string }
+) & { sourceItem?: number };
 
 type Field = {
   type: 'string' | 'integer' | 'boolean';
@@ -38,6 +40,7 @@ const definitions: Record<DictionaryAction['type'], Record<string, Field>> = {
     partOfSpeech: optionalText,
   },
   delete_word: { word: text },
+  keep_word: { word: text },
   move_example: {
     word: text,
     target: text,
@@ -61,6 +64,26 @@ const definitions: Record<DictionaryAction['type'], Record<string, Field>> = {
     reason: optionalText,
   },
 };
+
+for (const fields of Object.values(definitions))
+  fields.sourceItem = { type: 'integer', optional: true };
+
+/** Never apply just the model's understood subset of a numbered request. */
+export function assertRequestCoverage(
+  actions: DictionaryAction[],
+  expected: number[],
+): void {
+  const covered = new Set(actions.map((action) => action.sourceItem));
+  const missing = expected.filter((item) => !covered.has(item));
+  if (
+    !expected.length ||
+    missing.length ||
+    actions.some((action) => !expected.includes(action.sourceItem))
+  )
+    throw new DictionaryContentError(
+      `Не удалось проверить весь список${missing.length ? `: не разобраны пункты ${missing.join(', ')}` : ''}. Ничего не изменено. Повтори «Готово» или уточни эти пункты.`,
+    );
+}
 
 export const DICTIONARY_ACTIONS_SCHEMA = {
   type: 'array',

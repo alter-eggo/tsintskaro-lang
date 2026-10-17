@@ -23,6 +23,8 @@ async function main() {
     ['авария', 'дорожное происшествие'],
     ['пример', '1) значение А; 2) значение Б'],
     ['выражение', 'неуточнённый перевод'],
+    ['ахгыран', '1) болеющий; 2) больной'],
+    ['ахгзû гхырых', 'о человеке, который мало ест'],
   ].map(([word, translation], index) => ({
     id: index + 1,
     word,
@@ -53,6 +55,92 @@ async function main() {
     record: async () => {},
   });
   const cases = [
+    {
+      name: 'Separate grammatical labels for each meaning',
+      text: 'Баласи, исправь:\n1. ахгыран — 1) болеющий (причастие); 2) больной (прилагательное). Сохрани части речи для соответствующих значений.',
+      options: { requestItems: [1] },
+      check: (result) => {
+        assert.equal(result.action, 'dictionary_actions');
+        for (const [sense, partOfSpeech] of [
+          [1, 'причастие'],
+          [2, 'прилагательное'],
+        ])
+          assert(
+            result.operations.some(
+              (op) =>
+                op.type === 'set_sense_pos' &&
+                op.sense === sense &&
+                op.partOfSpeech === partOfSpeech &&
+                op.sourceItem === 1,
+            ),
+          );
+        assert(
+          !result.operations.some(
+            (op) =>
+              op.translation && /причастие|прилагательное/.test(op.translation),
+          ),
+        );
+      },
+    },
+    {
+      name: 'Expression kind stays out of spelling and translation',
+      text: 'Баласи, исправь:\n1. ахгзû гхырых — фразеологизм, буквально «рот сломан». Написание и перевод оставь как есть.',
+      options: { requestItems: [1] },
+      check: (result) => {
+        assert.equal(result.action, 'dictionary_actions');
+        assert(
+          result.operations.some(
+            (op) =>
+              op.type === 'set_kind' &&
+              op.kind === 'idiom' &&
+              op.sourceItem === 1,
+          ),
+        );
+        assert(
+          !result.operations.some(
+            (op) => op.newWord || op.translation || op.partOfSpeech,
+          ),
+        );
+      },
+    },
+    {
+      name: 'Missing target asks without any deletion or partial writes',
+      text: 'Баласи, исправь:\n1. авара дурмах — перенеси как пример к значению 1 слова «несуществующая основа». Новое слово не создавай.\n2. авария — удалить.',
+      options: { requestItems: [1, 2] },
+      check: (result) => {
+        assert.equal(result.action, 'reply');
+        assert(result.message.length > 10);
+      },
+    },
+    {
+      name: 'Clarification retains both original requested operations',
+      text: 'Баласи, исправь:\n1. авара дурмах — перенеси как пример к значению 1 слова «несуществующая основа». Новое слово не создавай.\n2. авария — удалить.\n\nУточнение редактора:\nБаласи, основная запись для первого пункта — авара, значение 1.',
+      options: {
+        requestItems: [1, 2],
+        clarificationQuestion:
+          'Основная запись не найдена. В какое слово перенести пример?',
+      },
+      check: (result) => {
+        assert.equal(result.action, 'dictionary_actions');
+        assert(
+          result.operations.some(
+            (op) =>
+              op.type === 'move_example' &&
+              op.target === 'авара' &&
+              op.sense === 1 &&
+              op.sourceItem === 1,
+          ),
+        );
+        assert(
+          result.operations.some(
+            (op) =>
+              op.type === 'delete_word' &&
+              op.word === 'авария' &&
+              op.sourceItem === 2,
+          ),
+        );
+      },
+    },
     {
       name: 'Edik list with agreed target meanings',
       text: 'Баласи, исправь:\n1. аваралых этмах — бездельничать, комментарий - заниматься ерундой; не имеет самостоятельного значения, необходимо перенести как пример слова аваралых\n2. авара дурмах — бездельничать (гл.), комментарий - не имеет самостоятельного значения, необходимо перенести как пример слова авара',
@@ -144,11 +232,14 @@ async function main() {
       check: (result) => assert.equal(result.action, 'reply'),
     },
   ];
+  const originalList = cases.find(
+    (test) => test.name === 'Edik list with agreed target meanings',
+  );
   cases.push({
     name: 'Original screenshot without earlier agreement',
-    text: cases[0].text,
+    text: originalList.text,
     check: (result) => {
-      if (result.action === 'dictionary_actions') cases[0].check(result);
+      if (result.action === 'dictionary_actions') originalList.check(result);
       else {
         assert.equal(result.action, 'reply');
         assert(!/кавычк|по шаблону|формате.*Баласи/i.test(result.message));
@@ -160,7 +251,7 @@ async function main() {
     name: 'Short follow-up resolves the original two-item request',
     text: 'К первому.',
     history: [
-      { username: 'editor', text: cases[0].text, sentAt: new Date() },
+      { username: 'editor', text: originalList.text, sentAt: new Date() },
       {
         username: 'Баласи',
         isBot: true,
@@ -168,7 +259,41 @@ async function main() {
         sentAt: new Date(),
       },
     ],
-    check: cases[0].check,
+    check: originalList.check,
+  });
+  const hundred = Array.from({ length: 100 }, (_, index) => ({
+    id: 1000 + index,
+    word: `тестовое слово ${index + 1}`,
+    translation: `старый перевод ${index + 1}`,
+    senses: null,
+    status: 'active',
+    kind: 'word',
+    partOfSpeech: null,
+  }));
+  rows.push(...hundred);
+  cases.push({
+    name: 'Complete hundred-item correction plan',
+    text:
+      'Баласи, замени полностью переводы в каждом из 100 пунктов:\n' +
+      hundred
+        .map(
+          (row, index) =>
+            `${index + 1}. ${row.word} — новый перевод ${index + 1}`,
+        )
+        .join('\n'),
+    options: { requestItems: hundred.map((_, index) => index + 1) },
+    check: (result) => {
+      assert.equal(result.action, 'dictionary_actions');
+      for (const [index, row] of hundred.entries())
+        assert(
+          result.operations.some(
+            (op) =>
+              op.word === row.word &&
+              op.sourceItem === index + 1 &&
+              op.translation === `новый перевод ${index + 1}`,
+          ),
+        );
+    },
   });
   const caseIndex = process.argv.indexOf('--case');
   const selected =

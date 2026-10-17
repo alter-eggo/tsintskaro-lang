@@ -1,6 +1,7 @@
 import { TelegramUpdate } from './telegram.update';
 import { WordReviewDecisionError } from '../word-review/word-review-decision';
 import { DictionaryContentError } from '../dictionary/dictionary-content';
+import { DictionaryRequestService } from './dictionary-request.service';
 
 describe('TelegramUpdate bot mentions', () => {
   const makeUpdate = (senderUsername = 'AAlxnv') => {
@@ -179,6 +180,52 @@ describe('TelegramUpdate bot mentions', () => {
         key === 'wordReviewCoordinatorIds' ? [] : 100,
       ),
     };
+    const requests: any[] = [];
+    const requestRepo: any = {
+      createQueryBuilder: () => {
+        let scope: string, messageId: number;
+        const query = {
+          where: (_sql, args) => {
+            scope = args.scope;
+            return query;
+          },
+          andWhere: (_sql, args) => {
+            messageId = JSON.parse(args.part)[0].messageId;
+            return query;
+          },
+          getOne: async () =>
+            requests.find(
+              (row) =>
+                row.scope === scope &&
+                row.parts.some((part) => part.messageId === messageId),
+            ),
+        };
+        return query;
+      },
+      findOne: async ({ where }) =>
+        structuredClone(
+          requests.filter((row) => row.scope === where.scope).at(-1) ?? null,
+        ),
+      findOneBy: async ({ id }) =>
+        structuredClone(requests.find((row) => row.id === id) ?? null),
+      create: (row) => row,
+      save: async (row) => {
+        row.id ??= requests.length + 1;
+        requests[row.id - 1] = structuredClone(row);
+        return row;
+      },
+      update: async (where, changes) => {
+        const row = requests.find((row) =>
+          Object.entries(where).every(([key, value]) => row[key] === value),
+        );
+        if (row) Object.assign(row, changes);
+      },
+    };
+    requestRepo.manager = {
+      transaction: async (work) =>
+        work({ getRepository: () => requestRepo, query: async () => [] }),
+    };
+    const dictionaryRequests = new DictionaryRequestService(requestRepo);
     const update = new TelegramUpdate(
       bot as any,
       telegramService as any,
@@ -191,6 +238,7 @@ describe('TelegramUpdate bot mentions', () => {
       wordReviewService as any,
       openaiUsageService as any,
       config as any,
+      dictionaryRequests,
     );
 
     return {
@@ -206,8 +254,146 @@ describe('TelegramUpdate bot mentions', () => {
       openaiUsageService,
       bot,
       config,
+      dictionaryRequests,
+      requests,
     };
   };
+
+  it('collects all three parts of a numbered correction list before changing the dictionary', async () => {
+    const { update, ctx, openaiService, telegramService } =
+      makeUpdate('Elvardi');
+    const parts = [
+      'Баласи, исправь:\n1. первый — перевод А',
+      '2. второй — перевод Б',
+      '3. третий — перевод В',
+    ];
+    for (const [index, text] of parts.entries()) {
+      ctx.message = {
+        message_id: 100 + index,
+        text,
+        from: ctx.from,
+        message_thread_id: 44,
+      };
+      await update.onText(ctx as any);
+    }
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(telegramService.addMessage).not.toHaveBeenCalled();
+    ctx.message = {
+      message_id: 103,
+      text: 'Готово',
+      from: ctx.from,
+      message_thread_id: 44,
+    };
+    await update.onText(ctx as any);
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    const sent = (openaiService.processBotMention as jest.Mock).mock
+      .calls[0][0];
+    for (const part of parts) expect(sent).toContain(part);
+  });
+
+  it('keeps split requests separate by sender and topic, and rejects incomplete numbering', async () => {
+    const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
+    for (const [id, text, sender, thread] of [
+      [100, 'Баласи, исправь:\n1. первый — А', 42, 44],
+      [101, 'Баласи, исправь:\n1. другой — Б', 43, 44],
+      [102, 'Баласи, исправь:\n1. третья тема — В', 42, 45],
+      [103, '3. третий — Г', 42, 44],
+      [104, 'Готово', 42, 44],
+    ] as const) {
+      const from = { ...ctx.from, id: sender };
+      await update.onText({
+        ...ctx,
+        from,
+        message: { message_id: id, text, from, message_thread_id: thread },
+      } as any);
+    }
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(requests).toHaveLength(3);
+    expect(ctx.reply).toHaveBeenLastCalledWith(
+      expect.stringContaining('Не хватает номеров: 2'),
+      expect.anything(),
+    );
+  });
+
+  it('keeps text following the word готово and counts indented list items', async () => {
+    const { update, ctx, openaiService } = makeUpdate('Elvardi');
+    const parts = [
+      'Баласи, исправь:\n1. первый — А',
+      'Готово, вот последний пункт:\n    2. второй — Б',
+    ];
+    for (const [index, text] of parts.entries())
+      await update.onText({
+        ...ctx,
+        message: { message_id: 100 + index, text, from: ctx.from },
+      } as any);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    await update.onText({
+      ...ctx,
+      message: { message_id: 102, text: 'Готово 2', from: ctx.from },
+    } as any);
+    const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+    expect(call[0]).toContain(parts[1]);
+    expect(call[4].requestItems).toEqual([1, 2]);
+  });
+
+  it('allows explicitly intentional gaps without losing their original item numbers', async () => {
+    const { update, ctx, openaiService } = makeUpdate('Elvardi');
+    for (const [index, text] of [
+      'Баласи, исправь:\n27. первый — А\n51. второй — Б',
+      'Готово, только перечисленные пункты',
+    ].entries()) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: 100 + index, text, from: ctx.from },
+      } as any);
+    }
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    expect(
+      (openaiService.processBotMention as jest.Mock).mock.calls[0][4]
+        .requestItems,
+    ).toEqual([27, 51]);
+  });
+
+  it('retains a full request through clarification and does not apply an incomplete model plan', async () => {
+    const { update, ctx, openaiService, dictionaryService, requests } =
+      makeUpdate('Elvardi');
+    const commit = jest.spyOn((update as any).dictionaryRequests, 'commit');
+    for (const [id, text] of [
+      [100, 'Баласи, исправь:\n1. первый — А\n2. второй — Б'],
+      [101, 'Готово'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: id, text, from: ctx.from },
+      } as any);
+    }
+    expect(requests[0].status).toBe('ready');
+    openaiService.processBotMention.mockResolvedValueOnce({
+      action: 'dictionary_actions',
+      operations: [{ type: 'delete_word', word: 'первый', sourceItem: 1 }],
+      snapshots: [],
+    } as any);
+    await update.onText({
+      ...ctx,
+      message: {
+        message_id: 102,
+        text: 'Баласи, второе слово — второй',
+        from: ctx.from,
+      },
+    } as any);
+    const sent = (openaiService.processBotMention as jest.Mock).mock.calls.at(
+      -1,
+    )[0];
+    expect(sent).toContain('1. первый — А');
+    expect(sent).toContain('2. второй — Б');
+    expect(sent).toContain('Уточнение редактора:');
+    expect(commit).not.toHaveBeenCalled();
+    expect(dictionaryService.applyActions).not.toHaveBeenCalled();
+    expect(requests[0].status).toBe('ready');
+    expect(ctx.reply).toHaveBeenLastCalledWith(
+      expect.stringContaining('не разобраны пункты 2'),
+    );
+  });
 
   it.each([
     'Баласи, исправь:\n1. аваралых этмах — бездельничать, комментарий - заниматься ерундой; не имеет самостоятельного значения, необходимо перенести как пример слова аваралых\n2. авара дурмах — бездельничать (гл.), комментарий - не имеет самостоятельного значения, необходимо перенести как пример слова авара',
@@ -295,7 +481,12 @@ describe('TelegramUpdate bot mentions', () => {
     openaiService.processBotMention.mockResolvedValueOnce({
       action: 'dictionary_actions',
       operations: [
-        { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+        {
+          type: 'move_example',
+          word: 'авара дурмах',
+          target: 'авара',
+          sense: 1,
+        },
       ],
       snapshots: [],
     } as any);
@@ -386,7 +577,12 @@ describe('TelegramUpdate bot mentions', () => {
     openaiService.processBotMention.mockResolvedValueOnce({
       action: 'dictionary_actions',
       operations: [
-        { type: 'move_example', word: 'авара дурмах', target: 'авара', sense: 1 },
+        {
+          type: 'move_example',
+          word: 'авара дурмах',
+          target: 'авара',
+          sense: 1,
+        },
       ],
       snapshots: [],
     } as any);

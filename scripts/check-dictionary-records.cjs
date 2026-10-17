@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 const Module = require('node:module');
 const ts = require('typescript');
 const { Client } = require('pg');
+const { TelegramUpdate } = require('../src/telegram/telegram.update');
 const { DataSource } = require('typeorm');
 const { Word } = require('../src/dictionary/entities/word.entity');
 const {
@@ -22,6 +23,20 @@ const { DictionaryService } = require('../src/dictionary/dictionary.service');
 const { DictionaryEditor } = require('../src/dictionary/dictionary-editor');
 const { renderSenses } = require('../src/dictionary/dictionary-content');
 const { actionWords } = require('../src/dictionary/dictionary-actions');
+const {
+  DictionaryRequest,
+} = require('../src/telegram/entities/dictionary-request.entity');
+const {
+  DictionaryRequestService,
+  requestItems,
+  requestText,
+} = require('../src/telegram/dictionary-request.service');
+const {
+  WordReviewBatch,
+} = require('../src/word-review/entities/word-review-batch.entity');
+const {
+  WordReviewItem,
+} = require('../src/word-review/entities/word-review-item.entity');
 
 async function main() {
   const env = { ...parseEnv(fs.readFileSync('.env', 'utf8')), ...process.env };
@@ -48,7 +63,14 @@ async function main() {
       url,
       ssl,
       schema,
-      entities: [Word, WordEditHistory, WordTranslationHistory],
+      entities: [
+        Word,
+        WordEditHistory,
+        WordTranslationHistory,
+        DictionaryRequest,
+        WordReviewBatch,
+        WordReviewItem,
+      ],
       synchronize: true,
       logging: false,
     });
@@ -509,6 +531,324 @@ async function main() {
       'PASS model plans: multi-item rollback, permissions, required reads, stale-version rejection, replay, ordered mixed operations and preserved search.',
     );
 
+    // A deletion followed by an unresolved correction must roll back the deletion too.
+    const protectedWord = await seed('защищённая запись', 'старое значение');
+    const failingPlan = [
+      { type: 'delete_word', word: protectedWord.word },
+      {
+        type: 'update_word',
+        word: 'отсутствующая запись',
+        translation: 'новое значение',
+      },
+    ];
+    const beforeFailedPlan = await history.count();
+    await assert.rejects(
+      dictionary.applyActions(
+        failingPlan,
+        { ...actor, messageId: 9000 },
+        await dictionary.inspectRecords(actionWords(failingPlan)),
+      ),
+      /Не нашёл запись/,
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: protectedWord.id })).status,
+      'active',
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: protectedWord.id })).translation,
+      'старое значение',
+    );
+    assert.equal(await history.count(), beforeFailedPlan);
+    const corrected = [
+      {
+        type: 'update_word',
+        word: protectedWord.word,
+        translation: 'уточнённое значение',
+      },
+    ];
+    await dictionary.applyActions(
+      corrected,
+      { ...actor, messageId: 9001 },
+      await dictionary.inspectRecords(actionWords(corrected)),
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: protectedWord.id })).translation,
+      'уточнённое значение',
+    );
+    console.log(
+      'PASS missing correction: earlier deletion rolled back; old value and history preserved; explicit clarification succeeds.',
+    );
+
+    const requestRepo = db.getRepository(DictionaryRequest);
+    let requests = new DictionaryRequestService(requestRepo);
+    const scope = '-987654:44:42';
+    const receive = (messageId, text, addressed = false, otherScope = scope) =>
+      requests.receive({ scope: otherScope, messageId, text, addressed });
+    const hundred = Array.from({ length: 100 }, (_, index) => ({
+      type: 'update_word',
+      word: `тест ${index + 1}`,
+      translation: `новый перевод ${index + 1}`,
+      sourceItem: index + 1,
+    }));
+    await repo.save(
+      hundred.map((operation) =>
+        repo.create({
+          word: operation.word,
+          translation: 'исходный перевод',
+          source: 'chat',
+        }),
+      ),
+    );
+    const lines = hundred.map(
+      (operation) =>
+        `${operation.sourceItem}. ${operation.word} — ${operation.translation}`,
+    );
+    await receive(
+      10000,
+      'Баласи, исправь:\n' + lines.slice(0, 34).join('\n'),
+      true,
+    );
+    await Promise.all([
+      receive(10002, lines.slice(67).join('\n')),
+      receive(10001, lines.slice(34, 67).join('\n')),
+    ]);
+    // New service instance models restart: all input lives in PostgreSQL.
+    requests = new DictionaryRequestService(requestRepo);
+    await receive(10001, lines.slice(34, 67).join('\n'));
+    const ready = await receive(10003, 'Готово 100');
+    assert.equal(ready.type, 'process');
+    assert.equal(ready.request.parts.length, 3);
+    assert.deepEqual(
+      requestItems(ready.request),
+      hundred.map((operation) => operation.sourceItem),
+    );
+    for (const line of lines) assert(requestText(ready.request).includes(line));
+    assert.equal(
+      (await repo.findOneByOrFail({ word: 'тест 100' })).translation,
+      'исходный перевод',
+    );
+    const reads = await dictionary.inspectRecords(actionWords(hundred));
+    const saveHundred = () =>
+      requests.commit(ready.request, (manager) =>
+        new DictionaryService(manager.getRepository(Word)).applyActions(
+          hundred,
+          { ...actor, messageId: 10000 },
+          reads,
+        ),
+      );
+    const repeated = await Promise.allSettled([saveHundred(), saveHundred()]);
+    assert.equal(
+      repeated.filter((result) => result.status === 'fulfilled').length,
+      1,
+    );
+    assert.equal((await receive(10004, 'Готово')).type, 'notice');
+    for (const operation of hundred)
+      assert.equal(
+        (await repo.findOneByOrFail({ word: operation.word })).translation,
+        operation.translation,
+      );
+    assert.equal(
+      await history.countBy({ requestKey: `${actor.chatId}:10000:actions` }),
+      1,
+    );
+
+    await receive(
+      10100,
+      'Баласи, исправь:\n1. защищённая запись — исправление',
+      true,
+    );
+    const staleDraft = (await receive(10101, 'Готово')).request;
+    await receive(10102, '2. тест 1 — ещё одно исправление');
+    let writes = 0;
+    await assert.rejects(
+      requests.commit(staleDraft, async () => {
+        writes++;
+      }),
+      /дополнился/,
+    );
+    assert.equal(writes, 0);
+    await receive(10103, 'Отмени список');
+    await assert.rejects(
+      requests.commit(staleDraft, async () => {
+        writes++;
+      }),
+      /отменён/,
+    );
+    assert.equal(writes, 0);
+
+    // A failed operation leaves both the data and the complete draft available for clarification.
+    await receive(
+      10200,
+      'Баласи, исправь:\n1. защищённая запись — перенеси в пример отсутствующей записи',
+      true,
+    );
+    const pending = (await receive(10201, 'Готово')).request;
+    const missingMove = [
+      {
+        type: 'move_example',
+        word: protectedWord.word,
+        target: 'отсутствующая основа',
+        sense: 1,
+      },
+    ];
+    const moveReads = await dictionary.inspectRecords(actionWords(missingMove));
+    await assert.rejects(
+      requests.commit(pending, (manager) =>
+        new DictionaryService(manager.getRepository(Word)).applyActions(
+          missingMove,
+          { ...actor, messageId: 10200 },
+          moveReads,
+        ),
+      ),
+      /Не нашёл основную запись/,
+    );
+    assert.equal(
+      (await requestRepo.findOneByOrFail({ id: pending.id })).status,
+      'ready',
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: protectedWord.id })).status,
+      'active',
+    );
+    await requests.rememberQuestion(
+      pending,
+      'В какую основную запись перенести?',
+    );
+    const clarified = await receive(
+      10202,
+      'Баласи, основная запись — тест 1',
+      true,
+    );
+    assert.equal(clarified.type, 'process');
+    assert(requestText(clarified.request).includes('отсутствующей записи'));
+    assert(requestText(clarified.request).includes('основная запись — тест 1'));
+    const fixedMove = [{ ...missingMove[0], target: 'тест 1' }];
+    const fixedReads = await dictionary.inspectRecords(actionWords(fixedMove));
+    await requests.commit(clarified.request, (manager) =>
+      new DictionaryService(manager.getRepository(Word)).applyActions(
+        fixedMove,
+        { ...actor, messageId: 10200 },
+        fixedReads,
+      ),
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: protectedWord.id })).status,
+      'embedded',
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ word: 'тест 1' })).senses[0].examples.at(-1)
+        .translation,
+      'уточнённое значение',
+    );
+    assert.equal(
+      (await requestRepo.findOneByOrFail({ id: pending.id })).status,
+      'applied',
+    );
+    console.log(
+      'PASS persistent requests: 100 items in 3 parts, out-of-order continuations, restart, duplicate delivery, concurrent completion, stale plans, cancellation and retry after missing target.',
+    );
+
+    // Exercise the real Telegram entry point, persistence, plan checks and DB commit together.
+    const routedPlan = ['а', 'б', 'в'].map((suffix, index) => ({
+      type: 'update_word',
+      word: `сквозной тест ${suffix}`,
+      translation: `результат ${suffix}`,
+      sourceItem: index + 1,
+    }));
+    for (const operation of routedPlan)
+      await seed(operation.word, 'до исправления');
+    const replies = [];
+    let modelCalls = 0;
+    const telegramContext = {
+      saveContextMessage: async () => {},
+      getRecentMessages: async () => [],
+      getBotMemory: async () => [],
+      addMessage: async () => {
+        throw new Error('Correction escaped to discussion buffer');
+      },
+    };
+    const model = {
+      processBotMention: async (text, _history, _memory, _entries, options) => {
+        modelCalls++;
+        assert.deepEqual(options.requestItems, [1, 2, 3]);
+        for (const operation of routedPlan)
+          assert(text.includes(operation.word));
+        return {
+          action: 'dictionary_actions',
+          operations: routedPlan,
+          snapshots: await dictionary.inspectRecords(actionWords(routedPlan)),
+        };
+      },
+    };
+    const handler = new TelegramUpdate(
+      {},
+      telegramContext,
+      model,
+      dictionary,
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      { get: () => 100 },
+      requests,
+    );
+    const from = { id: 42, username: 'Elvardi' };
+    const context = {
+      chat: { id: -987655, type: 'supergroup' },
+      from,
+      botInfo: { id: 900, username: 'fixture_bot' },
+      reply: async (text) => {
+        replies.push(text);
+      },
+      sendChatAction: async () => true,
+    };
+    for (const [index, operation] of routedPlan.entries())
+      await handler.onText({
+        ...context,
+        message: {
+          message_id: 12000 + index,
+          message_thread_id: 44,
+          from,
+          text: `${index === 0 ? 'Баласи, исправь:\n' : ''}${index + 1}. ${operation.word} — ${operation.translation}`,
+        },
+      });
+    assert.equal(modelCalls, 0);
+    await handler.onText({
+      ...context,
+      message: {
+        message_id: 12003,
+        message_thread_id: 44,
+        from,
+        text: 'Готово 3',
+      },
+    });
+    assert.equal(modelCalls, 1);
+    for (const operation of routedPlan)
+      assert.equal(
+        (await repo.findOneByOrFail({ word: operation.word })).translation,
+        operation.translation,
+      );
+    assert(replies.some((text) => text.includes('✅ Изменения сохранены')));
+    await handler.onText({
+      ...context,
+      message: {
+        message_id: 12004,
+        message_thread_id: 44,
+        from,
+        text: 'Готово',
+      },
+    });
+    assert.equal(modelCalls, 1);
+    assert.equal(
+      await history.countBy({ requestKey: '-987655:12000:actions' }),
+      1,
+    );
+    console.log(
+      'PASS complete Telegram flow: 3 messages -> one model plan -> one PostgreSQL transaction -> success reply; retry makes no duplicate.',
+    );
+
     // Execute the website's actual DB functions against this same disposable schema.
     const websiteFile = path.resolve(
       __dirname,
@@ -603,15 +943,30 @@ async function main() {
       await repo.save(avaralyh);
       const previewUrl = new URL(url);
       previewUrl.searchParams.set('options', `-c search_path=${schema}`);
-      const child = spawn('pnpm', ['exec', 'next', 'dev', '--port', '3007'], {
-        cwd: path.resolve(__dirname, '../../tsintskaro-website'),
-        env: {
-          ...process.env,
-          DATABASE_URL: previewUrl.toString(),
-          ...(env.DB_CERT ? { DB_CERT: env.DB_CERT } : {}),
+      const child = spawn(
+        'pnpm',
+        [
+          'exec',
+          'next',
+          'dev',
+          '--webpack',
+          '--port',
+          '3007',
+          '--hostname',
+          '127.0.0.1',
+        ],
+        {
+          cwd:
+            process.env.DICTIONARY_PREVIEW_DIR ||
+            path.resolve(__dirname, '../../tsintskaro-website'),
+          env: {
+            ...process.env,
+            DATABASE_URL: previewUrl.toString(),
+            ...(env.DB_CERT ? { DB_CERT: env.DB_CERT } : {}),
+          },
+          stdio: ['ignore', 'inherit', 'inherit'],
         },
-        stdio: ['ignore', 'inherit', 'inherit'],
-      });
+      );
       console.log(
         'PREVIEW uses disposable records only: http://localhost:3007/language. Stop this process to remove the test schema.',
       );

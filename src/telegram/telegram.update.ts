@@ -52,6 +52,14 @@ import {
   WORD_KIND_LABELS,
 } from '../dictionary/dictionary-content';
 import { hasWordDeletionGrant } from '../dictionary/deletion-permissions';
+import {
+  DictionaryRequestService,
+  requestText,
+  requestItems,
+} from './dictionary-request.service';
+import { DictionaryRequest } from './entities/dictionary-request.entity';
+import { Word } from '../dictionary/entities/word.entity';
+import { assertRequestCoverage } from '../dictionary/dictionary-actions';
 
 type ReportGenerationStage =
   | 'load_messages'
@@ -96,6 +104,7 @@ export class TelegramUpdate implements OnModuleInit {
     private wordReviewService: WordReviewService,
     private openaiUsageService: OpenaiUsageService,
     private config: ConfigService,
+    private dictionaryRequests: DictionaryRequestService,
   ) {
     this.threshold = this.config.get('messageThreshold') || 100;
     this.logger.log(`Bot initialized with threshold: ${this.threshold}`);
@@ -284,11 +293,69 @@ export class TelegramUpdate implements OnModuleInit {
     const isUsernameMention =
       ctx.botInfo?.username &&
       text.toLowerCase().includes(`@${ctx.botInfo.username.toLowerCase()}`);
-    if (
+    const addressed = Boolean(
       TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
       isReplyToBot ||
-      isUsernameMention
+      isUsernameMention,
+    );
+    const original = ctx.message as {
+      forward_origin?: unknown;
+      forward_from?: unknown;
+      forward_from_chat?: unknown;
+      sender_chat?: unknown;
+    };
+    const reviewDecision = addressed ? parseReviewDecision(text) : null;
+    if (
+      ctx.from?.id &&
+      message.message_id != null &&
+      !original.forward_origin &&
+      !original.forward_from &&
+      !original.forward_from_chat &&
+      !original.sender_chat &&
+      (!reviewDecision || reviewDecision === 'invalid')
     ) {
+      try {
+        const receipt = await this.dictionaryRequests.receive({
+          scope: `${chatId}:${threadId ?? 0}:${ctx.from.id}`,
+          messageId: message.message_id,
+          text,
+          addressed,
+        });
+        if (receipt) {
+          await this.rememberContextMessage({
+            chatId,
+            threadId: threadId ?? null,
+            telegramMessageId: message.message_id,
+            text,
+            username,
+            isBot: false,
+            sentAt: message.date ? new Date(message.date * 1000) : new Date(),
+          });
+          if (receipt.type === 'notice')
+            await this.replyAndRemember(ctx, receipt.text, {
+              reply_parameters: { message_id: message.message_id },
+            });
+          else
+            await this.handleBotMention(
+              ctx,
+              requestText(receipt.request),
+              username,
+              message.message_id,
+              threadId ?? null,
+              receipt.request,
+            );
+          return;
+        }
+      } catch (error) {
+        this.logger.error('Could not collect dictionary request', error);
+        await this.replyAndRemember(
+          ctx,
+          'Не удалось принять или обработать список. Уже полученные части сохранены; повтори последнее сообщение.',
+        );
+        return;
+      }
+    }
+    if (addressed) {
       await this.rememberContextMessage({
         chatId,
         threadId: threadId ?? null,
@@ -361,10 +428,11 @@ export class TelegramUpdate implements OnModuleInit {
     username: string,
     messageId: number | undefined,
     threadId: number | null,
+    request?: DictionaryRequest,
   ): Promise<void> {
     const chatId = ctx.chat!.id;
     this.logger.log(`[Chat ${chatId}] @${username} addressed bot: "${text}"`);
-    const reviewDecision = parseReviewDecision(text);
+    const reviewDecision = request ? null : parseReviewDecision(text);
     if (reviewDecision != null && reviewDecision !== 'invalid') {
       await this.handleReviewDecision(ctx, reviewDecision, messageId, threadId);
       return;
@@ -424,7 +492,7 @@ export class TelegramUpdate implements OnModuleInit {
     let result;
     try {
       result =
-        replyToMessage || readOnly
+        replyToMessage || readOnly || request
           ? await this.openaiService.processBotMention(
               text,
               recentMessages,
@@ -433,6 +501,12 @@ export class TelegramUpdate implements OnModuleInit {
               {
                 ...(replyToMessage ? { replyToMessage } : {}),
                 ...(readOnly ? { readOnly: true } : {}),
+                ...(request
+                  ? {
+                      requestItems: requestItems(request),
+                      clarificationQuestion: request.question,
+                    }
+                  : {}),
               },
             )
           : await this.openaiService.processBotMention(
@@ -463,6 +537,8 @@ export class TelegramUpdate implements OnModuleInit {
     }
 
     if (result.action === 'reply') {
+      if (request)
+        await this.dictionaryRequests.rememberQuestion(request, result.message);
       this.logger.log(`[Chat ${chatId}] AI reply: ${result.message}`);
       if (messageId != null) {
         for (const chunk of this.chunkBotAnswer(result.message)) {
@@ -482,6 +558,13 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
     if (result.action === 'add_memory') {
+      if (request) {
+        await this.replyAndRemember(
+          ctx,
+          'Список не применён: ожидается исправление словаря или уточнение. Полученный текст сохранён.',
+        );
+        return;
+      }
       await this.saveBotMemory(
         ctx,
         chatId,
@@ -495,18 +578,32 @@ export class TelegramUpdate implements OnModuleInit {
 
     let saved = false;
     try {
-      const batch = await this.dictionaryService.applyActions(
-        result.operations,
-        {
-          userId: ctx.from!.id,
-          username: this.dictionarySenderUsername(ctx),
-          chatId,
-          threadId,
-          messageId: messageId ?? null,
-          canRemoveEntry: await this.canDeleteDictionaryWords(ctx),
-        },
-        result.snapshots,
-      );
+      if (request)
+        assertRequestCoverage(result.operations, requestItems(request));
+      const actor = {
+        userId: ctx.from!.id,
+        username: this.dictionarySenderUsername(ctx),
+        chatId,
+        threadId,
+        messageId: request
+          ? Number(request.firstMessageId)
+          : (messageId ?? null),
+        canRemoveEntry: await this.canDeleteDictionaryWords(ctx),
+      };
+      const batch = request
+        ? await this.dictionaryRequests.commit(request, (manager) =>
+            new DictionaryService(manager.getRepository(Word)).applyActions(
+              result.operations,
+              actor,
+              result.snapshots,
+            ),
+          )
+        : await this.dictionaryService.applyActions(
+            result.operations,
+            actor,
+            result.snapshots,
+          );
+      if (request) this.dictionaryService.invalidateCache();
       saved = true;
       const transfers = result.operations
         .filter((action) => action.type === 'move_example')

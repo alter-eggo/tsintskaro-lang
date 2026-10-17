@@ -214,6 +214,9 @@ export class DictionaryService {
             throw new DictionaryContentError(
               `Уточни написание: «${action.word}» совпадает с другой записью. Ничего не изменено.`,
             );
+        } else if (action.type === 'keep_word') {
+          // A checked, explicitly unchanged item still participates in batch coverage.
+          assertEditableWord(row);
         } else if (action.type === 'update_word') {
           const updated = await service.updateWord({
             oldWord: action.word,
@@ -258,7 +261,7 @@ export class DictionaryService {
     return result;
   }
 
-  private invalidateCache() {
+  invalidateCache() {
     this.cache = null;
     this.cacheById = null;
     this.cacheByFolded = null;

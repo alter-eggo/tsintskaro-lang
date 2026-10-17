@@ -11,6 +11,8 @@ import { CollectedMessage } from './entities/collected-message.entity';
 import { SummaryConfig } from './entities/summary-config.entity';
 import { SummaryReport } from './entities/summary-report.entity';
 import { BotMemory } from './entities/bot-memory.entity';
+import { DictionaryRequest } from './entities/dictionary-request.entity';
+import { DictionaryRequestService } from './dictionary-request.service';
 
 @Module({
   imports: [
@@ -19,6 +21,7 @@ import { BotMemory } from './entities/bot-memory.entity';
       SummaryConfig,
       SummaryReport,
       BotMemory,
+      DictionaryRequest,
     ]),
     OpenaiModule,
     DictionaryModule,
@@ -26,6 +29,6 @@ import { BotMemory } from './entities/bot-memory.entity';
     FactDayModule,
     WordReviewModule,
   ],
-  providers: [TelegramService, TelegramUpdate],
+  providers: [TelegramService, TelegramUpdate, DictionaryRequestService],
 })
 export class TelegramModule {}

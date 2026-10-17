@@ -241,7 +241,7 @@ describe('OpenaiService requests', () => {
     expect(respond).toHaveBeenCalledTimes(1);
     const request = respond.mock.calls[0][0] as any;
     expect(request.text.format.name).toBe('bot_mention_action');
-    expect(request.prompt_cache_key).toBe('tsintskaro:bot_mention:v8');
+    expect(request.prompt_cache_key).toBe('tsintskaro:bot_mention:v9');
     expect(request.tool_choice).toBe('auto');
     expect(request.reasoning).toEqual({ effort: 'medium' });
     expect(request.max_output_tokens).toBe(8000);
@@ -555,6 +555,65 @@ describe('OpenaiService requests', () => {
     expect(respond).toHaveBeenCalledTimes(3);
     expect((respond.mock.calls[1][0] as any).input.at(-1).content).toContain(
       'не проверены все записи',
+    );
+  });
+
+  it('enforces read-only even when the model returns a mutation', async () => {
+    const { service, respond, dictionaryService } = makeService();
+    respond.mockResolvedValueOnce(
+      response(
+        JSON.stringify({
+          action: 'dictionary_actions',
+          operations: [{ type: 'delete_word', word: 'авария' }],
+        }),
+      ),
+    );
+    const result = await service.processBotMention(
+      'Баласи, удали аварию',
+      [],
+      [],
+      [],
+      { readOnly: true },
+    );
+    expect(result.action).toBe('reply');
+    expect(dictionaryService.inspectRecords).not.toHaveBeenCalled();
+  });
+
+  it('asks for clarification instead of returning a partial numbered plan', async () => {
+    const { service, respond } = makeService();
+    respond
+      .mockResolvedValueOnce(
+        response(
+          JSON.stringify({
+            action: 'dictionary_actions',
+            operations: [
+              { type: 'delete_word', word: 'авария', sourceItem: 1 },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        response(
+          JSON.stringify({
+            action: 'reply',
+            message: 'Какое точное слово указано во втором пункте?',
+          }),
+        ),
+      );
+    await expect(
+      service.processBotMention(
+        '1. авария — удалить\n2. неизвестное — исправить',
+        [],
+        [],
+        [],
+        { requestItems: [1, 2] },
+      ),
+    ).resolves.toEqual({
+      action: 'reply',
+      message: 'Какое точное слово указано во втором пункте?',
+    });
+    expect((respond.mock.calls[1][0] as any).input.at(-1).content).toContain(
+      'не разобраны пункты 2',
     );
   });
 
