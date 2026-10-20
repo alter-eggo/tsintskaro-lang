@@ -9,6 +9,7 @@ import {
 export interface DictionaryRequestPart {
   messageId: number;
   text: string;
+  addressed?: boolean;
   clarification?: boolean;
 }
 

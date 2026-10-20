@@ -292,11 +292,11 @@ export class TelegramUpdate implements OnModuleInit {
       message.reply_to_message?.from?.id === ctx.botInfo.id;
     const isUsernameMention =
       ctx.botInfo?.username &&
-      text.toLowerCase().includes(`@${ctx.botInfo.username.toLowerCase()}`);
+      new RegExp(`(?:^|\\s)@${ctx.botInfo.username}(?![a-z0-9_])`, 'i').test(
+        text,
+      );
     const addressed = Boolean(
-      TelegramUpdate.BOT_MENTION_REGEX.test(text) ||
-      isReplyToBot ||
-      isUsernameMention,
+      TelegramUpdate.BOT_MENTION_REGEX.test(text) || isUsernameMention,
     );
     const original = ctx.message as {
       forward_origin?: unknown;
@@ -304,7 +304,10 @@ export class TelegramUpdate implements OnModuleInit {
       forward_from_chat?: unknown;
       sender_chat?: unknown;
     };
-    const reviewDecision = addressed ? parseReviewDecision(text) : null;
+    // A reply alone is discussion. Only explicit review commands keep their
+    // existing shortcut when replying to a published batch.
+    const reviewDecision =
+      addressed || isReplyToBot ? parseReviewDecision(text) : null;
     if (
       ctx.from?.id &&
       message.message_id != null &&
@@ -320,6 +323,8 @@ export class TelegramUpdate implements OnModuleInit {
           messageId: message.message_id,
           text,
           addressed,
+          replyToMessageId: message.reply_to_message?.message_id,
+          replyToBot: isReplyToBot,
         });
         if (receipt) {
           await this.rememberContextMessage({
@@ -355,7 +360,7 @@ export class TelegramUpdate implements OnModuleInit {
         return;
       }
     }
-    if (addressed) {
+    if (addressed || (reviewDecision && reviewDecision !== 'invalid')) {
       await this.rememberContextMessage({
         chatId,
         threadId: threadId ?? null,

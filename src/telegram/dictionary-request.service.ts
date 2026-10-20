@@ -3,31 +3,12 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, Repository } from 'typeorm';
 import { DictionaryContentError } from '../dictionary/dictionary-content';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
-
-export function numberedItems(text: string): number[] {
-  const clean = text.replace(/^\s*(?:(?:баласи|бот)[\s,:!.—-]+|@\w+\s*)/i, '');
-  return [...clean.matchAll(/^[ \t]*(\d+)[.)]\s+\S/gm)].map((match) =>
-    Number(match[1]),
-  );
-}
-
-export function requestText(request: DictionaryRequest): string {
-  return request.parts
-    .map(
-      (part) =>
-        `${part.clarification ? '\nУточнение редактора:\n' : ''}${part.text}`,
-    )
-    .join('\n');
-}
-
-export function requestItems(request: DictionaryRequest): number[] {
-  return numberedItems(
-    request.parts
-      .filter((part) => !part.clarification)
-      .map((part) => part.text)
-      .join('\n'),
-  );
-}
+import { numberedItems, requestContent } from './dictionary-request-content';
+export {
+  numberedItems,
+  requestItems,
+  requestText,
+} from './dictionary-request-content';
 
 export type RequestReceipt =
   | { type: 'notice'; text: string }
@@ -57,6 +38,8 @@ export class DictionaryRequestService {
     messageId: number;
     text: string;
     addressed: boolean;
+    replyToMessageId?: number;
+    replyToBot?: boolean;
   }): Promise<RequestReceipt | null> {
     const clean = input.text
       .replace(/^\s*(?:(?:баласи|бот)[\s,:!.—-]+|@\w+\s*)/i, '')
@@ -72,6 +55,10 @@ export class DictionaryRequestService {
       /^готово(?:[\s,:—-]+(\d+))?(?:[\s,]+только перечисленные(?: пункты)?)?[.!]?$/i,
     );
     const cancel = /^(?:отмени список|отмена списка)[.!]?$/i.test(clean);
+    const hasItems = numberedItems(clean).length > 0;
+    // Ordinary conversation must never be captured just because a draft is open.
+    if (!input.addressed && /^@\w+/.test(input.text.trim())) return null;
+    if (!input.addressed && !hasItems && !finish && !cancel) return null;
     return this.locked(input.scope, async (manager) => {
       const repo = manager.getRepository(DictionaryRequest);
       const seen = await repo
@@ -85,6 +72,15 @@ export class DictionaryRequestService {
         where: { scope: input.scope },
         order: { id: 'DESC' },
       });
+      if (
+        !input.addressed &&
+        input.replyToMessageId != null &&
+        !(input.replyToBot && (finish || cancel)) &&
+        !request?.parts.some(
+          (part) => part.messageId === input.replyToMessageId,
+        )
+      )
+        return null;
       if (seen)
         return {
           type: 'notice',
@@ -124,7 +120,18 @@ export class DictionaryRequestService {
         };
       }
       if (finish) {
-        const items = requestItems(request);
+        const content = requestContent(request);
+        const items = content.items;
+        if (!items.length)
+          return {
+            type: 'notice',
+            text: 'В черновике только обсуждение без обращения ко мне. Словарь не изменён.',
+          };
+        if (content.conflicts.length)
+          return {
+            type: 'notice',
+            text: `Разные варианты пунктов: ${content.conflicts.join(', ')}. Уточни только эти пункты, обратившись ко мне, затем напиши «Готово». Остальной список сохранён, повторять его не нужно.`,
+          };
         const unique = new Set(items);
         const missing: number[] = [];
         const last = Math.max(0, ...items);
@@ -149,30 +156,25 @@ export class DictionaryRequestService {
         const expected = finish[1];
         if (
           items.some((item) => !Number.isSafeInteger(item) || item < 1) ||
-          unique.size !== items.length ||
           (hasGap && !/только перечисленные/i.test(clean)) ||
           (expected && Number(expected) !== items.length)
         ) {
           return {
             type: 'notice',
-            text: `Список пока не применён. Получено ${items.length} пунктов (до №${last}). ${unique.size !== items.length ? 'Есть повторяющиеся номера.' : missing.length ? `Не хватает номеров: ${missing.join(', ')}. Если пропуски намеренные, напиши «Готово, только перечисленные пункты».` : 'Проверь количество и номера пунктов.'} Пришли недостающую часть или отмени список и отправь исправленный.`,
+            text: `Список пока не применён. Получено ${items.length} пунктов (до №${last}). ${missing.length ? `Не хватает номеров: ${missing.join(', ')}. Пришли только недостающие пункты. Если пропуски намеренные, напиши «Готово, только перечисленные пункты».` : 'Проверь количество и номера пунктов.'} Полученные пункты сохранены, повторять весь список не нужно.`,
           };
         }
         request.status = 'ready';
         await repo.save(request);
         return { type: 'process', request };
       }
-      if (
-        request.status === 'ready' &&
-        !input.addressed &&
-        !numberedItems(clean).length
-      )
-        return null;
       const clarification =
-        request.status === 'ready' && !numberedItems(clean).length;
+        request.status === 'ready' && input.addressed && !hasItems;
+      if (!hasItems && !clarification) return null;
       request.parts.push({
         messageId: input.messageId,
         text: input.text,
+        addressed: input.addressed,
         ...(clarification ? { clarification: true } : {}),
       });
       request.parts.sort((a, b) => a.messageId - b.messageId);
@@ -184,9 +186,10 @@ export class DictionaryRequestService {
       if (!clarification) request.status = 'collecting';
       await repo.save(request);
       if (clarification) return { type: 'process', request };
+      const content = requestContent(request);
       return {
         type: 'notice',
-        text: `Получено частей: ${request.parts.length}, пунктов: ${requestItems(request).length}. Словарь пока не изменён. Пришли продолжение, затем «Готово» (можно «Готово 100» для проверки количества). Для отмены — «Отмени список».`,
+        text: `Получено частей: ${content.partCount}, пунктов: ${content.items.length}. Словарь пока не изменён. Пришли продолжение, затем «Готово» (можно «Готово 100» для проверки количества).`,
       };
     });
   }

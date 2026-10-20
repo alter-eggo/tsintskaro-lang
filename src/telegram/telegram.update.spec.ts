@@ -291,6 +291,301 @@ describe('TelegramUpdate bot mentions', () => {
     for (const part of parts) expect(sent).toContain(part);
   });
 
+  it('ignores a message to another person while collecting a correction list', async () => {
+    const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
+    for (const [messageId, text] of [
+      [100, 'Баласи, исправь:\n1. первый — перевод А'],
+      [101, '@AAlxnv, Стас, посмотри, что хочет бот?'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: messageId, text, from: ctx.from },
+      } as any);
+    }
+    expect(ctx.reply).toHaveBeenCalledTimes(1);
+    expect(requests[0].parts).toHaveLength(1);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+  });
+
+  it('does not join a reply chain without an explicit bot address', async () => {
+    const { update, ctx, openaiService } = makeUpdate();
+    await update.onText({
+      ...ctx,
+      botInfo: { id: 900, username: 'balasi_bot' },
+      message: {
+        message_id: 100,
+        text: 'Спасибо, теперь понятно',
+        from: ctx.from,
+        reply_to_message: { message_id: 99, from: { id: 900 } },
+      },
+    } as any);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).not.toHaveBeenCalled();
+  });
+
+  it('does not collect a discussion list posted as a reply to the bot', async () => {
+    const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
+    const botInfo = { id: 900, username: 'balasi_bot' };
+    const discussion =
+      'В порядке обсуждения направляю свои комментарии.\n' +
+      '1. первый — перевод А, комментарий — добавить значение\n' +
+      '2. второй — перевод Б, комментарий — оставить';
+    await update.onText({
+      ...ctx,
+      botInfo,
+      message: {
+        message_id: 100,
+        text: discussion,
+        from: ctx.from,
+        reply_to_message: { message_id: 99, from: botInfo },
+      },
+    } as any);
+    expect(requests).toHaveLength(0);
+    expect(ctx.reply).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+
+    for (const [id, text] of [
+      [101, 'Баласи, исправь:\n1. первый — перевод А'],
+      [102, '2. второй — перевод Б'],
+      [103, 'Готово 2'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        botInfo,
+        message: { message_id: id, text, from: ctx.from },
+      } as any);
+    }
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+    expect(call[0]).not.toContain('В порядке обсуждения');
+    expect(call[4].requestItems).toEqual([1, 2]);
+  });
+
+  it.each([
+    ['Спасибо', 77],
+    ['1. Предлагаю обсудить завтра', 77],
+    ['Готово', 77],
+    ['Отмени список', 77],
+    ['Спасибо', 900],
+    ['1. Предлагаю обсудить завтра', 900],
+  ])(
+    'ignores an unrelated reply during collection: %s to %s',
+    async (text, senderId) => {
+      const { update, ctx, requests, openaiService } = makeUpdate('Elvardi');
+      const botInfo = { id: 900, username: 'balasi_bot' };
+      await update.onText({
+        ...ctx,
+        botInfo,
+        message: {
+          message_id: 100,
+          text: 'Баласи, исправь:\n1. первый — перевод А',
+          from: ctx.from,
+        },
+      } as any);
+      await update.onText({
+        ...ctx,
+        botInfo,
+        message: {
+          message_id: 101,
+          text,
+          from: ctx.from,
+          reply_to_message: { message_id: 99, from: { id: senderId } },
+        },
+      } as any);
+      expect(requests[0].parts).toHaveLength(1);
+      expect(requests[0].status).toBe('collecting');
+      expect(ctx.reply).toHaveBeenCalledTimes(1);
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    },
+  );
+
+  it('accepts a continuation replying to a collected part and completion replying to the bot', async () => {
+    const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
+    const botInfo = { id: 900, username: 'balasi_bot' };
+    for (const message of [
+      {
+        message_id: 100,
+        text: 'Баласи, исправь:\n1. первый — перевод А',
+      },
+      {
+        message_id: 101,
+        text: '2. второй — перевод Б',
+        reply_to_message: { message_id: 100, from: ctx.from },
+      },
+      {
+        message_id: 102,
+        text: 'Готово 2',
+        reply_to_message: { message_id: 99, from: botInfo },
+      },
+    ]) {
+      await update.onText({
+        ...ctx,
+        botInfo,
+        message: { ...message, from: ctx.from },
+      } as any);
+    }
+    expect(requests[0].parts).toHaveLength(2);
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    expect(
+      (openaiService.processBotMention as jest.Mock).mock.calls[0][4]
+        .requestItems,
+    ).toEqual([1, 2]);
+  });
+
+  it('recovers the already received 100-item list from a legacy draft polluted by discussion', async () => {
+    const { update, ctx, requests, openaiService } = makeUpdate('Elvardi');
+    const discussion = Array.from(
+      { length: 98 },
+      (_, index) => `${index + 1}. слово ${index + 1} — обсуждаемый перевод`,
+    ).join('\n');
+    const corrections = Array.from(
+      { length: 100 },
+      (_, index) => `${index + 1}. слово ${index + 1} — согласованный перевод`,
+    );
+    const parts = [
+      {
+        messageId: 100,
+        text: `В порядке обсуждения направляю комментарии.\n${discussion}`,
+      },
+      { messageId: 101, text: 'Это обсуждение, к боту я не обращался.' },
+      {
+        messageId: 102,
+        text: `Баласи, исправь:\n${corrections.slice(0, 50).join('\n')}`,
+      },
+      { messageId: 103, text: corrections.slice(50).join('\n') },
+      { messageId: 104, text: '@AAlxnv, Стас, посмотри, что хочет бот?' },
+    ];
+    requests.push({
+      id: 1,
+      scope: '-100:0:42',
+      firstMessageId: 100,
+      status: 'collecting',
+      revision: 5,
+      question: null,
+      parts,
+    });
+    await update.onText({
+      ...ctx,
+      message: { message_id: 105, text: 'Готово 100', from: ctx.from },
+    } as any);
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+    expect(call[4].requestItems).toEqual(
+      Array.from({ length: 100 }, (_, index) => index + 1),
+    );
+    expect(call[0]).not.toContain('обсуждаемый перевод');
+    expect(call[0]).not.toContain('Стас');
+    for (const line of corrections) expect(call[0]).toContain(line);
+    expect(requests[0].parts).toEqual(parts);
+  });
+
+  it('counts identical overlapping items once without asking to resend the list', async () => {
+    const { update, ctx, openaiService } = makeUpdate('Elvardi');
+    for (const [messageId, text] of [
+      [100, 'Баласи, исправь:\n1. первый — перевод А\n2. второй — перевод Б'],
+      [101, '2. второй — перевод Б\n3. третий — перевод В'],
+      [102, 'Готово 3'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: messageId, text, from: ctx.from },
+      } as any);
+    }
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+    expect(call[4].requestItems).toEqual([1, 2, 3]);
+    expect(call[0].match(/2\. второй/g)).toHaveLength(1);
+  });
+
+  it('asks only about conflicting items and accepts a targeted correction without cancelling', async () => {
+    const { update, ctx, dictionaryService, openaiService } =
+      makeUpdate('Elvardi');
+    for (const [messageId, text] of [
+      [100, 'Баласи, исправь:\n1. первый — перевод А\n2. второй — перевод В'],
+      [101, '1. первый — перевод Б'],
+      [102, 'Готово'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: messageId, text, from: ctx.from },
+      } as any);
+    }
+    expect(ctx.reply).toHaveBeenLastCalledWith(
+      expect.stringContaining('Разные варианты пунктов: 1.'),
+      expect.anything(),
+    );
+    expect(ctx.reply.mock.calls.at(-1)[0]).not.toContain('Отмени список');
+    expect(ctx.reply.mock.calls.at(-1)[0]).toContain(
+      'Остальной список сохранён',
+    );
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(dictionaryService.applyActions).not.toHaveBeenCalled();
+    for (const [messageId, text] of [
+      [103, 'Баласи, исправь:\n1. первый — верный перевод'],
+      [104, 'Готово 2'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: messageId, text, from: ctx.from },
+      } as any);
+    }
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+    expect(call[4].requestItems).toEqual([1, 2]);
+    expect(call[0]).toContain('1. первый — верный перевод');
+    expect(call[0]).toContain('2. второй — перевод В');
+    expect(call[0]).not.toContain('перевод А');
+    expect(call[0]).not.toContain('перевод Б');
+  });
+
+  it.each(['@balasi_bot', '@BALASI_BOT,'])(
+    'answers the exact bot username: %s',
+    async (mention) => {
+      const { update, ctx, openaiService } = makeUpdate();
+      await update.onText({
+        ...ctx,
+        botInfo: { id: 900, username: 'balasi_bot' },
+        message: { message_id: 100, text: `${mention} помоги`, from: ctx.from },
+      } as any);
+      expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('does not mistake another username with the same prefix for the bot', async () => {
+    const { update, ctx, openaiService } = makeUpdate();
+    await update.onText({
+      ...ctx,
+      botInfo: { id: 900, username: 'balasi_bot' },
+      message: {
+        message_id: 100,
+        text: '@balasi_bot_other посмотри',
+        from: ctx.from,
+      },
+    } as any);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).not.toHaveBeenCalled();
+  });
+
+  it('answers a separate explicit question without appending it to a draft', async () => {
+    const { update, ctx, requests, openaiService } = makeUpdate('Elvardi');
+    for (const [messageId, text] of [
+      [100, 'Баласи, исправь:\n1. первый — перевод А'],
+      [101, 'Баласи, что значит ширин?'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: { message_id: messageId, text, from: ctx.from },
+      } as any);
+    }
+    expect(requests[0].parts).toHaveLength(1);
+    expect(openaiService.processBotMention).toHaveBeenCalledWith(
+      'Баласи, что значит ширин?',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
   it('keeps split requests separate by sender and topic, and rejects incomplete numbering', async () => {
     const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
     for (const [id, text, sender, thread] of [
@@ -774,7 +1069,7 @@ describe('TelegramUpdate bot mentions', () => {
     ).toBe(false);
   });
 
-  it('lets the model understand discussion in replies without mutating records', async () => {
+  it('keeps discussion replies in context without answering or mutating records', async () => {
     const {
       update,
       ctx,
@@ -793,8 +1088,9 @@ describe('TelegramUpdate bot mentions', () => {
     };
     wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
     await update.onText(ctx as any);
-    expect(telegramService.saveContextMessage).toHaveBeenCalled();
-    expect(openaiService.processBotMention).toHaveBeenCalled();
+    expect(telegramService.addMessage).toHaveBeenCalled();
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(ctx.reply).not.toHaveBeenCalled();
     expect(dictionaryService.applyActions).not.toHaveBeenCalled();
     expect(dictionaryService.upsertWord).not.toHaveBeenCalled();
     expect(dictionaryService.replaceTranslation).not.toHaveBeenCalled();
@@ -913,9 +1209,9 @@ describe('TelegramUpdate bot mentions', () => {
       wordReviewService.isReviewMessage.mockResolvedValueOnce(true);
       await update.onText(ctx as any);
       expect(wordReviewService.recordDecision).not.toHaveBeenCalled();
-      expect(openaiService.processBotMention).toHaveBeenCalled();
-      expect(telegramService.saveContextMessage).toHaveBeenCalled();
-      expect(ctx.reply).toHaveBeenCalled();
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(telegramService.addMessage).toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
     });
 
     it('does not let a participant close a batch', async () => {
@@ -1488,12 +1784,12 @@ describe('TelegramUpdate bot mentions', () => {
       [],
     );
   });
-  it('answers a Telegram reply without repeating the bot name and passes the quoted message', async () => {
+  it('answers an explicitly addressed reply and passes the quoted message', async () => {
     const { update, ctx, openaiService, telegramService } = makeUpdate();
     Object.assign(ctx, { botInfo: { id: 900, username: 'balasi_bot' } });
     ctx.message = {
       message_id: 124,
-      text: 'А во множественном числе?',
+      text: 'Баласи, а во множественном числе?',
       date: 1784102460,
       from: { id: 1, username: 'alice' },
       message_thread_id: 42,
@@ -1515,7 +1811,7 @@ describe('TelegramUpdate bot mentions', () => {
     await update.onText(ctx as any);
 
     expect(openaiService.processBotMention).toHaveBeenCalledWith(
-      'А во множественном числе?',
+      'Баласи, а во множественном числе?',
       [],
       [],
       [],
@@ -1528,7 +1824,7 @@ describe('TelegramUpdate bot mentions', () => {
         chatId: -100,
         threadId: 42,
         telegramMessageId: 124,
-        text: 'А во множественном числе?',
+        text: 'Баласи, а во множественном числе?',
         isBot: false,
       }),
     );
