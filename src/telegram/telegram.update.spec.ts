@@ -210,6 +210,10 @@ describe('TelegramUpdate bot mentions', () => {
         };
         return query;
       },
+      find: async ({ where }) =>
+        structuredClone(
+          requests.filter((row) => where.status.value.includes(row.status)),
+        ).reverse(),
       findOne: async ({ where }) =>
         structuredClone(
           requests.filter((row) => row.scope === where.scope).at(-1) ?? null,
@@ -390,6 +394,94 @@ describe('TelegramUpdate bot mentions', () => {
     expect(text).toContain('@Elvardi');
     expect(text).toContain('«Готово 100.»');
     expect(text).toContain('обычное сообщение: нет обращения к боту');
+  });
+
+  describe('list manager', () => {
+    const edik = { id: 7, username: 'Elvardi' };
+    const katya = { id: 8, username: 'ekaterina_karaasheva' };
+    const botInfo = { id: 900, username: 'balasi_bot' };
+    const send = (
+      update: TelegramUpdate,
+      ctx: any,
+      from: any,
+      messageId: number,
+      text: string,
+      replyTo: any = { message_id: 44, from: { id: 1 } },
+    ) =>
+      update.onText({
+        ...ctx,
+        from,
+        botInfo,
+        message: {
+          message_id: messageId,
+          text,
+          from,
+          message_thread_id: 44,
+          is_topic_message: true,
+          reply_to_message: replyTo,
+        },
+      } as any);
+
+    it('finishes the only other open list with a plain «Готово»', async () => {
+      const { update, ctx, openaiService } = makeUpdate('AAlxnv');
+      await send(update, ctx, edik, 100, 'Баласи, исправь:\n1. первый — А');
+      await send(update, ctx, edik, 101, '2. второй — Б');
+      await send(update, ctx, ctx.from, 102, 'Готово 2.');
+      expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+      const call = (openaiService.processBotMention as jest.Mock).mock.calls[0];
+      expect(call[0]).toContain('1. первый — А');
+      expect(call[4].requestItems).toEqual([1, 2]);
+    });
+
+    it('selects the list by replying to its author and adds missing items', async () => {
+      const { update, ctx, openaiService, requests } = makeUpdate('AAlxnv');
+      await send(update, ctx, edik, 100, 'Баласи, исправь:\n1. А\n3. В');
+      await send(update, ctx, katya, 101, 'Баласи, исправь:\n1. другой — Б');
+      await send(update, ctx, ctx.from, 102, 'Готово 3');
+      expect(ctx.reply).toHaveBeenLastCalledWith(
+        expect.stringContaining('несколько списков'),
+        expect.anything(),
+      );
+      const toEdik = { message_id: 100, from: edik };
+      await send(update, ctx, ctx.from, 103, '2. Б', toEdik);
+      expect(ctx.reply).toHaveBeenLastCalledWith(
+        expect.stringContaining(
+          'Список @Elvardi: Получено частей: 2, пунктов: 3',
+        ),
+        expect.anything(),
+      );
+      await send(update, ctx, ctx.from, 104, 'Готово 3', toEdik);
+      expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+      expect(
+        (openaiService.processBotMention as jest.Mock).mock.calls[0][4]
+          .requestItems,
+      ).toEqual([1, 2, 3]);
+      expect(requests[1].parts).toHaveLength(1);
+    });
+
+    it('keeps a manager reply without a list command as discussion', async () => {
+      const { update, ctx, requests, telegramService } = makeUpdate('AAlxnv');
+      await send(update, ctx, edik, 100, 'Баласи, исправь:\n1. первый — А');
+      await send(update, ctx, ctx.from, 101, 'напишите ещё раз', {
+        message_id: 100,
+        from: edik,
+      });
+      expect(requests[0].parts).toHaveLength(1);
+      expect(telegramService.addMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not let other participants finish someone else’s list', async () => {
+      const { update, ctx, openaiService, requests } = makeUpdate('Elvardi');
+      await send(update, ctx, katya, 100, 'Баласи, исправь:\n1. первый — А');
+      await send(update, ctx, ctx.from, 101, 'Готово 1');
+      await send(update, ctx, ctx.from, 102, 'Готово 1', {
+        message_id: 100,
+        from: katya,
+      });
+      expect(openaiService.processBotMention).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+      expect(requests[0].status).toBe('collecting');
+    });
   });
 
   it('ignores a message to another person while collecting a correction list', async () => {

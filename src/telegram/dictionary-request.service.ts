@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { EntityManager, Repository } from 'typeorm';
+import { EntityManager, In, Repository } from 'typeorm';
 import { DictionaryContentError } from '../dictionary/dictionary-content';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
 import { numberedItems, requestContent } from './dictionary-request-content';
@@ -20,6 +20,20 @@ const ignored = (reason: string): RequestReceipt => ({
   type: 'ignored',
   reason,
 });
+
+/** «Готово…» and «Отмени список», with or without an address to the bot. */
+export function listCommand(text: string) {
+  const clean = text
+    .replace(/^\s*(?:(?:баласи|бот)[\s,:!.—-]+|@\w+\s*)/i, '')
+    .trim();
+  return {
+    clean,
+    finish: clean.match(
+      /^готово(?:[\s,:—-]+(\d+))?(?:[\s,]+только перечисленные(?: пункты)?)?[.!]?$/i,
+    ),
+    cancel: /^(?:отмени список|отмена списка)[.!]?$/i.test(clean),
+  };
+}
 
 @Injectable()
 export class DictionaryRequestService {
@@ -48,9 +62,7 @@ export class DictionaryRequestService {
     replyToMessageId?: number;
     replyToBot?: boolean;
   }): Promise<RequestReceipt> {
-    const clean = input.text
-      .replace(/^\s*(?:(?:баласи|бот)[\s,:!.—-]+|@\w+\s*)/i, '')
-      .trim();
+    const { clean, finish, cancel } = listCommand(input.text);
     const start =
       input.addressed &&
       numberedItems(clean).length > 0 &&
@@ -58,10 +70,6 @@ export class DictionaryRequestService {
         /(?:исправ|коррект|внес|добав|измени|перенес|удали|словар|итог)/i.test(
           clean,
         ));
-    const finish = clean.match(
-      /^готово(?:[\s,:—-]+(\d+))?(?:[\s,]+только перечисленные(?: пункты)?)?[.!]?$/i,
-    );
-    const cancel = /^(?:отмени список|отмена списка)[.!]?$/i.test(clean);
     const hasItems = numberedItems(clean).length > 0;
     // Ordinary conversation must never be captured just because a draft is open.
     if (!input.addressed && /^@\w+/.test(input.text.trim()))
@@ -210,6 +218,15 @@ export class DictionaryRequestService {
         text: `Получено частей: ${content.partCount}, пунктов: ${content.items.length}. Словарь пока не изменён. Пришли продолжение, затем «Готово» (можно «Готово 100» для проверки количества).`,
       };
     });
+  }
+
+  /** Collecting or awaiting-clarification lists whose scope starts with `prefix`. */
+  async openDrafts(prefix: string): Promise<DictionaryRequest[]> {
+    const rows = await this.repo.find({
+      where: { status: In(['collecting', 'ready']) },
+      order: { id: 'DESC' },
+    });
+    return rows.filter((row) => row.scope.startsWith(prefix));
   }
 
   async rememberQuestion(

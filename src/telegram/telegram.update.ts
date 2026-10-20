@@ -54,9 +54,12 @@ import {
 import { hasWordDeletionGrant } from '../dictionary/deletion-permissions';
 import {
   DictionaryRequestService,
+  listCommand,
+  numberedItems,
   requestText,
   requestItems,
 } from './dictionary-request.service';
+import { canManageOthersDrafts } from './draft-permissions';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
 import { BotEventRoute } from './entities/bot-event.entity';
 import { Word } from '../dictionary/entities/word.entity';
@@ -89,7 +92,12 @@ interface ReportFailure {
 
 interface IncomingReply {
   message_id?: number;
-  from?: { id?: number };
+  from?: {
+    id?: number;
+    is_bot?: boolean;
+    username?: string;
+    first_name?: string;
+  };
 }
 
 /**
@@ -372,22 +380,33 @@ export class TelegramUpdate implements OnModuleInit {
       (!reviewDecision || reviewDecision === 'invalid')
     ) {
       try {
+        const managed = await this.managedDraft(ctx, reply, text, addressed);
+        if (managed?.type === 'notice') {
+          this.trace(ctx, 'draft', `ответ: ${managed.text}`);
+          await this.replyAndRemember(ctx, managed.text, {
+            reply_parameters: { message_id: message.message_id },
+          });
+          return;
+        }
         const receipt = await this.dictionaryRequests.receive({
-          scope: `${chatId}:${threadId ?? 0}:${ctx.from.id}`,
+          scope: managed?.scope ?? `${chatId}:${threadId ?? 0}:${ctx.from.id}`,
           messageId: message.message_id,
           text,
           addressed,
-          replyToMessageId: reply?.message_id,
-          replyToBot: isReplyToBot,
+          // A manager's reply to the author only selects that author's list.
+          replyToMessageId: managed ? undefined : reply?.message_id,
+          replyToBot: !managed && isReplyToBot,
         });
+        const owner = managed ? `Список ${managed.owner}: ` : '';
         if (receipt.type === 'ignored') silentReason = receipt.reason;
         else {
           this.trace(
             ctx,
             'draft',
-            receipt.type === 'notice'
-              ? `ответ: ${receipt.text}`
-              : `список готов, пунктов: ${requestItems(receipt.request).length}; передаю модели`,
+            owner +
+              (receipt.type === 'notice'
+                ? `ответ: ${receipt.text}`
+                : `список готов, пунктов: ${requestItems(receipt.request).length}; передаю модели`),
           );
           await this.rememberContextMessage({
             chatId,
@@ -399,7 +418,7 @@ export class TelegramUpdate implements OnModuleInit {
             sentAt: message.date ? new Date(message.date * 1000) : new Date(),
           });
           if (receipt.type === 'notice')
-            await this.replyAndRemember(ctx, receipt.text, {
+            await this.replyAndRemember(ctx, owner + receipt.text, {
               reply_parameters: { message_id: message.message_id },
             });
           else
@@ -471,6 +490,82 @@ export class TelegramUpdate implements OnModuleInit {
 
     if (count >= this.threshold) {
       await this.generateReport(ctx);
+    }
+  }
+
+  /**
+   * A list manager acts on another author's open list by replying to any
+   * message of that author. Without such a reply, «Готово», «Отмени список»
+   * and an answer to the bot's question go to the only other open list in the
+   * topic, unless the manager has an open list of their own.
+   */
+  private async managedDraft(
+    ctx: Context,
+    reply: IncomingReply | undefined,
+    text: string,
+    addressed: boolean,
+  ): Promise<
+    | { type: 'list'; scope: string; owner: string }
+    | { type: 'notice'; text: string }
+    | null
+  > {
+    const sender = ctx.from;
+    if (!sender || !canManageOthersDrafts(this.dictionarySenderUsername(ctx)))
+      return null;
+    const replyToBot = reply != null && reply.from?.id === ctx.botInfo?.id;
+    const author =
+      reply?.from?.id != null &&
+      !replyToBot &&
+      !reply.from.is_bot &&
+      reply.from.id !== sender.id
+        ? reply.from
+        : undefined;
+    if (reply && !author && !replyToBot) return null;
+    const { clean, finish, cancel } = listCommand(text);
+    const answer = replyToBot && addressed && !numberedItems(clean).length;
+    if (!author && !finish && !cancel && !answer) return null;
+
+    const thread = (ctx.message as { message_thread_id?: number })
+      .message_thread_id;
+    const prefix = `${ctx.chat!.id}:${thread ?? 0}:`;
+    const drafts = await this.dictionaryRequests.openDrafts(prefix);
+    if (author) {
+      const draft = drafts.find((row) => row.scope === prefix + author.id);
+      if (!draft) return null;
+      return {
+        type: 'list',
+        scope: draft.scope,
+        owner: author.username
+          ? `@${author.username}`
+          : (author.first_name ?? `участника ${author.id}`),
+      };
+    }
+    if (drafts.some((row) => row.scope === prefix + sender.id)) return null;
+    const candidates = answer
+      ? drafts.filter((row) => row.status === 'ready' && row.question)
+      : drafts;
+    if (candidates.length > 1 && !answer)
+      return {
+        type: 'notice',
+        text: 'Открыто несколько списков других участников. Отправь это же сообщение ответом на любое сообщение автора нужного списка.',
+      };
+    if (candidates.length !== 1) return null;
+    return {
+      type: 'list',
+      scope: candidates[0].scope,
+      owner: await this.memberName(
+        ctx,
+        Number(candidates[0].scope.slice(prefix.length)),
+      ),
+    };
+  }
+
+  private async memberName(ctx: Context, userId: number): Promise<string> {
+    try {
+      const { user } = await ctx.telegram.getChatMember(ctx.chat!.id, userId);
+      return user.username ? `@${user.username}` : user.first_name;
+    } catch {
+      return `участника ${userId}`;
     }
   }
 
