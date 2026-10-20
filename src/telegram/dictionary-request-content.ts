@@ -25,6 +25,18 @@ function splitItems(text: string) {
   };
 }
 
+/**
+ * Review batches render items as «N. запись — перевод», so the text before the
+ * first « — » names the existing record exactly, even a malformed one.
+ */
+export function itemRecordNames(
+  text: string,
+): { item: number; word: string }[] {
+  return [
+    ...text.matchAll(/^[ \t]*(\d+)[.)][ \t]+([^\n]+?)[ \t]+—[ \t]/gm),
+  ].map((match) => ({ item: Number(match[1]), word: match[2] }));
+}
+
 export function numberedItems(text: string): number[] {
   return splitItems(text).items.map((item) => item.number);
 }

@@ -63,6 +63,14 @@ describe('TelegramUpdate bot mentions', () => {
       findWord: jest.fn(async () => undefined),
       findByTranslation: jest.fn(async () => []),
       findRelevantForPrompt: jest.fn(async () => []),
+      inspectRecords: jest.fn(
+        async (words: string[]): Promise<any[]> =>
+          words.map((word) => ({
+            word: word.toLowerCase(),
+            version: null,
+            record: null,
+          })),
+      ),
       getLeaderboard: jest.fn(async () => [
         { username: 'anonymous', wordsCount: 410 },
       ]),
@@ -481,6 +489,99 @@ describe('TelegramUpdate bot mentions', () => {
       expect(openaiService.processBotMention).not.toHaveBeenCalled();
       expect(requests).toHaveLength(1);
       expect(requests[0].status).toBe('collecting');
+    });
+
+    const question = 'Не нашёл запись для пункта 2. Уточните написание.';
+    const askQuestion = async (update: TelegramUpdate, ctx: any) => {
+      const mention = ctx.openaiService.processBotMention as jest.Mock;
+      mention.mockResolvedValueOnce({ action: 'reply', message: question });
+      await send(
+        update,
+        ctx,
+        edik,
+        100,
+        'Баласи, исправь:\n1. А — а\n2. Б — б',
+      );
+      await send(update, ctx, edik, 101, 'Готово 2');
+      expect(mention).toHaveBeenCalledTimes(1);
+    };
+    const toQuestion = { message_id: 500, from: botInfo, text: question };
+
+    it.each([
+      ['the author', edik, 'ответ на вопрос бота'],
+      [
+        'the list manager',
+        { id: 42, username: 'AAlxnv' },
+        'Список @Elvardi: ответ на вопрос бота',
+      ],
+    ])(
+      'treats a reply by %s to the bot question as its answer without an address',
+      async (_who, from, prefix) => {
+        const { update, ctx, openaiService, requests, telegramService } =
+          makeUpdate('AAlxnv');
+        (ctx as any).openaiService = openaiService;
+        (ctx.telegram as any).getChatMember = jest.fn(async () => ({
+          user: edik,
+        }));
+        await askQuestion(update, ctx);
+        expect(requests[0].question).toBe(question);
+        await send(update, ctx, from, 102, 'делай что можешь', toQuestion);
+        const calls = (openaiService.processBotMention as jest.Mock).mock.calls;
+        expect(calls).toHaveLength(2);
+        expect(calls[1][0]).toContain('Уточнение редактора:\nделай что можешь');
+        expect(calls[1][4].clarificationQuestion).toBe(question);
+        expect(telegramService.recordBotEvent).toHaveBeenCalledWith(
+          expect.objectContaining({
+            messageId: 102,
+            route: 'draft',
+            detail: expect.stringMatching(new RegExp(`^${prefix}`)),
+          }),
+        );
+      },
+    );
+
+    it('ignores a reply to the list question from another participant', async () => {
+      const { update, ctx, openaiService, telegramService } =
+        makeUpdate('AAlxnv');
+      (ctx as any).openaiService = openaiService;
+      await askQuestion(update, ctx);
+      await send(update, ctx, katya, 102, 'делай что можешь', toQuestion);
+      expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+      expect(telegramService.addMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes records named at the start of list items to the model', async () => {
+      const { update, ctx, openaiService, dictionaryService } =
+        makeUpdate('AAlxnv');
+      const broken = {
+        word: 'айте иях- давай',
+        translation: 'те) пойдём кушать',
+      };
+      (dictionaryService.inspectRecords as jest.Mock).mockImplementationOnce(
+        async (words: string[]) =>
+          words.map((word) => ({
+            word: word.toLowerCase(),
+            version: 'v1',
+            record: word === broken.word ? broken : null,
+          })),
+      );
+      await send(
+        update,
+        ctx,
+        edik,
+        100,
+        'Баласи, исправь:\n1. нет такого — а\n2. айте иях- давай — те) пойдём кушать, комментарий – перенести как пример',
+      );
+      await send(update, ctx, edik, 101, 'Готово 2');
+      expect(dictionaryService.inspectRecords).toHaveBeenCalledWith([
+        'нет такого',
+        'айте иях- давай',
+      ]);
+      const options = (openaiService.processBotMention as jest.Mock).mock
+        .calls[0][4];
+      expect(options.listRecords).toEqual([
+        { item: 2, word: 'айте иях- давай', version: 'v1', record: broken },
+      ]);
     });
   });
 

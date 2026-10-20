@@ -59,11 +59,15 @@ import {
   requestText,
   requestItems,
 } from './dictionary-request.service';
+import { itemRecordNames } from './dictionary-request-content';
 import { canManageOthersDrafts } from './draft-permissions';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
 import { BotEventRoute } from './entities/bot-event.entity';
 import { Word } from '../dictionary/entities/word.entity';
-import { assertRequestCoverage } from '../dictionary/dictionary-actions';
+import {
+  assertRequestCoverage,
+  dictionaryWord,
+} from '../dictionary/dictionary-actions';
 
 type ReportGenerationStage =
   | 'load_messages'
@@ -92,6 +96,7 @@ interface ReportFailure {
 
 interface IncomingReply {
   message_id?: number;
+  text?: string;
   from?: {
     id?: number;
     is_bot?: boolean;
@@ -380,7 +385,13 @@ export class TelegramUpdate implements OnModuleInit {
       (!reviewDecision || reviewDecision === 'invalid')
     ) {
       try {
-        const managed = await this.managedDraft(ctx, reply, text, addressed);
+        const own = `${chatId}:${threadId ?? 0}:${ctx.from.id}`;
+        const answer = isReplyToBot
+          ? await this.questionDraft(ctx, reply?.text, own)
+          : null;
+        const managed = answer
+          ? null
+          : await this.managedDraft(ctx, reply, text, addressed);
         if (managed?.type === 'notice') {
           this.trace(ctx, 'draft', `ответ: ${managed.text}`);
           await this.replyAndRemember(ctx, managed.text, {
@@ -388,22 +399,25 @@ export class TelegramUpdate implements OnModuleInit {
           });
           return;
         }
+        const target = answer ?? managed;
         const receipt = await this.dictionaryRequests.receive({
-          scope: managed?.scope ?? `${chatId}:${threadId ?? 0}:${ctx.from.id}`,
+          scope: target?.scope ?? own,
           messageId: message.message_id,
           text,
-          addressed,
-          // A manager's reply to the author only selects that author's list.
-          replyToMessageId: managed ? undefined : reply?.message_id,
-          replyToBot: !managed && isReplyToBot,
+          // Answering the bot's question about a list counts as addressing it.
+          addressed: addressed || Boolean(answer),
+          // A reply that selected the list is not discussion.
+          replyToMessageId: target ? undefined : reply?.message_id,
+          replyToBot: !target && isReplyToBot,
         });
-        const owner = managed ? `Список ${managed.owner}: ` : '';
+        const owner = target?.owner ? `Список ${target.owner}: ` : '';
         if (receipt.type === 'ignored') silentReason = receipt.reason;
         else {
           this.trace(
             ctx,
             'draft',
             owner +
+              (answer ? 'ответ на вопрос бота; ' : '') +
               (receipt.type === 'notice'
                 ? `ответ: ${receipt.text}`
                 : `список готов, пунктов: ${requestItems(receipt.request).length}; передаю модели`),
@@ -473,7 +487,12 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    this.trace(ctx, 'chat', `без ответа: ${silentReason}`);
+    const replyNote =
+      reply?.message_id != null &&
+      !silentReason.includes(`#${reply.message_id}`)
+        ? ` (ответ на #${reply.message_id}${isReplyToBot ? ', сообщение бота' : ''})`
+        : '';
+    this.trace(ctx, 'chat', `без ответа: ${silentReason}${replyNote}`);
 
     const sentAt = message.date ? new Date(message.date * 1000) : new Date();
     const count = await this.telegramService.addMessage(
@@ -558,6 +577,45 @@ export class TelegramUpdate implements OnModuleInit {
         Number(candidates[0].scope.slice(prefix.length)),
       ),
     };
+  }
+
+  /**
+   * A reply to the bot's question about an open list answers it without
+   * «Баласи». Only the list's author and a list manager may answer.
+   */
+  private async questionDraft(
+    ctx: Context,
+    botText: string | undefined,
+    own: string,
+  ): Promise<{ scope: string; owner: string } | null> {
+    if (!botText) return null;
+    const prefix = own.slice(0, own.lastIndexOf(':') + 1);
+    const draft = await this.dictionaryRequests.findByQuestion(prefix, botText);
+    if (!draft) return null;
+    if (draft.scope === own) return { scope: own, owner: '' };
+    if (!canManageOthersDrafts(this.dictionarySenderUsername(ctx))) return null;
+    return {
+      scope: draft.scope,
+      owner: await this.memberName(
+        ctx,
+        Number(draft.scope.slice(prefix.length)),
+      ),
+    };
+  }
+
+  /** Records named at the start of list items, so spelling noise cannot hide them. */
+  private async listItemRecords(text: string) {
+    const names = itemRecordNames(text);
+    if (!names.length) return [];
+    const records = await this.dictionaryService.inspectRecords(
+      names.map(({ word }) => word),
+    );
+    return names.flatMap(({ item, word }) => {
+      const found = records.find(
+        (entry) => entry.record && entry.word === dictionaryWord(word),
+      );
+      return found ? [{ item, ...found }] : [];
+    });
   }
 
   private async memberName(ctx: Context, userId: number): Promise<string> {
@@ -758,6 +816,7 @@ export class TelegramUpdate implements OnModuleInit {
                 ...(request
                   ? {
                       requestItems: requestItems(request),
+                      listRecords: await this.listItemRecords(text),
                       clarificationQuestion: request.question,
                     }
                   : {}),

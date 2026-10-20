@@ -374,6 +374,48 @@ async function main() {
       (await repo.findOneByOrFail({ word: 'ахгыран' })).senses[1].partOfSpeech,
       'прилагательное',
     );
+    // One expression can become an example of two words and of two senses.
+    const shared = await seed('айте иях- давай', 'те) пойдём кушать');
+    const sharedA = await seed('айтê', '1) пойдём');
+    const sharedB = await seed('емах', '1) еда; 2) кушать');
+    const sharedOps = [
+      { type: 'move_example', word: shared.word, target: sharedA.word, sense: 1, phrase: 'айтê иях', translation: 'пойдём покушаем' },
+      { type: 'move_example', word: shared.word, target: sharedB.word, sense: 2, phrase: 'айтê иях', translation: 'пойдём покушаем' },
+      { type: 'move_example', word: shared.word, target: sharedB.word, sense: 1, phrase: 'айтê иях', translation: 'покушаем' },
+    ];
+    await dictionary.applyActions(
+      sharedOps,
+      { ...actor, messageId: 1990 },
+      await dictionary.inspectRecords(actionWords(sharedOps)),
+    );
+    const sharedSource = await repo.findOneByOrFail({ id: shared.id });
+    assert.equal(sharedSource.status, 'embedded');
+    assert.equal(sharedSource.relatedWordId, sharedA.id);
+    const sharedTarget = await repo.findOneByOrFail({ id: sharedB.id });
+    assert.deepEqual(
+      sharedTarget.senses.map((sense) =>
+        sense.examples.map((example) => [example.phrase, example.translation, example.sourceWordId]),
+      ),
+      [
+        [['айтê иях', 'покушаем', shared.id]],
+        [['айтê иях', 'пойдём покушаем', shared.id]],
+      ],
+    );
+    assert.equal(
+      (await repo.findOneByOrFail({ id: sharedA.id })).senses[0].examples[0].phrase,
+      'айтê иях',
+    );
+    await assert.rejects(
+      editor.apply(
+        { ...sharedOps[1], translation: 'другой перевод' },
+        { ...actor, messageId: 1991 },
+      ),
+      /уже перенесена/,
+    );
+    console.log(
+      'PASS shared example: one moved expression illustrates two words and two senses; conflicting repeat rejected.',
+    );
+
     // Model-generated plans execute atomically against the versions actually read.
     const planRoot = await seed('план основа', 'значение');
     const planA = await seed('план пример а', 'перевод а');

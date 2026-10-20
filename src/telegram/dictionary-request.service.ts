@@ -229,6 +229,21 @@ export class DictionaryRequestService {
     return rows.filter((row) => row.scope.startsWith(prefix));
   }
 
+  /** The open list whose pending question contains this bot message text. */
+  async findByQuestion(
+    prefix: string,
+    botText: string,
+  ): Promise<DictionaryRequest | null> {
+    const quoted = botText.trim();
+    if (!quoted) return null;
+    const drafts = await this.openDrafts(prefix);
+    return (
+      drafts.find(
+        (row) => row.status === 'ready' && row.question?.includes(quoted),
+      ) ?? null
+    );
+  }
+
   async rememberQuestion(
     request: DictionaryRequest,
     question: string,

@@ -100,6 +100,8 @@ export interface BotDictionaryContextEntry {
 
 export interface BotMentionOptions {
   requestItems?: number[];
+  /** Records named at the start of list items, already read from the dictionary. */
+  listRecords?: (DictionarySnapshot & { item: number; record: unknown })[];
   clarificationQuestion?: string | null;
   readOnly?: boolean;
   replyToMessage?: {
@@ -388,7 +390,14 @@ ${options.readOnly ? 'Это пересланное сообщение или с
     const replySection = options.replyToMessage
       ? `\nСООБЩЕНИЕ, НА КОТОРОЕ ОТВЕЧАЕТ ПОЛЬЗОВАТЕЛЬ:\n[${formatBotDateTime(options.replyToMessage.sentAt)}] ${options.replyToMessage.isBot ? 'Баласи (бот)' : `@${options.replyToMessage.username}`}: ${options.replyToMessage.text}\n`
       : '';
-    const userPrompt = `${dictionarySection}${memorySection}${contextSection}${replySection}\nТЕКУЩИЕ ДАТА И ВРЕМЯ: ${formatBotDateTime(new Date())}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
+    const listRecordsSection = options.listRecords?.length
+      ? `\nЗАПИСИ ИЗ ПУНКТОВ СПИСКА (найдены по точному названию в начале пункта и уже прочитаны; это исходные записи пунктов, даже если название выглядит испорченным; в operations указывай именно это название в word, а исправленное выражение — в phrase или newWord):\n${options.listRecords
+          .map(
+            (entry) => `пункт ${entry.item}: ${JSON.stringify(entry.record)}`,
+          )
+          .join('\n')}\n`
+      : '';
+    const userPrompt = `${dictionarySection}${listRecordsSection}${memorySection}${contextSection}${replySection}\nТЕКУЩИЕ ДАТА И ВРЕМЯ: ${formatBotDateTime(new Date())}\nСООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n${text}`;
     const contextMetadata = {
       userTextLength: text.length,
       recentMessages: recentMessages.length,
@@ -404,6 +413,7 @@ ${options.readOnly ? 'Это пересланное сообщение или с
       actionSystemPrompt,
       options.requestItems,
       options.readOnly,
+      options.listRecords,
     );
   }
 
@@ -439,6 +449,7 @@ ${options.readOnly ? 'Это пересланное сообщение или с
     actionInstructions: string,
     expectedItems?: number[],
     readOnly = false,
+    preInspected: DictionarySnapshot[] = [],
   ): Promise<BotMentionResult> {
     const systemPrompt = `${actionInstructions}
 
@@ -470,7 +481,9 @@ ${options.readOnly ? 'Это пересланное сообщение или с
     const maxToolRounds = 8;
     let toolCallsExecuted = 0;
     let repaired = false;
-    const inspected = new Map<string, DictionarySnapshot>();
+    const inspected = new Map<string, DictionarySnapshot>(
+      preInspected.map(({ word, version }) => [word, { word, version }]),
+    );
     for (let round = 0; round <= maxToolRounds + 1; round += 1) {
       const toolsAvailable = round < maxToolRounds && toolCallsExecuted < 64;
       if (!toolsAvailable && !repaired) {

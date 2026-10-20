@@ -201,13 +201,16 @@ export class DictionaryEditor {
               sameText(e.phrase, phrase) ||
               (edit.type === 'move_example' && e.sourceWordId === source.id),
           );
+          // «Пример слова А и слова Б»: an expression already moved to one
+          // word or sense may also illustrate another; the source stays as is.
+          const alsoExample =
+            edit.type === 'move_example' && source.status === 'embedded';
           if (
             edit.type === 'move_example' &&
-            (source.status === 'embedded' || source.status === 'merged')
+            (alsoExample || source.status === 'merged')
           ) {
             if (
-              source.status === 'embedded' &&
-              source.relatedWordId === word.id &&
+              alsoExample &&
               existing &&
               sameText(existing.phrase, phrase) &&
               sameText(existing.translation, translation)
@@ -219,15 +222,16 @@ export class DictionaryEditor {
                 movedWord: source.word,
               };
             }
-            throw new DictionaryContentError(
-              'Запись уже перенесена. Для изменения перевода используй команду изменения примера.',
-            );
+            if (!alsoExample || existing)
+              throw new DictionaryContentError(
+                'Запись уже перенесена. Для изменения перевода используй команду изменения примера.',
+              );
           }
           if (existing && !sameText(existing.translation, translation))
             throw new DictionaryContentError(
               'Такой пример уже есть с другим переводом. Укажи явное изменение перевода примера.',
             );
-          if (edit.type === 'move_example') {
+          if (edit.type === 'move_example' && !alsoExample) {
             if (
               source.senses?.some((s) => s.examples.length) ||
               (await words.count({ where: { relatedWordId: source.id } })) > 0

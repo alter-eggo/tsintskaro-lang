@@ -269,13 +269,31 @@ export class DictionaryService {
   }
 
   private normalizeWordInput(word: string): string {
-    return word
-      .normalize('NFC')
-      .toLowerCase()
-      .trim()
-      .replace(/^[\s"'«»“”„`.,;:!?()[\]{}]+/g, '')
-      .replace(/[\s"'«»“”„`.,;:!?()[\]{}]+$/g, '')
-      .replace(/\s+/g, ' ');
+    const value = word.normalize('NFC').toLowerCase().trim();
+    const edge = /[\s"'«»“”„`.,;:!?[\]{}]/;
+    const count = (from: number, to: number, char: string) =>
+      value.slice(from, to).split(char).length - 1;
+    let start = 0;
+    let end = value.length;
+    // Parentheses belong to names such as «айче (айчем)»; trim only unpaired ones.
+    for (;;) {
+      if (
+        start < end &&
+        (edge.test(value[start]) ||
+          (value[start] === '(' &&
+            count(start, end, '(') > count(start, end, ')')))
+      )
+        start++;
+      else if (
+        end > start &&
+        (edge.test(value[end - 1]) ||
+          (value[end - 1] === ')' &&
+            count(start, end, ')') > count(start, end, '(')))
+      )
+        end--;
+      else break;
+    }
+    return value.slice(start, end).replace(/\s+/g, ' ');
   }
 
   private foldWordForLookup(word: string): string {
