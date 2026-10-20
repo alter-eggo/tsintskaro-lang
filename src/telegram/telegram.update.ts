@@ -58,6 +58,7 @@ import {
   requestItems,
 } from './dictionary-request.service';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
+import { BotEventRoute } from './entities/bot-event.entity';
 import { Word } from '../dictionary/entities/word.entity';
 import { assertRequestCoverage } from '../dictionary/dictionary-actions';
 
@@ -86,6 +87,38 @@ interface ReportFailure {
   message: string;
 }
 
+interface IncomingReply {
+  message_id?: number;
+  from?: { id?: number };
+}
+
+/**
+ * Telegram attaches the topic creation message as reply_to_message to every
+ * message sent in a forum topic. Only a reply chosen by the sender counts.
+ */
+function explicitReply<T extends IncomingReply>(message: {
+  message_thread_id?: number;
+  is_topic_message?: boolean;
+  reply_to_message?: T;
+}): T | undefined {
+  const reply = message.reply_to_message;
+  if (
+    !reply ||
+    (message.is_topic_message && reply.message_id === message.message_thread_id)
+  )
+    return undefined;
+  return reply;
+}
+
+const BOT_EVENT_LABELS: Record<BotEventRoute, string> = {
+  chat: 'обычное сообщение',
+  bot: 'обращение к боту',
+  review: 'итоги разбора',
+  draft: 'список исправлений',
+  model: 'модель',
+  error: 'ошибка',
+};
+
 @Update()
 export class TelegramUpdate implements OnModuleInit {
   private readonly threshold: number;
@@ -111,6 +144,16 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onModuleInit() {
+    // Telegraf stops waiting for a handler after 90 s, but the handler keeps
+    // working and polling resumes. Say so instead of an unexplained error.
+    this.bot.catch((error, ctx) => {
+      const update = `Update ${ctx.update.update_id}`;
+      if (error instanceof Error && error.name === 'TimeoutError')
+        this.logger.warn(
+          `${update} is still being processed after 90 s; other messages are handled meanwhile`,
+        );
+      else this.logger.error(`${update} failed`, error);
+    });
     await this.bot.telegram.setMyCommands([
       { command: 'start', description: 'Начать работу' },
       { command: 'report', description: 'Создать отчёт сейчас' },
@@ -183,6 +226,10 @@ export class TelegramUpdate implements OnModuleInit {
       { command: 'memoryedit', description: 'Изменить запись памяти' },
       { command: 'memorydel', description: 'Удалить запись памяти' },
       { command: 'threadid', description: 'Показать chat_id и thread_id' },
+      {
+        command: 'botlog',
+        description: 'Почему бот ответил или промолчал в этой теме',
+      },
     ]);
     this.logger.log('Bot commands registered');
     await this.telegramService.ensureDefaultGlobalMemory();
@@ -280,16 +327,17 @@ export class TelegramUpdate implements OnModuleInit {
         last_name?: string;
       };
       message_thread_id?: number;
+      is_topic_message?: boolean;
       date?: number;
-      reply_to_message?: { message_id?: number; from?: { id?: number } };
+      reply_to_message?: IncomingReply;
     };
     const text = message.text;
     const threadId = message.message_thread_id;
     const username = message.from?.username || 'anonymous';
 
+    const reply = explicitReply(message);
     const isReplyToBot =
-      ctx.botInfo?.id != null &&
-      message.reply_to_message?.from?.id === ctx.botInfo.id;
+      ctx.botInfo?.id != null && reply?.from?.id === ctx.botInfo.id;
     const isUsernameMention =
       ctx.botInfo?.username &&
       new RegExp(`(?:^|\\s)@${ctx.botInfo.username}(?![a-z0-9_])`, 'i').test(
@@ -308,13 +356,19 @@ export class TelegramUpdate implements OnModuleInit {
     // existing shortcut when replying to a published batch.
     const reviewDecision =
       addressed || isReplyToBot ? parseReviewDecision(text) : null;
+    const forwarded = Boolean(
+      original.forward_origin ||
+      original.forward_from ||
+      original.forward_from_chat ||
+      original.sender_chat,
+    );
+    let silentReason = forwarded
+      ? 'пересланное сообщение или сообщение от имени чата'
+      : 'нет обращения к боту';
     if (
       ctx.from?.id &&
       message.message_id != null &&
-      !original.forward_origin &&
-      !original.forward_from &&
-      !original.forward_from_chat &&
-      !original.sender_chat &&
+      !forwarded &&
       (!reviewDecision || reviewDecision === 'invalid')
     ) {
       try {
@@ -323,10 +377,18 @@ export class TelegramUpdate implements OnModuleInit {
           messageId: message.message_id,
           text,
           addressed,
-          replyToMessageId: message.reply_to_message?.message_id,
+          replyToMessageId: reply?.message_id,
           replyToBot: isReplyToBot,
         });
-        if (receipt) {
+        if (receipt.type === 'ignored') silentReason = receipt.reason;
+        else {
+          this.trace(
+            ctx,
+            'draft',
+            receipt.type === 'notice'
+              ? `ответ: ${receipt.text}`
+              : `список готов, пунктов: ${requestItems(receipt.request).length}; передаю модели`,
+          );
           await this.rememberContextMessage({
             chatId,
             threadId: threadId ?? null,
@@ -353,6 +415,11 @@ export class TelegramUpdate implements OnModuleInit {
         }
       } catch (error) {
         this.logger.error('Could not collect dictionary request', error);
+        this.trace(
+          ctx,
+          'error',
+          `список не принят: ${error instanceof Error ? error.message : String(error)}`,
+        );
         await this.replyAndRemember(
           ctx,
           'Не удалось принять или обработать список. Уже полученные части сохранены; повтори последнее сообщение.',
@@ -361,6 +428,13 @@ export class TelegramUpdate implements OnModuleInit {
       }
     }
     if (addressed || (reviewDecision && reviewDecision !== 'invalid')) {
+      this.trace(
+        ctx,
+        addressed ? 'bot' : 'review',
+        addressed
+          ? 'обращение к боту, готовлю ответ'
+          : `итоги ответом на сообщение бота #${reply?.message_id}`,
+      );
       await this.rememberContextMessage({
         chatId,
         threadId: threadId ?? null,
@@ -380,9 +454,7 @@ export class TelegramUpdate implements OnModuleInit {
       return;
     }
 
-    this.logger.log(
-      `[Chat ${chatId}${threadId ? ` / thread ${threadId}` : ''}] Received text: "${text}"`,
-    );
+    this.trace(ctx, 'chat', `без ответа: ${silentReason}`);
 
     const sentAt = message.date ? new Date(message.date * 1000) : new Date();
     const count = await this.telegramService.addMessage(
@@ -400,6 +472,79 @@ export class TelegramUpdate implements OnModuleInit {
     if (count >= this.threshold) {
       await this.generateReport(ctx);
     }
+  }
+
+  /**
+   * One line per decision: to the process log and to the journal behind
+   * /botlog. Journal failures never affect the reply.
+   */
+  private trace(ctx: Context, route: BotEventRoute, detail: string): void {
+    const chatId = ctx.chat?.id;
+    if (chatId == null) return;
+    const message = ctx.message as
+      | { message_id?: number; message_thread_id?: number; text?: string }
+      | undefined;
+    const threadId = message?.message_thread_id ?? null;
+    const username = ctx.from?.username || ctx.from?.first_name || 'anonymous';
+    const preview = (message?.text ?? '').replace(/\s+/g, ' ').trim();
+    this.logger.log(
+      `[Chat ${chatId}${threadId ? ` / thread ${threadId}` : ''} / msg ${message?.message_id ?? '-'}] @${username} «${preview.slice(0, 80)}» → ${route}: ${detail}`,
+    );
+    this.telegramService
+      .recordBotEvent({
+        chatId,
+        threadId,
+        messageId: message?.message_id ?? null,
+        username,
+        preview: preview.length > 100 ? `${preview.slice(0, 99)}…` : preview,
+        route,
+        detail: detail.slice(0, 1000),
+      })
+      .catch((error) =>
+        this.logger.warn(
+          `Could not save bot journal entry: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+  }
+
+  @Command('botlog')
+  async onBotLog(@Ctx() ctx: Context) {
+    if (!(await this.requireAdmin(ctx))) return;
+    if (this.isPrivateChat(ctx)) {
+      await ctx.reply('Журнал ведётся только в групповых чатах.');
+      return;
+    }
+    const message = ctx.message as {
+      text?: string;
+      message_thread_id?: number;
+    };
+    const requested = Number((message.text ?? '').split(/\s+/)[1]);
+    const limit = Number.isInteger(requested)
+      ? Math.min(Math.max(requested, 1), 50)
+      : 15;
+    const events = await this.telegramService.getBotEvents(
+      ctx.chat!.id,
+      message.message_thread_id ?? null,
+      limit,
+    );
+    if (!events.length) {
+      await ctx.reply(
+        'В этой теме журнал пока пуст. Записи появляются для новых сообщений после обновления бота.',
+      );
+      return;
+    }
+    const lines = events
+      .reverse()
+      .map(
+        (event) =>
+          `${formatBotDateTime(event.createdAt)} · @${event.username}` +
+          `${event.messageId != null ? ` · #${event.messageId}` : ''}` +
+          `${event.preview ? `\n«${event.preview}»` : ''}` +
+          `\n→ ${BOT_EVENT_LABELS[event.route] ?? event.route}: ${event.detail}`,
+      );
+    const text = `🧾 Последние решения бота в этой теме (${events.length}):\n\n${lines.join('\n\n')}`;
+    // Plain replies: the journal must not become part of the model's context.
+    for (const chunk of this.chunkBotAnswer(text)) await ctx.reply(chunk);
   }
 
   @Action(/^wr:(?:correct|fix):\d+:\d+$/)
@@ -494,6 +639,15 @@ export class TelegramUpdate implements OnModuleInit {
     const typingTimer = setInterval(() => {
       void showTyping();
     }, 4000);
+    const startedAt = Date.now();
+    const elapsed = () => `${Math.round((Date.now() - startedAt) / 1000)} с`;
+    this.trace(
+      ctx,
+      'model',
+      request
+        ? `проверяю список, пунктов: ${requestItems(request).length}`
+        : 'запрос отправлен',
+    );
     let result;
     try {
       result =
@@ -525,6 +679,11 @@ export class TelegramUpdate implements OnModuleInit {
         `[Chat ${chatId}] AI processBotMention failed`,
         err,
       );
+      this.trace(
+        ctx,
+        'error',
+        `модель не ответила (${elapsed()}): ${this.describeOpenAiFailureForUser(err)}`,
+      );
       if (messageId != null) {
         await this.replyAndRemember(
           ctx,
@@ -541,6 +700,17 @@ export class TelegramUpdate implements OnModuleInit {
       clearInterval(typingTimer);
     }
 
+    this.trace(
+      ctx,
+      'model',
+      `ответ за ${elapsed()}: ${
+        result.action === 'reply'
+          ? 'текст'
+          : result.action === 'add_memory'
+            ? 'запись в память'
+            : `изменений словаря: ${result.operations.length}`
+      }`,
+    );
     if (result.action === 'reply') {
       if (request)
         await this.dictionaryRequests.rememberQuestion(request, result.message);
@@ -610,6 +780,13 @@ export class TelegramUpdate implements OnModuleInit {
           );
       if (request) this.dictionaryService.invalidateCache();
       saved = true;
+      this.trace(
+        ctx,
+        'draft',
+        batch.unchanged
+          ? 'изменения уже были сохранены раньше'
+          : `сохранено, записей: ${batch.words.length}`,
+      );
       const transfers = result.operations
         .filter((action) => action.type === 'move_example')
         .map(
@@ -706,6 +883,7 @@ export class TelegramUpdate implements OnModuleInit {
         !(error instanceof TranslationEditForbiddenError)
       )
         this.logger.error('Dictionary action batch failed', error);
+      this.trace(ctx, 'error', message);
       await this.replyAndRemember(ctx, message);
     }
   }
@@ -719,8 +897,11 @@ export class TelegramUpdate implements OnModuleInit {
     const message = ctx.message as {
       sender_chat?: unknown;
       forward_origin?: unknown;
-      reply_to_message?: { message_id?: number; from?: { id?: number } };
+      message_thread_id?: number;
+      is_topic_message?: boolean;
+      reply_to_message?: IncomingReply;
     };
+    const reply = explicitReply(message);
     if (
       !ctx.from?.id ||
       ctx.from.is_bot ||
@@ -752,9 +933,7 @@ export class TelegramUpdate implements OnModuleInit {
         chatId: ctx.chat!.id,
         threadId,
         replyToMessageId:
-          message.reply_to_message?.from?.id === ctx.botInfo?.id
-            ? message.reply_to_message?.message_id
-            : undefined,
+          reply?.from?.id === ctx.botInfo?.id ? reply?.message_id : undefined,
         userId: ctx.from.id,
         username: ctx.from.username ?? null,
         messageId: messageId!,
@@ -1109,7 +1288,7 @@ export class TelegramUpdate implements OnModuleInit {
   private getReplyContext(ctx: Context): ConversationMessage | undefined {
     const message = ctx.message;
     if (!message || !('reply_to_message' in message)) return undefined;
-    const reply = message.reply_to_message;
+    const reply = explicitReply(message);
     if (!reply) return undefined;
     const text =
       'text' in reply

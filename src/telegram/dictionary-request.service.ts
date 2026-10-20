@@ -12,7 +12,14 @@ export {
 
 export type RequestReceipt =
   | { type: 'notice'; text: string }
-  | { type: 'process'; request: DictionaryRequest };
+  | { type: 'process'; request: DictionaryRequest }
+  /** Not part of a correction list; `reason` explains why for the bot journal. */
+  | { type: 'ignored'; reason: string };
+
+const ignored = (reason: string): RequestReceipt => ({
+  type: 'ignored',
+  reason,
+});
 
 @Injectable()
 export class DictionaryRequestService {
@@ -40,7 +47,7 @@ export class DictionaryRequestService {
     addressed: boolean;
     replyToMessageId?: number;
     replyToBot?: boolean;
-  }): Promise<RequestReceipt | null> {
+  }): Promise<RequestReceipt> {
     const clean = input.text
       .replace(/^\s*(?:(?:баласи|бот)[\s,:!.—-]+|@\w+\s*)/i, '')
       .trim();
@@ -57,8 +64,10 @@ export class DictionaryRequestService {
     const cancel = /^(?:отмени список|отмена списка)[.!]?$/i.test(clean);
     const hasItems = numberedItems(clean).length > 0;
     // Ordinary conversation must never be captured just because a draft is open.
-    if (!input.addressed && /^@\w+/.test(input.text.trim())) return null;
-    if (!input.addressed && !hasItems && !finish && !cancel) return null;
+    if (!input.addressed && /^@\w+/.test(input.text.trim()))
+      return ignored('сообщение адресовано участнику, а не боту');
+    if (!input.addressed && !hasItems && !finish && !cancel)
+      return ignored('нет обращения к боту');
     return this.locked(input.scope, async (manager) => {
       const repo = manager.getRepository(DictionaryRequest);
       const seen = await repo
@@ -80,7 +89,9 @@ export class DictionaryRequestService {
           (part) => part.messageId === input.replyToMessageId,
         )
       )
-        return null;
+        return ignored(
+          `ответ на сообщение #${input.replyToMessageId}, которое не входит в список; без обращения к боту это обсуждение`,
+        );
       if (seen)
         return {
           type: 'notice',
@@ -100,7 +111,13 @@ export class DictionaryRequestService {
                     ? 'Этот список уже сохранён. Повторно ничего не меняю.'
                     : 'Этот список отменён. Пришли новый список исправлений.',
               }
-            : null;
+            : ignored(
+                finish || cancel
+                  ? 'открытого списка исправлений нет'
+                  : input.addressed
+                    ? 'не список исправлений'
+                    : 'нумерованный текст без обращения к боту не начинает список',
+              );
         request = repo.create({
           scope: input.scope,
           firstMessageId: input.messageId,
@@ -170,7 +187,8 @@ export class DictionaryRequestService {
       }
       const clarification =
         request.status === 'ready' && input.addressed && !hasItems;
-      if (!hasItems && !clarification) return null;
+      if (!hasItems && !clarification)
+        return ignored('в сообщении нет нумерованных пунктов для списка');
       request.parts.push({
         messageId: input.messageId,
         text: input.text,

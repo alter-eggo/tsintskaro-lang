@@ -25,6 +25,7 @@ import { SummaryConfig } from './telegram/entities/summary-config.entity';
 import { SummaryReport } from './telegram/entities/summary-report.entity';
 import { BotMemory } from './telegram/entities/bot-memory.entity';
 import { DictionaryRequest } from './telegram/entities/dictionary-request.entity';
+import { BotEvent } from './telegram/entities/bot-event.entity';
 import { Word } from './dictionary/entities/word.entity';
 import { WordTranslationHistory } from './dictionary/entities/word-translation-history.entity';
 import { WordEditHistory } from './dictionary/entities/word-edit-history.entity';
@@ -58,6 +59,7 @@ import configuration from './config/configuration';
           SummaryReport,
           BotMemory,
           DictionaryRequest,
+          BotEvent,
           OpenaiUsageLog,
           OpenaiUsageReportConfig,
           Word,

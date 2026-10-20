@@ -12,6 +12,7 @@ import { SummaryConfig } from './entities/summary-config.entity';
 import { SummaryReport } from './entities/summary-report.entity';
 import { BotMemory } from './entities/bot-memory.entity';
 import { DictionaryRequest } from './entities/dictionary-request.entity';
+import { BotEvent } from './entities/bot-event.entity';
 import { DictionaryRequestService } from './dictionary-request.service';
 
 @Module({
@@ -22,6 +23,7 @@ import { DictionaryRequestService } from './dictionary-request.service';
       SummaryReport,
       BotMemory,
       DictionaryRequest,
+      BotEvent,
     ]),
     OpenaiModule,
     DictionaryModule,

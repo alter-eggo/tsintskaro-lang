@@ -1,10 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, Repository } from 'typeorm';
+import { In, IsNull, LessThan, Repository } from 'typeorm';
 import { CollectedMessage } from './entities/collected-message.entity';
 import { SummaryConfig } from './entities/summary-config.entity';
 import { SummaryReport } from './entities/summary-report.entity';
 import { BotMemory } from './entities/bot-memory.entity';
+import { BotEvent } from './entities/bot-event.entity';
 
 export const GLOBAL_BOT_MEMORY_CHAT_ID = 0;
 const DEFAULT_WORKING_LINKS_MEMORY_KEY = 'working-links-site-rule';
@@ -79,7 +80,11 @@ export class TelegramService {
     private readonly summaryReportRepo: Repository<SummaryReport>,
     @InjectRepository(BotMemory)
     private readonly botMemoryRepo: Repository<BotMemory>,
+    @InjectRepository(BotEvent)
+    private readonly botEventRepo: Repository<BotEvent>,
   ) {}
+
+  private botEventsPrunedAt = 0;
 
   async addMessage(
     chatId: number,
@@ -371,5 +376,29 @@ export class TelegramService {
   ): Promise<void> {
     if (messageIds.length === 0) return;
     await this.messageRepo.update({ id: In(messageIds) }, { reportId });
+  }
+
+  async recordBotEvent(
+    event: Omit<BotEvent, 'id' | 'createdAt'>,
+  ): Promise<void> {
+    await this.botEventRepo.insert(event);
+    // The journal explains recent behaviour; keep it bounded.
+    if (Date.now() - this.botEventsPrunedAt < 60 * 60 * 1000) return;
+    this.botEventsPrunedAt = Date.now();
+    await this.botEventRepo.delete({
+      createdAt: LessThan(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
+    });
+  }
+
+  async getBotEvents(
+    chatId: number,
+    threadId: number | null,
+    limit: number,
+  ): Promise<BotEvent[]> {
+    return this.botEventRepo.find({
+      where: { chatId, threadId: threadId ?? IsNull() },
+      order: { id: 'DESC' },
+      take: limit,
+    });
   }
 }

@@ -103,6 +103,13 @@ describe('TelegramUpdate bot mentions', () => {
       addBotMemory: jest.fn(async () => ({ id: 1 })),
       updateBotMemory: jest.fn(async () => ({ id: 1 })),
       deleteBotMemory: jest.fn(async () => true),
+      recordBotEvent: jest.fn(async (_event: any) => {
+        void _event;
+      }),
+      getBotEvents: jest.fn(async (..._args: any[]): Promise<any[]> => {
+        void _args;
+        return [];
+      }),
     };
     const wordReviewService = {
       setTarget: jest.fn(async () => ({})),
@@ -169,6 +176,7 @@ describe('TelegramUpdate bot mentions', () => {
       telegram: { setMessageReaction: jest.fn() },
     };
     const bot = {
+      catch: jest.fn(),
       telegram: {
         setMyCommands: jest.fn(),
         sendMessage: jest.fn(async () => undefined),
@@ -289,6 +297,99 @@ describe('TelegramUpdate bot mentions', () => {
     const sent = (openaiService.processBotMention as jest.Mock).mock
       .calls[0][0];
     for (const part of parts) expect(sent).toContain(part);
+  });
+
+  it('does not treat the forum topic root as a reply when collecting and finishing a list', async () => {
+    const { update, ctx, openaiService, telegramService } =
+      makeUpdate('Elvardi');
+    // Telegram attaches the topic creation message to every message sent in a topic.
+    const topicRoot = {
+      message_id: 44,
+      from: { id: 1 },
+      forum_topic_created: { name: 'Язык' },
+    };
+    for (const [messageId, text] of [
+      [100, 'Баласи, исправь:\n1. первый — перевод А'],
+      [101, '2. второй — перевод Б'],
+      [102, 'Готово 2.'],
+    ] as const) {
+      await update.onText({
+        ...ctx,
+        message: {
+          message_id: messageId,
+          text,
+          from: ctx.from,
+          message_thread_id: 44,
+          is_topic_message: true,
+          reply_to_message: topicRoot,
+        },
+      } as any);
+    }
+    expect(telegramService.addMessage).not.toHaveBeenCalled();
+    expect(openaiService.processBotMention).toHaveBeenCalledTimes(1);
+    expect(
+      (openaiService.processBotMention as jest.Mock).mock.calls[0][4]
+        .requestItems,
+    ).toEqual([1, 2]);
+  });
+
+  it('still ignores an explicit reply to another participant inside a topic', async () => {
+    const { update, ctx, openaiService, telegramService } =
+      makeUpdate('Elvardi');
+    const topic = { message_thread_id: 44, is_topic_message: true };
+    await update.onText({
+      ...ctx,
+      message: {
+        message_id: 100,
+        text: 'Баласи, исправь:\n1. первый — перевод А',
+        from: ctx.from,
+        ...topic,
+        reply_to_message: { message_id: 44, from: { id: 1 } },
+      },
+    } as any);
+    await update.onText({
+      ...ctx,
+      message: {
+        message_id: 101,
+        text: 'Готово',
+        from: ctx.from,
+        ...topic,
+        reply_to_message: { message_id: 90, from: { id: 900 } },
+      },
+    } as any);
+    expect(openaiService.processBotMention).not.toHaveBeenCalled();
+    expect(telegramService.addMessage).toHaveBeenCalledTimes(1);
+    expect(telegramService.recordBotEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        messageId: 101,
+        route: 'chat',
+        detail: expect.stringContaining('ответ на сообщение #90'),
+      }),
+    );
+  });
+
+  it('shows recent decisions for the current topic with /botlog', async () => {
+    const { update, ctx, telegramService } = makeUpdate('AAlxnv');
+    (telegramService.getBotEvents as jest.Mock).mockResolvedValueOnce([
+      {
+        createdAt: new Date('2026-10-20T10:15:53Z'),
+        username: 'Elvardi',
+        messageId: 57820,
+        preview: 'Готово 100.',
+        route: 'chat',
+        detail: 'нет обращения к боту',
+      },
+    ]);
+    await (update as any).onBotLog({
+      ...ctx,
+      message: { text: '/botlog 5', message_thread_id: 11232 },
+    } as any);
+    expect(telegramService.getBotEvents).toHaveBeenCalledWith(-100, 11232, 5);
+    const text = (ctx.reply as jest.Mock).mock.calls[0][0];
+    expect(text).toContain('13:15');
+    expect(text).toContain('@Elvardi');
+    expect(text).toContain('«Готово 100.»');
+    expect(text).toContain('обычное сообщение: нет обращения к боту');
   });
 
   it('ignores a message to another person while collecting a correction list', async () => {

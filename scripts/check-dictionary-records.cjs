@@ -761,6 +761,7 @@ async function main() {
     let modelCalls = 0;
     const telegramContext = {
       saveContextMessage: async () => {},
+      recordBotEvent: async () => {},
       getRecentMessages: async () => [],
       getBotMemory: async () => [],
       addMessage: async () => {

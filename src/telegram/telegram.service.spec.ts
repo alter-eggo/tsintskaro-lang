@@ -13,6 +13,7 @@ describe('TelegramService default memory', () => {
       {} as any,
       {} as any,
       botMemoryRepo as any,
+      {} as any,
     );
 
     await service.ensureDefaultGlobalMemory();
@@ -42,6 +43,7 @@ describe('TelegramService conversation context', () => {
       repo,
       service: new TelegramService(
         repo as any,
+        {} as any,
         {} as any,
         {} as any,
         {} as any,
